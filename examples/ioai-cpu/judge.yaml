@@ -1,0 +1,7 @@
+version: 1
+kind: ioai
+runtime: python-3.13
+scoring: scorer.metrics:evaluate
+resource_profile: ioai-cpu
+network: disabled
+feedback: validation

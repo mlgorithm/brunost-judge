@@ -1,0 +1,19 @@
+[project]
+name = "brunost-judge"
+version = "0.1.0"
+description = "Open-source, platform-independent judging contracts and task tooling"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+brunost = "brunost_judge.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "numpy>=1.26", "ruff>=0.6"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
