@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from brunost_judge.artifacts import (
     ArtifactError,
     artifact_id,
+    artifact_store_from_environment,
     pack_directory,
     safe_extract,
 )
@@ -42,6 +43,13 @@ def test_artifact_store_rejects_traversal(tmp_path: Path):
 def test_directory_bundle_is_deterministic(tmp_path: Path):
     task = _task(tmp_path)
     assert pack_directory(task) == pack_directory(task)
+
+
+def test_artifact_store_from_environment_defaults_to_filesystem(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.delenv("BRUNOST_JUDGE_ARTIFACT_BACKEND", raising=False)
+    store = artifact_store_from_environment()
+    assert type(store).__name__ == "ArtifactStore"
 
 
 def test_task_and_submission_artifacts_remove_shared_mount_requirement(tmp_path: Path, monkeypatch):

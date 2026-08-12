@@ -16,6 +16,7 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 
 
 class ArtifactError(ValueError):
@@ -132,3 +133,81 @@ class ArtifactStore:
         except Exception:
             temporary.cleanup()
             raise
+
+
+class S3ArtifactStore(ArtifactStore):
+    """Content-addressed artifact store backed by S3-compatible object storage."""
+
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        endpoint_url: str | None = None,
+        region_name: str | None = None,
+        access_key: str | None = None,
+        secret_key: str | None = None,
+        max_bytes: int = 512 * 1024 * 1024,
+        prefix: str = "brunost/artifacts",
+    ) -> None:
+        try:
+            import boto3
+        except ImportError as exc:  # pragma: no cover - exercised in production images
+            raise ArtifactError("S3 artifact storage requires the brunost-judge production extra") from exc
+        if not bucket.strip():
+            raise ArtifactError("S3 artifact bucket is required")
+        session = boto3.session.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region_name,
+        )
+        self.client: Any = session.client("s3", endpoint_url=endpoint_url)
+        self.bucket = bucket
+        self.max_bytes = max(1, int(max_bytes))
+        self.prefix = prefix.strip("/")
+
+    def _key(self, identifier: str) -> str:
+        return f"{self.prefix}/{identifier[:2]}/{identifier}.tar.gz"
+
+    def path(self, artifact: str) -> str:
+        return f"s3://{self.bucket}/{self._key(_safe_id(artifact))}"
+
+    def put(self, data: bytes, *, expected_id: str | None = None) -> dict[str, object]:
+        if len(data) > self.max_bytes:
+            raise ArtifactError(f"artifact exceeds {self.max_bytes} bytes")
+        identifier = artifact_id(data)
+        if expected_id and _safe_id(expected_id) != identifier:
+            raise ArtifactError("artifact_id does not match the uploaded bytes")
+        self.client.put_object(Bucket=self.bucket, Key=self._key(identifier), Body=data, ContentType="application/gzip")
+        return {"artifact_id": identifier, "size_bytes": len(data), "sha256": identifier}
+
+    def get(self, identifier: str) -> bytes:
+        safe_identifier = _safe_id(identifier)
+        try:
+            response = self.client.get_object(Bucket=self.bucket, Key=self._key(safe_identifier))
+        except Exception as exc:
+            raise FileNotFoundError(identifier) from exc
+        body = response["Body"]
+        try:
+            data = body.read()
+        finally:
+            body.close()
+        if artifact_id(data) != safe_identifier:
+            raise ArtifactError("artifact checksum mismatch")
+        return data
+
+
+def artifact_store_from_environment() -> ArtifactStore:
+    """Build the local or S3 artifact backend selected by deployment config."""
+    backend = os.environ.get("BRUNOST_JUDGE_ARTIFACT_BACKEND", "filesystem").strip().lower()
+    max_bytes = int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_BYTES", str(512 * 1024 * 1024)))
+    if backend in {"s3", "object", "object-storage"}:
+        return S3ArtifactStore(
+            os.environ.get("BRUNOST_JUDGE_ARTIFACT_BUCKET", ""),
+            endpoint_url=os.environ.get("BRUNOST_JUDGE_ARTIFACT_ENDPOINT"),
+            region_name=os.environ.get("BRUNOST_JUDGE_ARTIFACT_REGION"),
+            access_key=os.environ.get("BRUNOST_JUDGE_ARTIFACT_ACCESS_KEY"),
+            secret_key=os.environ.get("BRUNOST_JUDGE_ARTIFACT_SECRET_KEY"),
+            max_bytes=max_bytes,
+            prefix=os.environ.get("BRUNOST_JUDGE_ARTIFACT_PREFIX", "brunost/artifacts"),
+        )
+    return ArtifactStore(os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"), max_bytes=max_bytes)

@@ -16,7 +16,11 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
-from brunost_judge.artifacts import ArtifactError, ArtifactStore, safe_extract
+from brunost_judge.artifacts import (
+    ArtifactError,
+    artifact_store_from_environment,
+    safe_extract,
+)
 from brunost_judge.contracts import ExecutionResult, WorkerRecord
 from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
 from brunost_judge.sdk import JudgeClient
@@ -66,7 +70,7 @@ class LocalWorker:
         self.lease_seconds = lease_seconds
         self.callback_signing_secret = callback_signing_secret or os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
-        self.artifact_store = ArtifactStore(os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"))
+        self.artifact_store = artifact_store_from_environment()
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
             or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}

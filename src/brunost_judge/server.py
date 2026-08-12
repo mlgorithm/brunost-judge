@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from brunost_judge.artifacts import ArtifactError, ArtifactStore, pack_directory
+from brunost_judge.artifacts import (
+    ArtifactError,
+    artifact_store_from_environment,
+    pack_directory,
+)
 from brunost_judge.contracts import TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
@@ -128,10 +132,7 @@ def create_app(database: str | Path | None = None):
 
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
-    artifact_store = ArtifactStore(
-        os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"),
-        max_bytes=int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_BYTES", str(512 * 1024 * 1024))),
-    )
+    artifact_store = artifact_store_from_environment()
     app = FastAPI(title="Brunost Judge", version="0.8.0")
 
     def _allowed_path(value: str, env_name: str) -> str:

@@ -35,6 +35,19 @@ Country deployments can avoid shared filesystem mounts by uploading
 content-addressed task/submission bundles with `brunost artifact upload`; remote
 workers download and verify them before execution.
 
+For a distributed control plane, install the production extra and configure an
+S3-compatible artifact store on every API and worker process:
+
+```bash
+python -m pip install -e '.[production]'
+export BRUNOST_JUDGE_ARTIFACT_BACKEND=s3
+export BRUNOST_JUDGE_ARTIFACT_BUCKET=brunost-artifacts
+export BRUNOST_JUDGE_ARTIFACT_ENDPOINT=https://s3.example.org
+```
+
+Artifact object keys are content-addressed and verified on upload and
+download. Filesystem storage remains the default for local single-node use.
+
 The generated task can be run locally without a database, Redis, cloud account,
 or Brunost platform. Official workers mount the same task package into a sealed
 sandbox.
