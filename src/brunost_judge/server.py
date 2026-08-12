@@ -83,7 +83,19 @@ def create_app(database: str | Path | None = None):
 
     @app.get("/console", response_class=__import__("fastapi.responses", fromlist=["HTMLResponse"]).HTMLResponse)
     def console() -> str:
-        return """<!doctype html><html><head><title>Brunost Judge</title></head><body><h1>Brunost Judge</h1><p>API is healthy. Use <a href='/docs'>API docs</a> or the SDK to register tasks and submit executions.</p></body></html>"""
+        return """<!doctype html><html><head><meta charset='utf-8'><title>Brunost Judge</title>
+        <style>body{font:16px system-ui;max-width:980px;margin:2rem auto;padding:0 1rem}section{border:1px solid #ddd;border-radius:8px;padding:1rem;margin:1rem 0}input{padding:.5rem;margin:.25rem;width:32rem}button{padding:.5rem 1rem}table{width:100%;border-collapse:collapse}td,th{padding:.4rem;border-bottom:1px solid #eee;text-align:left}.muted{color:#666}</style></head>
+        <body><h1>Brunost Judge</h1><p class='muted'>Standalone operator console · <a href='/docs'>API documentation</a></p>
+        <section><h2>Register task</h2><input id='task-ref' placeholder='task reference, e.g. demo/v1'><input id='task-path' placeholder='task path visible to the API'><button onclick='registerTask()'>Register</button><pre id='task-message'></pre></section>
+        <section><h2>Submit execution</h2><input id='exec-task' placeholder='task reference'><input id='submission-path' placeholder='submission directory path'><input id='idempotency' placeholder='idempotency key'><button onclick='submitExecution()'>Submit</button><pre id='exec-message'></pre></section>
+        <section><h2>Registered tasks</h2><button onclick='refresh()'>Refresh</button><table><thead><tr><th>Reference</th><th>Kind</th><th>Path</th></tr></thead><tbody id='tasks'></tbody></table></section>
+        <script>
+        async function api(path, options){const r=await fetch(path,{headers:{'Content-Type':'application/json'},...options});const d=await r.json();if(!r.ok)throw new Error(JSON.stringify(d));return d}
+        async function registerTask(){try{const d=await api('/v1/tasks',{method:'POST',body:JSON.stringify({task_ref:document.querySelector('#task-ref').value,path:document.querySelector('#task-path').value})});document.querySelector('#task-message').textContent=JSON.stringify(d,null,2);refresh()}catch(e){document.querySelector('#task-message').textContent=e}}
+        async function submitExecution(){try{const d=await api('/v1/executions',{method:'POST',body:JSON.stringify({task_ref:document.querySelector('#exec-task').value,submission_path:document.querySelector('#submission-path').value,idempotency_key:document.querySelector('#idempotency').value})});document.querySelector('#exec-message').textContent=JSON.stringify(d,null,2)}catch(e){document.querySelector('#exec-message').textContent=e}}
+        async function refresh(){try{const rows=await api('/v1/tasks');document.querySelector('#tasks').innerHTML=rows.map(t=>`<tr><td>${t.task_ref}</td><td>${t.kind}</td><td>${t.path}</td></tr>`).join('')}catch(e){document.querySelector('#tasks').innerHTML='<tr><td colspan=3>'+e+'</td></tr>'}}
+        refresh();
+        </script></body></html>"""
 
     return app
 

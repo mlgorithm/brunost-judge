@@ -30,3 +30,9 @@ def test_api_token_protects_control_plane(tmp_path: Path, monkeypatch):
     client = TestClient(create_app(tmp_path / "judge.db"))
     assert client.get("/v1/tasks").status_code == 401
     assert client.get("/v1/tasks", headers={"Authorization": "Bearer secret"}).status_code == 200
+
+
+def test_operator_console_is_available(tmp_path: Path):
+    response = TestClient(create_app(tmp_path / "judge.db")).get("/console")
+    assert response.status_code == 200
+    assert "Register task" in response.text
