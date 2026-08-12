@@ -13,7 +13,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SUPPORTED_KINDS = {"icpc", "ioi", "ioai", "agent"}
+SUPPORTED_KINDS = {"agent", "game", "icpc", "interactive", "ioai", "ioi", "model", "output-only"}
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 
 

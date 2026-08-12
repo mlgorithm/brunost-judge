@@ -21,6 +21,8 @@ services:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN:-change-me-before-exposure}
       BRUNOST_JUDGE_REQUIRE_API_TOKEN: "true"
+      BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN: "true"
+      BRUNOST_JUDGE_CLUSTER_ID: ${BRUNOST_JUDGE_CLUSTER_ID:-local}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
     ports:
       - "8787:8787"

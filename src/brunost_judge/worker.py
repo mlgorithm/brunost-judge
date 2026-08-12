@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import urllib.request
 import uuid
+from contextlib import ExitStack
 from pathlib import Path
 
-from brunost_judge.contracts import ExecutionResult
+from brunost_judge.artifacts import safe_extract
+from brunost_judge.contracts import ExecutionResult, WorkerRecord
 from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
+from brunost_judge.sdk import JudgeClient
 from brunost_judge.security import callback_signature
 from brunost_judge.store import JudgeStore
 
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/0.4"}
+    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/0.8"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:
@@ -46,6 +50,8 @@ class LocalWorker:
         lease_seconds: int = 300,
         callback_signing_secret: str | None = None,
         sandbox_runner: SandboxRunner | None = None,
+        capabilities: tuple[str, ...] = (),
+        region: str | None = None,
     ) -> None:
         self.store = store
         self.poll_seconds = poll_seconds
@@ -55,8 +61,19 @@ class LocalWorker:
         self.lease_seconds = lease_seconds
         self.callback_signing_secret = callback_signing_secret or os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
+        advertised_capabilities = capabilities or tuple(
+            value.strip() for value in os.environ.get("BRUNOST_JUDGE_CAPABILITIES", "runtime:local,resource:cpu").split(",") if value.strip()
+        )
+        self.store.register_worker(WorkerRecord(
+            worker_id=self.worker_id,
+            capabilities=advertised_capabilities,
+            queues=self.queues or ("default",),
+            resource_classes=self.resource_classes or ("cpu",),
+            region=region or os.environ.get("BRUNOST_JUDGE_REGION"),
+        ))
 
     def process_one(self) -> ExecutionResult | None:
+        self.store.heartbeat_worker(self.worker_id)
         claimed = self.store.claim_next(
             worker_id=self.worker_id,
             queues=self.queues,
@@ -119,5 +136,104 @@ class LocalWorker:
     def run_forever(self) -> None:
         while True:
             self.deliver_callbacks()
+            if self.process_one() is None:
+                time.sleep(self.poll_seconds)
+
+
+class RemoteWorker:
+    """Worker agent that joins a remote control plane over HTTPS.
+
+    Task and submission paths are deliberately mapped locally rather than
+    copied implicitly.  Production deployments normally mount the same
+    read-only task and submission roots on every worker or provide an object
+    storage synchronizer around this agent.
+    """
+
+    def __init__(
+        self,
+        api_url: str,
+        token: str,
+        worker_id: str,
+        *,
+        poll_seconds: float = 1.0,
+        sandbox_runner: SandboxRunner | None = None,
+        path_map: tuple[tuple[str, str], ...] = (),
+    ) -> None:
+        self.client = JudgeClient(api_url, token=token, timeout=30)
+        self.worker_id = worker_id
+        self.poll_seconds = poll_seconds
+        self.sandbox_runner = sandbox_runner or sandbox_from_environment()
+        self.path_map = path_map
+
+    def _local_path(self, value: str) -> Path:
+        source = Path(value).expanduser()
+        for remote_root, local_root in self.path_map:
+            remote = Path(remote_root).expanduser()
+            try:
+                relative = source.relative_to(remote)
+            except ValueError:
+                continue
+            return Path(local_root).expanduser() / relative
+        return source
+
+    def _materialize(self, value: str, stack: ExitStack) -> Path:
+        if value.startswith("artifact://"):
+            identifier = value.removeprefix("artifact://")
+            temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-remote-artifact-"))
+            return safe_extract(self.client.download_artifact(self.worker_id, identifier), temporary)
+        return self._local_path(value)
+
+    def process_one(self) -> ExecutionResult | None:
+        self.client.heartbeat_worker(self.worker_id)
+        claimed = self.client.claim_worker(self.worker_id)
+        if not claimed:
+            return None
+        execution_payload = claimed["execution"]
+        task_payload = claimed["task"]
+        context = claimed.get("context") or {}
+        execution_id = execution_payload["execution_id"]
+        try:
+            with ExitStack() as stack:
+                submission = self._materialize(context["submission_path"], stack).resolve()
+                task_path = self._materialize(task_payload["path"], stack).resolve()
+                if not submission.is_dir():
+                    raise ValueError(f"submission path is not a directory: {submission}")
+                raw = self.sandbox_runner.run(submission, task_path, execution_id)
+            result = ExecutionResult(
+                execution_id=execution_id,
+                task_ref=execution_payload["task_ref"],
+                status=raw.get("status", "failed"),
+                score=raw.get("score"),
+                metrics=raw.get("metrics") or {},
+                failure_reason=raw.get("failure_reason"),
+                metadata=execution_payload.get("metadata") or {},
+                queue=execution_payload.get("queue", "default"),
+                resource_class=execution_payload.get("resource_class", "cpu"),
+                priority=execution_payload.get("priority", 0),
+            )
+        except Exception as exc:  # noqa: BLE001 - worker must contain task failures
+            result = ExecutionResult(
+                execution_id=execution_id,
+                task_ref=execution_payload["task_ref"],
+                status="failed",
+                failure_reason=f"worker failure: {type(exc).__name__}: {exc}"[:2000],
+                metadata=execution_payload.get("metadata") or {},
+                queue=execution_payload.get("queue", "default"),
+                resource_class=execution_payload.get("resource_class", "cpu"),
+                priority=execution_payload.get("priority", 0),
+            )
+        finished = self.client.finish_worker(self.worker_id, result.as_dict())
+        callback_url = context.get("callback_url")
+        if callback_url:
+            _notify(
+                callback_url,
+                context.get("callback_token"),
+                finished,
+                os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET"),
+            )
+        return result
+
+    def run_forever(self) -> None:
+        while True:
             if self.process_one() is None:
                 time.sleep(self.poll_seconds)

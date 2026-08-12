@@ -1,0 +1,23 @@
+name: judge-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: latest
+      - run: uv sync --extra dev
+      - run: uv run pytest -q
+      - run: uv run ruff check src tests
+      - run: uv run python scripts/export_openapi.py /tmp/openapi.json
+      - run: test -s /tmp/openapi.json
+      - run: uv build --wheel --sdist

@@ -7,12 +7,19 @@ platform integrations do not depend on a database-specific API.
 
 from __future__ import annotations
 
+import hmac
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
+from brunost_judge.contracts import (
+    ExecutionRequest,
+    ExecutionResult,
+    TaskRecord,
+    WorkerRecord,
+)
+from brunost_judge.enrollment import digest_secret, is_expired
 
 
 def _now() -> str:
@@ -56,6 +63,41 @@ class PostgresJudgeStore:
                     execution_id TEXT PRIMARY KEY REFERENCES executions(execution_id), callback_url TEXT NOT NULL,
                     callback_token TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ NOT NULL,
                     delivered_at TIMESTAMPTZ, last_error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS definitions (
+                    definition_type TEXT NOT NULL,
+                    definition_id TEXT NOT NULL,
+                    payload_json JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (definition_type, definition_id)
+                );
+                CREATE TABLE IF NOT EXISTS workers (
+                    worker_id TEXT PRIMARY KEY,
+                    capabilities_json JSONB NOT NULL,
+                    queues_json JSONB NOT NULL,
+                    resource_classes_json JSONB NOT NULL,
+                    region TEXT,
+                    status TEXT NOT NULL,
+                    draining BOOLEAN NOT NULL DEFAULT FALSE,
+                    metadata_json JSONB NOT NULL,
+                    last_seen TIMESTAMPTZ NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS node_enrollment_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    payload_json JSONB NOT NULL,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    used_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_node_enrollment_tokens_active
+                    ON node_enrollment_tokens(token_hash, used_at, expires_at);
+                CREATE TABLE IF NOT EXISTS worker_credentials (
+                    worker_id TEXT PRIMARY KEY REFERENCES workers(worker_id),
+                    token_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    revoked_at TIMESTAMPTZ
                 );"""
             )
 
@@ -77,6 +119,147 @@ class PostgresJudgeStore:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM tasks ORDER BY task_ref").fetchall()
         return [self._task(row) for row in rows]
+
+    def register_definition(self, definition_type: str, definition_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        now = _now()
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO definitions(definition_type,definition_id,payload_json,created_at,updated_at)
+                   VALUES(%s,%s,%s,%s,%s)
+                   ON CONFLICT(definition_type,definition_id) DO UPDATE SET
+                   payload_json=EXCLUDED.payload_json,updated_at=EXCLUDED.updated_at""",
+                (definition_type, definition_id, json.dumps(payload), now, now),
+            )
+        return {"definition_type": definition_type, "definition_id": definition_id, **payload}
+
+    def get_definition(self, definition_type: str, definition_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM definitions WHERE definition_type=%s AND definition_id=%s",
+                (definition_type, definition_id),
+            ).fetchone()
+        if not row:
+            return None
+        payload = row["payload_json"] if isinstance(row["payload_json"], dict) else json.loads(row["payload_json"])
+        return {"definition_type": row["definition_type"], "definition_id": row["definition_id"], **payload}
+
+    def list_definitions(self, definition_type: str) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM definitions WHERE definition_type=%s ORDER BY definition_id",
+                (definition_type,),
+            ).fetchall()
+        return [
+            {
+                "definition_type": row["definition_type"],
+                "definition_id": row["definition_id"],
+                **(row["payload_json"] if isinstance(row["payload_json"], dict) else json.loads(row["payload_json"])),
+            }
+            for row in rows
+        ]
+
+    def register_worker(self, worker: WorkerRecord) -> WorkerRecord:
+        now = _now()
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO workers(worker_id,capabilities_json,queues_json,resource_classes_json,region,status,draining,metadata_json,last_seen)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(worker_id) DO UPDATE SET capabilities_json=EXCLUDED.capabilities_json,
+                   queues_json=EXCLUDED.queues_json,resource_classes_json=EXCLUDED.resource_classes_json,
+                   region=EXCLUDED.region,status=EXCLUDED.status,draining=EXCLUDED.draining,
+                   metadata_json=EXCLUDED.metadata_json,last_seen=EXCLUDED.last_seen""",
+                (
+                    worker.worker_id,
+                    json.dumps(list(worker.capabilities)),
+                    json.dumps(list(worker.queues)),
+                    json.dumps(list(worker.resource_classes)),
+                    worker.region,
+                    worker.status,
+                    worker.draining,
+                    json.dumps(worker.metadata),
+                    now,
+                ),
+            )
+        return self.get_worker(worker.worker_id)  # type: ignore[return-value]
+
+    def get_worker(self, worker_id: str) -> WorkerRecord | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM workers WHERE worker_id=%s", (worker_id,)).fetchone()
+        return self._worker(row) if row else None
+
+    def list_workers(self) -> list[WorkerRecord]:
+        with self._connect() as db:
+            rows = db.execute("SELECT * FROM workers ORDER BY worker_id").fetchall()
+        return [self._worker(row) for row in rows]
+
+    def heartbeat_worker(self, worker_id: str, *, status: str = "ready") -> WorkerRecord | None:
+        with self._connect() as db:
+            db.execute("UPDATE workers SET status=%s,last_seen=%s WHERE worker_id=%s", (status, _now(), worker_id))
+        return self.get_worker(worker_id)
+
+    def drain_worker(self, worker_id: str, *, draining: bool = True) -> WorkerRecord | None:
+        with self._connect() as db:
+            db.execute("UPDATE workers SET draining=%s,last_seen=%s WHERE worker_id=%s", (draining, _now(), worker_id))
+        return self.get_worker(worker_id)
+
+    def create_enrollment_token(
+        self,
+        *,
+        token_id: str,
+        token_hash: str,
+        payload: dict[str, Any],
+        expires_at: str,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO node_enrollment_tokens(token_id,token_hash,payload_json,expires_at,created_at)
+                   VALUES(%s,%s,%s,%s,%s)""",
+                (token_id, token_hash, json.dumps(payload), expires_at, now),
+            )
+        return {"token_id": token_id, **payload, "expires_at": expires_at}
+
+    def consume_enrollment_token(self, token: str) -> dict[str, Any] | None:
+        token_hash = digest_secret(token)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM node_enrollment_tokens WHERE token_hash=%s AND used_at IS NULL FOR UPDATE",
+                (token_hash,),
+            ).fetchone()
+            if row is None or is_expired(str(row["expires_at"])):
+                return None
+            db.execute(
+                "UPDATE node_enrollment_tokens SET used_at=%s WHERE token_id=%s AND used_at IS NULL",
+                (_now(), row["token_id"]),
+            )
+        payload = row["payload_json"] if isinstance(row["payload_json"], dict) else json.loads(row["payload_json"])
+        return {"token_id": row["token_id"], **payload, "expires_at": row["expires_at"].isoformat() if hasattr(row["expires_at"], "isoformat") else str(row["expires_at"])}
+
+    def create_worker_credential(self, worker_id: str, token: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO worker_credentials(worker_id,token_hash,created_at,revoked_at)
+                   VALUES(%s,%s,%s,NULL)
+                   ON CONFLICT(worker_id) DO UPDATE SET token_hash=EXCLUDED.token_hash,
+                   created_at=EXCLUDED.created_at,revoked_at=NULL""",
+                (worker_id, digest_secret(token), _now()),
+            )
+
+    def verify_worker_token(self, worker_id: str, token: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT token_hash FROM worker_credentials WHERE worker_id=%s AND revoked_at IS NULL",
+                (worker_id,),
+            ).fetchone()
+        return row is not None and hmac.compare_digest(str(row["token_hash"]), digest_secret(token))
+
+    def revoke_worker_credential(self, worker_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE worker_credentials SET revoked_at=%s WHERE worker_id=%s AND revoked_at IS NULL",
+                (_now(), worker_id),
+            )
+        return cursor.rowcount > 0
 
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id, now = str(uuid.uuid4()), _now()
@@ -103,9 +286,11 @@ class PostgresJudgeStore:
             db.execute("UPDATE executions SET status='queued',worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=%s", (now, now))
             clauses, params = ["status='queued'", "cancel_requested=FALSE"], []
             if queues:
-                clauses.append("queue = ANY(%s)"); params.append(list(queues))
+                clauses.append("queue = ANY(%s)")
+                params.append(list(queues))
             if resource_classes:
-                clauses.append("resource_class = ANY(%s)"); params.append(list(resource_classes))
+                clauses.append("resource_class = ANY(%s)")
+                params.append(list(resource_classes))
             row = db.execute("SELECT * FROM executions WHERE " + " AND ".join(clauses) + " ORDER BY priority DESC,created_at LIMIT 1 FOR UPDATE SKIP LOCKED", params).fetchone()
             if not row:
                 return None
@@ -116,10 +301,12 @@ class PostgresJudgeStore:
             return None
         return self.get_execution(row["execution_id"]), self._task(task_row), {"callback_url": row["callback_url"], "callback_token": row["callback_token"], "submission_path": row["submission_path"], "queue": row["queue"], "resource_class": row["resource_class"]}
 
-    def finish(self, execution_id: str, result: ExecutionResult) -> ExecutionResult:
+    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
         with self._connect() as db:
-            db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s", (result.status, result.score, json.dumps(result.metrics), result.failure_reason, json.dumps(result.metadata), _now(), execution_id))
-        return self.get_execution(execution_id)  # type: ignore[return-value]
+            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
+        if cursor.rowcount == 0:
+            return None
+        return self.get_execution(execution_id)
 
     def enqueue_callback(self, execution_id: str, callback_url: str, callback_token: str | None = None) -> None:
         with self._connect() as db:
@@ -176,3 +363,22 @@ class PostgresJudgeStore:
         metrics = row["metrics_json"] if isinstance(row["metrics_json"], dict) else json.loads(row["metrics_json"])
         metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
         return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"])
+
+    @staticmethod
+    def _worker(row: dict[str, Any]) -> WorkerRecord:
+        def _list(value: Any) -> tuple[str, ...]:
+            if isinstance(value, list):
+                return tuple(str(item) for item in value)
+            return tuple(json.loads(value))
+
+        metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
+        return WorkerRecord(
+            worker_id=row["worker_id"],
+            capabilities=_list(row["capabilities_json"]),
+            queues=_list(row["queues_json"]),
+            resource_classes=_list(row["resource_classes_json"]),
+            region=row["region"],
+            status=row["status"],
+            draining=bool(row["draining"]),
+            metadata=metadata,
+        )

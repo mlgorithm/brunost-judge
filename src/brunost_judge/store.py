@@ -7,6 +7,7 @@ public execution contracts.
 
 from __future__ import annotations
 
+import hmac
 import json
 import sqlite3
 import threading
@@ -15,7 +16,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
+from brunost_judge.contracts import (
+    ExecutionRequest,
+    ExecutionResult,
+    TaskRecord,
+    WorkerRecord,
+)
+from brunost_judge.enrollment import digest_secret, is_expired
 
 
 def create_store(database: str | Path = "judge.db"):
@@ -94,6 +101,41 @@ class JudgeStore:
                     delivered_at TEXT,
                     last_error TEXT
                 );
+                CREATE TABLE IF NOT EXISTS definitions (
+                    definition_type TEXT NOT NULL,
+                    definition_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (definition_type, definition_id)
+                );
+                CREATE TABLE IF NOT EXISTS workers (
+                    worker_id TEXT PRIMARY KEY,
+                    capabilities_json TEXT NOT NULL,
+                    queues_json TEXT NOT NULL,
+                    resource_classes_json TEXT NOT NULL,
+                    region TEXT,
+                    status TEXT NOT NULL,
+                    draining INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL,
+                    last_seen TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS node_enrollment_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_node_enrollment_tokens_active
+                    ON node_enrollment_tokens(token_hash, used_at, expires_at);
+                CREATE TABLE IF NOT EXISTS worker_credentials (
+                    worker_id TEXT PRIMARY KEY REFERENCES workers(worker_id),
+                    token_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT
+                );
                 """
             )
             # Keep existing reference deployments upgradeable without a manual
@@ -133,6 +175,155 @@ class JudgeStore:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM tasks ORDER BY task_ref").fetchall()
         return [TaskRecord(row["task_ref"], row["path"], row["kind"], json.loads(row["manifest_json"])) for row in rows]
+
+    def register_definition(self, definition_type: str, definition_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Upsert an extensible agent/game definition without leaking DB details."""
+        now = _now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO definitions(definition_type,definition_id,payload_json,created_at,updated_at)
+                   VALUES(?,?,?,?,?) ON CONFLICT(definition_type,definition_id) DO UPDATE SET
+                   payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                (definition_type, definition_id, json.dumps(payload, sort_keys=True), now, now),
+            )
+        return {"definition_type": definition_type, "definition_id": definition_id, **payload}
+
+    def get_definition(self, definition_type: str, definition_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM definitions WHERE definition_type=? AND definition_id=?",
+                (definition_type, definition_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "definition_type": row["definition_type"],
+            "definition_id": row["definition_id"],
+            **json.loads(row["payload_json"]),
+        }
+
+    def list_definitions(self, definition_type: str) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM definitions WHERE definition_type=? ORDER BY definition_id",
+                (definition_type,),
+            ).fetchall()
+        return [
+            {"definition_type": row["definition_type"], "definition_id": row["definition_id"], **json.loads(row["payload_json"])}
+            for row in rows
+        ]
+
+    def register_worker(self, worker: WorkerRecord) -> WorkerRecord:
+        now = _now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO workers(worker_id,capabilities_json,queues_json,resource_classes_json,region,status,draining,metadata_json,last_seen)
+                   VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET
+                   capabilities_json=excluded.capabilities_json,queues_json=excluded.queues_json,
+                   resource_classes_json=excluded.resource_classes_json,region=excluded.region,status=excluded.status,
+                   draining=excluded.draining,metadata_json=excluded.metadata_json,last_seen=excluded.last_seen""",
+                (
+                    worker.worker_id,
+                    json.dumps(sorted(worker.capabilities)),
+                    json.dumps(sorted(worker.queues)),
+                    json.dumps(sorted(worker.resource_classes)),
+                    worker.region,
+                    worker.status,
+                    int(worker.draining),
+                    json.dumps(worker.metadata, sort_keys=True),
+                    now,
+                ),
+            )
+        return self.get_worker(worker.worker_id)  # type: ignore[return-value]
+
+    def get_worker(self, worker_id: str) -> WorkerRecord | None:
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM workers WHERE worker_id=?", (worker_id,)).fetchone()
+        return self._worker(row) if row else None
+
+    def list_workers(self) -> list[WorkerRecord]:
+        with self._connect() as db:
+            rows = db.execute("SELECT * FROM workers ORDER BY worker_id").fetchall()
+        return [self._worker(row) for row in rows]
+
+    def heartbeat_worker(self, worker_id: str, *, status: str = "ready") -> WorkerRecord | None:
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE workers SET status=?,last_seen=? WHERE worker_id=?", (status, _now(), worker_id))
+        return self.get_worker(worker_id)
+
+    def drain_worker(self, worker_id: str, *, draining: bool = True) -> WorkerRecord | None:
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE workers SET draining=?,last_seen=? WHERE worker_id=?", (int(draining), _now(), worker_id))
+        return self.get_worker(worker_id)
+
+    def create_enrollment_token(
+        self,
+        *,
+        token_id: str,
+        token_hash: str,
+        payload: dict[str, Any],
+        expires_at: str,
+    ) -> dict[str, Any]:
+        """Persist a short-lived, single-use node enrollment token."""
+
+        now = _now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO node_enrollment_tokens(token_id,token_hash,payload_json,expires_at,created_at)
+                   VALUES(?,?,?,?,?)""",
+                (token_id, token_hash, json.dumps(payload, sort_keys=True), expires_at, now),
+            )
+        return {"token_id": token_id, **payload, "expires_at": expires_at}
+
+    def consume_enrollment_token(self, token: str) -> dict[str, Any] | None:
+        """Atomically consume a valid enrollment token, returning its payload."""
+
+        token_hash = digest_secret(token)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM node_enrollment_tokens WHERE token_hash=? AND used_at IS NULL",
+                (token_hash,),
+            ).fetchone()
+            if row is None or is_expired(row["expires_at"]):
+                db.rollback()
+                return None
+            db.execute(
+                "UPDATE node_enrollment_tokens SET used_at=? WHERE token_id=? AND used_at IS NULL",
+                (_now(), row["token_id"]),
+            )
+            db.commit()
+        return {"token_id": row["token_id"], **json.loads(row["payload_json"]), "expires_at": row["expires_at"]}
+
+    def create_worker_credential(self, worker_id: str, token: str) -> None:
+        """Replace a worker credential; the raw token is never written to disk."""
+
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO worker_credentials(worker_id,token_hash,created_at,revoked_at)
+                   VALUES(?,?,?,NULL)
+                   ON CONFLICT(worker_id) DO UPDATE SET token_hash=excluded.token_hash,
+                   created_at=excluded.created_at,revoked_at=NULL""",
+                (worker_id, digest_secret(token), _now()),
+            )
+
+    def verify_worker_token(self, worker_id: str, token: str) -> bool:
+        """Verify a worker-scoped credential using constant-time comparison."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT token_hash FROM worker_credentials WHERE worker_id=? AND revoked_at IS NULL",
+                (worker_id,),
+            ).fetchone()
+        return row is not None and hmac.compare_digest(str(row["token_hash"]), digest_secret(token))
+
+    def revoke_worker_credential(self, worker_id: str) -> bool:
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE worker_credentials SET revoked_at=? WHERE worker_id=? AND revoked_at IS NULL",
+                (_now(), worker_id),
+            )
+        return cursor.rowcount > 0
 
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id = str(uuid.uuid4())
@@ -222,11 +413,12 @@ class JudgeStore:
             "resource_class": row["resource_class"],
         }
 
-    def finish(self, execution_id: str, result: ExecutionResult) -> ExecutionResult:
+    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
         with self._lock, self._connect() as db:
-            db.execute(
+            cursor = db.execute(
                 """UPDATE executions SET status=?,score=?,metrics_json=?,failure_reason=?,
-                   metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=? WHERE execution_id=?""",
+                   metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=?
+                   WHERE execution_id=? AND (? IS NULL OR worker_id=?)""",
                 (
                     result.status,
                     result.score,
@@ -235,9 +427,13 @@ class JudgeStore:
                     json.dumps(result.metadata, sort_keys=True),
                     _now(),
                     execution_id,
+                    worker_id,
+                    worker_id,
                 ),
             )
-        return self.get_execution(execution_id)  # type: ignore[return-value]
+        if cursor.rowcount == 0:
+            return None
+        return self.get_execution(execution_id)
 
     def enqueue_callback(self, execution_id: str, callback_url: str, callback_token: str | None = None) -> None:
         with self._lock, self._connect() as db:
@@ -319,4 +515,17 @@ class JudgeStore:
             queue=row["queue"],
             resource_class=row["resource_class"],
             priority=row["priority"],
+        )
+
+    @staticmethod
+    def _worker(row: sqlite3.Row) -> WorkerRecord:
+        return WorkerRecord(
+            worker_id=row["worker_id"],
+            capabilities=tuple(json.loads(row["capabilities_json"])),
+            queues=tuple(json.loads(row["queues_json"])),
+            resource_classes=tuple(json.loads(row["resource_classes_json"])),
+            region=row["region"],
+            status=row["status"],
+            draining=bool(row["draining"]),
+            metadata=json.loads(row["metadata_json"]),
         )

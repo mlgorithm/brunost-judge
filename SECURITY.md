@@ -15,6 +15,13 @@ with `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET`; receivers should verify the
 timestamp/signature pair using `brunost_judge.sdk.JudgeClient.verify_callback`
 and reject timestamps older than five minutes.
 
+For distributed workers, also set `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true`.
+Create short-lived join tokens through the operator API or console, enroll each
+node once, and keep the returned worker credential in a mode-`0600` node
+configuration. Never copy the global API token to a worker. Re-enrolling a node
+rotates its worker credential; revoke the old credential before investigating a
+lost node.
+
 The reference Docker worker is not a complete sandbox for adversarial code.
 Official contests must run the worker inside a separately hardened runtime
 (gVisor, Kata, Firecracker, or equivalent), disable network egress, apply CPU,

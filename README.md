@@ -1,6 +1,7 @@
 # Brunost Judge
 
-Current release: `0.4.0` — hardened sandbox overlay, canary, and recovery drills.
+Current release: `0.8.0` — zero-code node enrollment, portable artifacts, worker credentials, capability scheduling, provider
+adapters, and deterministic game contracts.
 
 Brunost Judge is the platform-independent judging layer for ICPC, IOI, IOAI,
 and agent tasks. It is intentionally separate from the NOKI/Brunost education
@@ -25,6 +26,14 @@ brunost run tasks/example --submission ./submission
 brunost server
 brunost worker
 ```
+
+Workers automatically register and heartbeat their queues, resource classes,
+capabilities, and region. Advertise deployment-specific capabilities with
+`brunost worker --capability gpu:true --capability runtime:kubernetes --region nordic`.
+
+Country deployments can avoid shared filesystem mounts by uploading
+content-addressed task/submission bundles with `brunost artifact upload`; remote
+workers download and verify them before execution.
 
 The generated task can be run locally without a database, Redis, cloud account,
 or Brunost platform. Official workers mount the same task package into a sealed
@@ -69,10 +78,20 @@ docker compose up --build
 ```
 
 See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow,
+[`docs/node-onboarding.md`](docs/node-onboarding.md) for zero-code three-node
+onboarding,
 [`docs/production.md`](docs/production.md) for production controls, and
 [`docs/rollout.md`](docs/rollout.md) for the supervised canary checklist.
 See [`docs/ownership.md`](docs/ownership.md) for the boundary between the judge
 and an LMS/platform.
+
+For the generated application layer, framework adapters, and standalone/
+embedded/hybrid integration modes, see [`docs/platform-kit.md`](docs/platform-kit.md).
+Plugin authors can use the dependency-free conformance helpers in
+`brunost_judge.conformance` to validate result and worker-capability payloads
+in CI.
+The API and provider model are documented in [`docs/api.md`](docs/api.md) and
+[`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md).
 
 ## The contract
 

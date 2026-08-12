@@ -5,12 +5,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import socket
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
+from brunost_judge.artifacts import artifact_id as digest_artifact
+from brunost_judge.artifacts import pack_directory
+from brunost_judge.deployment import render_country_bundle
+from brunost_judge.enrollment import new_secret
 from brunost_judge.sdk import JudgeClient
 from brunost_judge.task import (
     SUPPORTED_KINDS,
@@ -41,6 +47,16 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--submission", required=True, type=Path)
     run_parser.add_argument("--result", type=Path, help="write canonical JSON result to this file")
 
+    artifact = subparsers.add_parser("artifact", help="package and upload portable task/submission bundles")
+    artifact_sub = artifact.add_subparsers(dest="artifact_command", required=True)
+    pack = artifact_sub.add_parser("pack", help="create a content-addressed tar.gz bundle")
+    pack.add_argument("path", type=Path)
+    pack.add_argument("--output", type=Path)
+    upload = artifact_sub.add_parser("upload", help="upload a directory bundle to a judge API")
+    upload.add_argument("path", type=Path)
+    upload.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
+    upload.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
+
     server = subparsers.add_parser("server", help="run the standalone HTTP API")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", default=8787, type=int)
@@ -52,8 +68,51 @@ def _parser() -> argparse.ArgumentParser:
     worker.add_argument("--worker-id")
     worker.add_argument("--queue", action="append", dest="queues", help="queue to consume (repeatable)")
     worker.add_argument("--resource-class", action="append", dest="resource_classes", help="resource class to consume (repeatable)")
+    worker.add_argument("--capability", action="append", dest="capabilities", help="capability to advertise (repeatable)")
+    worker.add_argument("--region", help="region to advertise")
     worker.add_argument("--lease-seconds", default=int(os.environ.get("BRUNOST_JUDGE_LEASE_SECONDS", "300")), type=int)
+    worker.add_argument("--config", type=Path, help="enrolled node JSON config; use remote HTTPS worker mode")
+    worker.add_argument("--path-map", action="append", default=[], metavar="REMOTE=LOCAL", help="map control-plane paths to local paths")
     worker.add_argument("--once", action="store_true")
+
+    cluster = subparsers.add_parser("cluster", help="bootstrap and operate a country cluster")
+    cluster_sub = cluster.add_subparsers(dest="cluster_command", required=True)
+    cluster_init = cluster_sub.add_parser("init", help="create a generated cluster environment")
+    cluster_init.add_argument("path", nargs="?", type=Path, default=Path("."))
+    cluster_init.add_argument("--name", default="country-judge")
+    cluster_init.add_argument("--domain", default="judge.example.org")
+    cluster_init.add_argument("--cluster-id")
+    cluster_init.add_argument("--force", action="store_true")
+    issue = cluster_sub.add_parser("issue-node-token", help="create a short-lived one-time node join token")
+    issue.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
+    issue.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
+    issue.add_argument("--node-id", required=True)
+    issue.add_argument("--worker-id")
+    issue.add_argument("--role", default="worker")
+    issue.add_argument("--capability", action="append", default=[])
+    issue.add_argument("--queue", action="append", default=[])
+    issue.add_argument("--resource-class", action="append", dest="resource_classes", default=[])
+    issue.add_argument("--region")
+    issue.add_argument("--ttl-seconds", default=900, type=int)
+
+    node = subparsers.add_parser("node", help="join and diagnose a remote worker node")
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+    join = node_sub.add_parser("join", help="enroll this node with a judge control plane")
+    join.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
+    join.add_argument("--join-token", default=os.environ.get("BRUNOST_JUDGE_JOIN_TOKEN"))
+    join.add_argument("--output", type=Path, default=Path("brunost-node.json"))
+    join.add_argument("--hostname", default=socket.gethostname())
+    join.add_argument("--capability", action="append", default=[], help="additional capability hint")
+    join.add_argument("--resource-class", action="append", dest="resource_classes", default=[])
+    join.add_argument("--path-map", action="append", default=[], metavar="REMOTE=LOCAL")
+    join.add_argument("--metadata", action="append", default=[], metavar="KEY=VALUE")
+    join.add_argument("--force", action="store_true")
+    doctor = node_sub.add_parser("doctor", help="check the control plane and this node")
+    doctor.add_argument("--config", type=Path, default=Path("brunost-node.json"))
+    revoke = node_sub.add_parser("revoke", help="revoke a worker credential")
+    revoke.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
+    revoke.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
+    revoke.add_argument("--worker-id", required=True)
     init = subparsers.add_parser("init", help="create a local judge project")
     init.add_argument("path", nargs="?", type=Path, default=Path("."))
     up = subparsers.add_parser("up", help="start the Docker Compose reference deployment")
@@ -82,6 +141,55 @@ def _validate(path: Path) -> int:
     for error in result.errors:
         print(f"  - {error}", file=sys.stderr)
     return 2
+
+
+def _parse_path_maps(values: list[str]) -> tuple[tuple[str, str], ...]:
+    mappings: list[tuple[str, str]] = []
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"path map must be REMOTE=LOCAL: {value}")
+        remote, local = value.split("=", 1)
+        if not remote or not local:
+            raise ValueError(f"path map must be REMOTE=LOCAL: {value}")
+        mappings.append((remote, local))
+    return tuple(mappings)
+
+
+def _parse_metadata(values: list[str]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"metadata must be KEY=VALUE: {value}")
+        key, item = value.split("=", 1)
+        if not key:
+            raise ValueError(f"metadata must be KEY=VALUE: {value}")
+        metadata[key] = item
+    return metadata
+
+
+def _detect_capabilities() -> tuple[list[str], list[str]]:
+    """Detect safe scheduling hints without requiring optional libraries."""
+
+    capabilities = {"resource:cpu", "runtime:local", f"cpu:cores={os.cpu_count() or 1}"}
+    resource_classes = {"cpu"}
+    if shutil.which("docker"):
+        capabilities.add("runtime:docker")
+    if shutil.which("nvidia-smi") or Path("/dev/nvidia0").exists():
+        capabilities.update({"gpu:true", "runtime:nvidia"})
+        resource_classes.add("gpu")
+    extra = os.environ.get("BRUNOST_NODE_CAPABILITIES", "")
+    capabilities.update(item.strip() for item in extra.split(",") if item.strip())
+    return sorted(capabilities), sorted(resource_classes)
+
+
+def _write_json(path: Path, payload: dict[str, object], *, force: bool = False, private: bool = False) -> None:
+    path = path.expanduser().resolve()
+    if path.exists() and not force:
+        raise FileExistsError(f"file already exists: {path} (use --force to replace it)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if private:
+        path.chmod(0o600)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +221,139 @@ def main(argv: list[str] | None = None) -> int:
             args.result.write_text(encoded + "\n", encoding="utf-8")
         print(encoded)
         return 0 if result.get("status") == "completed" else 1
+    if args.command == "artifact" and args.artifact_command == "pack":
+        try:
+            data = pack_directory(args.path)
+        except Exception as exc:  # noqa: BLE001 - CLI reports a concise packaging error
+            print(f"artifact packaging failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        identifier = digest_artifact(data)
+        output = args.output or args.path.with_name(f"{identifier}.tar.gz")
+        output.write_bytes(data)
+        print(json.dumps({"artifact_id": identifier, "path": str(output.resolve()), "size_bytes": len(data)}, sort_keys=True))
+        return 0
+    if args.command == "artifact" and args.artifact_command == "upload":
+        try:
+            result = JudgeClient(args.url, token=args.token).upload_artifact(args.path)
+        except Exception as exc:  # noqa: BLE001 - CLI reports a concise upload error
+            print(f"artifact upload failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "cluster" and args.cluster_command == "init":
+        root = args.path.expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        cluster_id = args.cluster_id or f"cluster-{uuid.uuid4().hex[:12]}"
+        env_path = root / ".env"
+        if env_path.exists() and not args.force:
+            print(f"file already exists: {env_path} (use --force to replace it)", file=sys.stderr)
+            return 2
+        env_path.write_text(
+            "\n".join([
+                f"BRUNOST_JUDGE_CLUSTER_ID={cluster_id}",
+                f"BRUNOST_JUDGE_DOMAIN={args.domain}",
+                "BRUNOST_JUDGE_IMAGE=ghcr.io/brunost/judge:0.8.0",
+                "BRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime:latest",
+                "POSTGRES_DB=brunost_judge",
+                "POSTGRES_USER=brunost",
+                f"BRUNOST_JUDGE_API_TOKEN={new_secret()}",
+                f"BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET={new_secret()}",
+                "BRUNOST_JUDGE_REQUIRE_API_TOKEN=true",
+                "BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true",
+                "POSTGRES_PASSWORD=" + new_secret(),
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        env_path.chmod(0o600)
+        _write_json(root / "brunost-cluster.json", {
+            "version": 1,
+            "name": args.name,
+            "domain": args.domain,
+            "cluster_id": cluster_id,
+            "env_file": str(env_path),
+        }, force=args.force)
+        render_country_bundle(root, force=args.force)
+        print(f"created cluster configuration: {root}")
+        print(f"keep secrets private: {env_path}")
+        return 0
+    if args.command == "cluster" and args.cluster_command == "issue-node-token":
+        client = JudgeClient(args.url, token=args.token)
+        try:
+            record = client.issue_enrollment_token(
+                node_id=args.node_id,
+                worker_id=args.worker_id,
+                role=args.role,
+                capabilities=args.capability,
+                queues=args.queue or ["default"],
+                resource_classes=args.resource_classes or ["cpu"],
+                region=args.region,
+                ttl_seconds=args.ttl_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - operator command reports actionable failure
+            print(f"unable to issue node token: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(record, indent=2, sort_keys=True))
+        return 0
+    if args.command == "node" and args.node_command == "join":
+        if not args.join_token:
+            print("--join-token (or BRUNOST_JUDGE_JOIN_TOKEN) is required", file=sys.stderr)
+            return 2
+        try:
+            path_map = _parse_path_maps(args.path_map)
+            metadata = _parse_metadata(args.metadata)
+            detected_capabilities, detected_resources = _detect_capabilities()
+            detected_capabilities = sorted(set(detected_capabilities) | set(args.capability))
+            detected_resources = sorted(set(detected_resources) | set(args.resource_classes))
+            response = JudgeClient(args.url).enroll_node(
+                join_token=args.join_token,
+                hostname=args.hostname,
+                capabilities=detected_capabilities,
+                resource_classes=detected_resources,
+                metadata=metadata,
+            )
+            worker = response["worker"]
+            config = {
+                "version": 1,
+                "api_url": args.url.rstrip("/"),
+                "cluster_id": response.get("cluster_id", "local"),
+                "node_id": response.get("node_id"),
+                "worker_id": worker["worker_id"],
+                "worker_token": response["worker_token"],
+                "capabilities": worker.get("capabilities", []),
+                "queues": worker.get("queues", ["default"]),
+                "resource_classes": worker.get("resource_classes", ["cpu"]),
+                "region": worker.get("region"),
+                "path_map": [list(item) for item in path_map],
+            }
+            _write_json(args.output, config, force=args.force, private=True)
+        except (ValueError, KeyError, FileExistsError) as exc:
+            print(f"node join failed: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:  # noqa: BLE001 - operator command reports actionable failure
+            print(f"node join failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(f"node joined: {worker['worker_id']}")
+        print(f"worker configuration saved: {args.output.expanduser().resolve()}")
+        return 0
+    if args.command == "node" and args.node_command == "doctor":
+        try:
+            config = json.loads(args.config.expanduser().read_text(encoding="utf-8"))
+            client = JudgeClient(config["api_url"], token=config["worker_token"])
+            result = {"health": client.health(), "worker": client.worker_status(config["worker_id"])}
+        except Exception as exc:  # noqa: BLE001 - doctor should print one actionable failure
+            print(f"node doctor failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["worker"].get("status") in {"ready", "busy"} else 1
+    if args.command == "node" and args.node_command == "revoke":
+        try:
+            result = JudgeClient(args.url, token=args.token).revoke_worker_credential(args.worker_id)
+        except Exception as exc:  # noqa: BLE001 - operator command reports actionable failure
+            print(f"credential revoke failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "server":
         try:
             import uvicorn
@@ -126,7 +367,27 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "worker":
         from brunost_judge.store import create_store
-        from brunost_judge.worker import LocalWorker
+        from brunost_judge.worker import LocalWorker, RemoteWorker
+
+        if args.config:
+            try:
+                config = json.loads(args.config.expanduser().read_text(encoding="utf-8"))
+                mappings = list(config.get("path_map", []))
+                mappings.extend(_parse_path_maps(args.path_map))
+                worker = RemoteWorker(
+                    config["api_url"],
+                    config["worker_token"],
+                    config["worker_id"],
+                    poll_seconds=args.poll_seconds,
+                    path_map=tuple((str(item[0]), str(item[1])) for item in mappings),
+                )
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                print(f"invalid node configuration: {exc}", file=sys.stderr)
+                return 2
+            if args.once:
+                return 0 if worker.process_one() is not None else 1
+            worker.run_forever()
+            return 0
 
         worker = LocalWorker(
             create_store(args.database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")),
@@ -134,6 +395,8 @@ def main(argv: list[str] | None = None) -> int:
             worker_id=args.worker_id,
             queues=tuple(args.queues) if args.queues else None,
             resource_classes=tuple(args.resource_classes) if args.resource_classes else None,
+            capabilities=tuple(args.capabilities) if args.capabilities else (),
+            region=args.region,
             lease_seconds=args.lease_seconds,
         )
         if args.once:

@@ -14,6 +14,8 @@ Before an official contest, operators must provide:
 - private worker queues (`--queue`) and resource pools (`--resource-class`);
 - signed result callbacks using `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET` and the
   `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers;
+- one-time node enrollment with `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true` and
+  a separate scoped credential per worker;
 - backups, monitoring, alerting, and a rehearsed restore/failover plan;
 - a second failure domain for multi-country availability.
 
@@ -35,6 +37,11 @@ and the configured gVisor/Kata runtime. Build the sandbox image with
 digest. GPU workers should use a separately
 certified runtime because gVisor GPU support is limited.
 
+The reference artifact backend is a content-addressed filesystem. For a
+multi-node country deployment, put that root on replicated S3/MinIO-compatible
+object storage or deploy an equivalent artifact adapter; the worker protocol
+does not require shared POSIX mounts.
+
 ## Deployment sequence
 
 1. Create random values for the API token, callback signing secret, and database
@@ -47,6 +54,10 @@ certified runtime because gVisor GPU support is limited.
    replay rejection.
 6. Promote additional worker pools after queue-drain, failure-injection, and
    restore tests pass.
+
+For country-operated nodes, use the join workflow in
+[`node-onboarding.md`](node-onboarding.md). Do not copy the global API token to
+workers; workers should use the credential returned by `brunost node join`.
 
 ## Repeatable drills
 

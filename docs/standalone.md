@@ -34,8 +34,25 @@ brunost worker --queue default --resource-class cpu --worker-id cpu-1
 brunost worker --queue ioai-gpu --resource-class gpu --worker-id gpu-1
 ```
 
+For a remote country node, use the zero-code enrollment flow. The control
+plane issues a short-lived join token, and the node stores a scoped credential:
+
+```bash
+brunost cluster issue-node-token --url https://judge.country.example \
+  --token "$BRUNOST_JUDGE_API_TOKEN" --node-id node-2 --capability runtime:docker
+brunost node join --url https://judge.country.example --join-token '<token>' \
+  --output /etc/brunost/node.json
+brunost worker --config /etc/brunost/node.json
+brunost node doctor --config /etc/brunost/node.json
+```
+
+See [`node-onboarding.md`](node-onboarding.md) for the complete three-node
+operator workflow and path-mount requirements.
+
 The API exposes `/v1/stats` and `/v1/executions` for a lightweight operator
-view; the `/console` page uses the API token stored in the current browser.
+view; the `/console` page uses the API token stored in the current browser. It
+also shows cluster identity, workers, regions, capabilities, and queue health,
+and can issue one-time node join tokens.
 
 For the hardened CPU worker, use the production overlay and run the canary:
 

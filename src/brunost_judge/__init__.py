@@ -4,8 +4,77 @@ The compatibility ``grader`` package remains importable for task packages that
 were authored before the standalone repository was extracted.
 """
 
+from brunost_judge.adapters import (
+    DockerAdapter,
+    KubernetesAdapter,
+    LaunchPlan,
+    LaunchRequest,
+    OpenStackAdapter,
+    SlurmAdapter,
+)
+from brunost_judge.artifacts import (
+    ArtifactError,
+    ArtifactStore,
+    artifact_id,
+    pack_directory,
+    safe_extract,
+)
+from brunost_judge.conformance import (
+    assert_conformant,
+    validate_capability_payload,
+    validate_result_payload,
+)
+from brunost_judge.contracts import (
+    AgentDefinition,
+    EvaluationRequest,
+    ExecutionRequest,
+    ExecutionResult,
+    GameDefinition,
+    ResourceProfile,
+    TaskDefinition,
+    WorkerRecord,
+)
+from brunost_judge.games import AgentSeat, GameRunner, MatchRequest, MatchResult
+from brunost_judge.scheduler import (
+    CapabilityScheduler,
+    SchedulingRequest,
+    WorkerAdvertisement,
+)
 from brunost_judge.task import task_digest
 from grader.harness import normalize_result, run
 
-__all__ = ["normalize_result", "run", "task_digest"]
-__version__ = "0.4.0"
+__all__ = [
+    "AgentDefinition",
+    "AgentSeat",
+    "ArtifactError",
+    "ArtifactStore",
+    "CapabilityScheduler",
+    "DockerAdapter",
+    "EvaluationRequest",
+    "ExecutionRequest",
+    "ExecutionResult",
+    "GameDefinition",
+    "GameRunner",
+    "KubernetesAdapter",
+    "LaunchPlan",
+    "LaunchRequest",
+    "MatchRequest",
+    "MatchResult",
+    "OpenStackAdapter",
+    "ResourceProfile",
+    "SchedulingRequest",
+    "SlurmAdapter",
+    "TaskDefinition",
+    "WorkerAdvertisement",
+    "WorkerRecord",
+    "artifact_id",
+    "assert_conformant",
+    "normalize_result",
+    "pack_directory",
+    "run",
+    "safe_extract",
+    "task_digest",
+    "validate_capability_payload",
+    "validate_result_payload",
+]
+__version__ = "0.8.0"
