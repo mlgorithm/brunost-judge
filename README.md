@@ -1,5 +1,7 @@
 # Brunost Judge
 
+Current release: `0.2.0` — standalone reference control plane and SDK.
+
 Brunost Judge is the platform-independent judging layer for ICPC, IOI, IOAI,
 and agent tasks. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest

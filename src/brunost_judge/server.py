@@ -33,7 +33,7 @@ def create_app(database: str | Path | None = None):
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     store = JudgeStore(database or os.environ.get("BRUNOST_JUDGE_DB", "judge.db"))
-    app = FastAPI(title="Brunost Judge", version="0.1.0")
+    app = FastAPI(title="Brunost Judge", version="0.2.0")
 
     def require_api_token(authorization: str | None = Header(default=None)) -> None:
         expected = os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip()

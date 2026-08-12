@@ -7,4 +7,4 @@ were authored before the standalone repository was extracted.
 from grader.harness import normalize_result, run
 
 __all__ = ["normalize_result", "run"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
