@@ -1,7 +1,6 @@
 # Brunost Judge
 
-Current release: `0.3.0` — standalone control plane, production store adapter,
-worker routing, and signed callbacks.
+Current release: `0.4.0` — hardened sandbox overlay, canary, and recovery drills.
 
 Brunost Judge is the platform-independent judging layer for ICPC, IOI, IOAI,
 and agent tasks. It is intentionally separate from the NOKI/Brunost education
@@ -10,8 +9,9 @@ platform integrates through the SDK/API boundary.
 
 The distribution includes the scorer core, task package validator, local CLI,
 SQLite development control plane, optional PostgreSQL control plane, HTTP API,
-SDK, queue-aware worker, signed callbacks, operator console, and Docker Compose
-deployment. High-assurance sandboxing remains a replaceable host adapter.
+SDK, queue-aware worker, signed callbacks, operator console, hardened
+Docker/gVisor overlay, backup/restore drills, and Docker Compose deployment.
+High-assurance runtime availability remains a host certification step.
 
 ## Quick start
 

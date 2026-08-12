@@ -7,8 +7,11 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 
+from brunost_judge.sdk import JudgeClient
 from brunost_judge.task import (
     SUPPORTED_KINDS,
     scaffold_task,
@@ -49,13 +52,24 @@ def _parser() -> argparse.ArgumentParser:
     worker.add_argument("--worker-id")
     worker.add_argument("--queue", action="append", dest="queues", help="queue to consume (repeatable)")
     worker.add_argument("--resource-class", action="append", dest="resource_classes", help="resource class to consume (repeatable)")
-    worker.add_argument("--lease-seconds", default=300, type=int)
+    worker.add_argument("--lease-seconds", default=int(os.environ.get("BRUNOST_JUDGE_LEASE_SECONDS", "300")), type=int)
     worker.add_argument("--once", action="store_true")
     init = subparsers.add_parser("init", help="create a local judge project")
     init.add_argument("path", nargs="?", type=Path, default=Path("."))
     up = subparsers.add_parser("up", help="start the Docker Compose reference deployment")
     up.add_argument("--detach", action="store_true")
     up.add_argument("--file", type=Path, default=Path("docker-compose.yml"))
+
+    canary = subparsers.add_parser("canary", help="run an end-to-end CPU judge canary")
+    canary.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
+    canary.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
+    canary.add_argument("--task-ref", default="canary/ioai-cpu-v1")
+    canary.add_argument("--task-path", type=Path, required=True)
+    canary.add_argument("--submission", type=Path, required=True)
+    canary.add_argument("--timeout", type=float, default=120.0)
+    canary.add_argument("--poll-seconds", type=float, default=1.0)
+    canary.add_argument("--queue", default="default")
+    canary.add_argument("--resource-class", default="cpu")
     return parser
 
 
@@ -143,4 +157,39 @@ def main(argv: list[str] | None = None) -> int:
         if args.detach:
             command.append("--detach")
         return subprocess.run(command, check=False).returncode
+    if args.command == "canary":
+        validation = validate_task(args.task_path)
+        if not validation.valid:
+            return _validate(args.task_path)
+        if not args.submission.is_dir():
+            print(f"submission directory does not exist: {args.submission}", file=sys.stderr)
+            return 2
+        client = JudgeClient(args.url, token=args.token, timeout=30)
+        try:
+            task = client.register_task(task_ref=args.task_ref, path=str(args.task_path.resolve()))
+            key = f"canary-{uuid.uuid4()}"
+            payload = {
+                "task_ref": args.task_ref,
+                "submission_path": str(args.submission.resolve()),
+                "idempotency_key": key,
+                "queue": args.queue,
+                "resource_class": args.resource_class,
+                "metadata": {"canary": True, "task_digest": task.get("manifest", {}).get("digest")},
+            }
+            first = client.submit(**payload)
+            second = client.submit(**payload)
+            if first.get("execution_id") != second.get("execution_id"):
+                raise RuntimeError("idempotency check failed: duplicate execution IDs")
+            deadline = time.monotonic() + max(1.0, args.timeout)
+            current = first
+            while time.monotonic() < deadline:
+                current = client.get_execution(first["execution_id"])
+                if current.get("status") in {"completed", "failed", "canceled"}:
+                    break
+                time.sleep(max(0.05, args.poll_seconds))
+            print(json.dumps({"task": task, "execution": current}, sort_keys=True, indent=2))
+            return 0 if current.get("status") == "completed" else 1
+        except Exception as exc:  # noqa: BLE001 - canary should report one actionable failure
+            print(f"judge canary failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     return 2

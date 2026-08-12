@@ -1,0 +1,28 @@
+# Hardened overlay. Run with:
+#   docker compose -f docker-compose.yml -f docker-compose.production.yml up --build
+#
+# This deliberately makes the Docker socket mount explicit. The socket is only
+# used by the worker launcher; the evaluator itself runs with no network,
+# read-only rootfs, dropped capabilities, quotas, and a gVisor/Kata runtime.
+services:
+  judge-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: ["brunost", "worker", "--poll-seconds", "1", "--lease-seconds", "${BRUNOST_JUDGE_LEASE_SECONDS:-300}"]
+    environment:
+      BRUNOST_JUDGE_SANDBOX_MODE: docker
+      BRUNOST_JUDGE_SANDBOX_IMAGE: ${BRUNOST_JUDGE_SANDBOX_IMAGE:?set BRUNOST_JUDGE_SANDBOX_IMAGE to an immutable evaluator image}
+      BRUNOST_JUDGE_SANDBOX_RUNTIME: ${BRUNOST_JUDGE_SANDBOX_RUNTIME:-runsc}
+      BRUNOST_JUDGE_REQUIRE_SECCOMP: "true"
+      BRUNOST_JUDGE_SANDBOX_SECCOMP: ${BRUNOST_JUDGE_SANDBOX_SECCOMP:-/etc/docker/seccomp/brunost-seccomp.json}
+      BRUNOST_JUDGE_SANDBOX_TIMEOUT_SECONDS: ${BRUNOST_JUDGE_SANDBOX_TIMEOUT_SECONDS:-900}
+      BRUNOST_JUDGE_SANDBOX_MEMORY: ${BRUNOST_JUDGE_SANDBOX_MEMORY:-4g}
+      BRUNOST_JUDGE_SANDBOX_CPUS: ${BRUNOST_JUDGE_SANDBOX_CPUS:-2}
+      BRUNOST_JUDGE_SANDBOX_PIDS_LIMIT: ${BRUNOST_JUDGE_SANDBOX_PIDS_LIMIT:-256}
+      BRUNOST_JUDGE_LEASE_SECONDS: ${BRUNOST_JUDGE_LEASE_SECONDS:-300}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${BRUNOST_JUDGE_TASK_ROOT:-./examples}:/tasks:ro
+      - ${BRUNOST_JUDGE_SUBMISSION_ROOT:-./local-submissions}:/submissions
+      - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-/srv/brunost/security/brunost-seccomp.json}:/etc/docker/seccomp/brunost-seccomp.json:ro

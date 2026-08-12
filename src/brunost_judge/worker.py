@@ -15,14 +15,14 @@ import uuid
 from pathlib import Path
 
 from brunost_judge.contracts import ExecutionResult
+from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
 from brunost_judge.security import callback_signature
 from brunost_judge.store import JudgeStore
-from grader.harness import run
 
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/0.3"}
+    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/0.4"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:
@@ -45,6 +45,7 @@ class LocalWorker:
         resource_classes: tuple[str, ...] | None = None,
         lease_seconds: int = 300,
         callback_signing_secret: str | None = None,
+        sandbox_runner: SandboxRunner | None = None,
     ) -> None:
         self.store = store
         self.poll_seconds = poll_seconds
@@ -53,6 +54,7 @@ class LocalWorker:
         self.resource_classes = resource_classes
         self.lease_seconds = lease_seconds
         self.callback_signing_secret = callback_signing_secret or os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+        self.sandbox_runner = sandbox_runner or sandbox_from_environment()
 
     def process_one(self) -> ExecutionResult | None:
         claimed = self.store.claim_next(
@@ -68,7 +70,7 @@ class LocalWorker:
             submission = Path(context["submission_path"]).expanduser().resolve()
             if not submission.is_dir():
                 raise ValueError(f"submission path is not a directory: {submission}")
-            raw = run(str(submission), task.path)
+            raw = self.sandbox_runner.run(submission, Path(task.path), execution.execution_id)
             result = ExecutionResult(
                 execution_id=execution.execution_id,
                 task_ref=execution.task_ref,

@@ -8,4 +8,4 @@ from brunost_judge.task import task_digest
 from grader.harness import normalize_result, run
 
 __all__ = ["normalize_result", "run", "task_digest"]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -1,0 +1,12 @@
+# Build a contest runtime that contains the dependency-free judge entrypoint.
+# Supply a pinned task/runtime base image at build time; the resulting image is
+# referenced by BRUNOST_JUDGE_SANDBOX_IMAGE using its registry digest.
+ARG BASE_IMAGE=python:3.13-slim
+FROM ${BASE_IMAGE}
+
+COPY src/grader /opt/brunost/grader
+ENV PYTHONPATH=/opt/brunost
+WORKDIR /workspace
+
+# The worker invokes `python -m grader.evaluate`; task authors provide the
+# metrics dependencies in the selected base image.

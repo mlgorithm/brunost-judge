@@ -38,7 +38,7 @@ def create_app(database: str | Path | None = None):
 
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
-    app = FastAPI(title="Brunost Judge", version="0.3.0")
+    app = FastAPI(title="Brunost Judge", version="0.4.0")
 
     def _allowed_path(value: str, env_name: str) -> str:
         path = Path(value).expanduser().resolve()

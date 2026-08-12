@@ -37,6 +37,14 @@ brunost worker --queue ioai-gpu --resource-class gpu --worker-id gpu-1
 The API exposes `/v1/stats` and `/v1/executions` for a lightweight operator
 view; the `/console` page uses the API token stored in the current browser.
 
+For the hardened CPU worker, use the production overlay and run the canary:
+
+```bash
+export BRUNOST_JUDGE_SANDBOX_IMAGE='ghcr.io/example/brunost-judge-runtime@sha256:<digest>'
+docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d
+scripts/canary.sh
+```
+
 ## Existing platform integration
 
 An LMS should use the SDK or the JSON API. It should send a stable idempotency
