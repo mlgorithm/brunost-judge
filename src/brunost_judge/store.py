@@ -334,8 +334,15 @@ class JudgeStore:
             ).fetchone()
             if existing is not None:
                 return self._result(existing)
-            if db.execute("SELECT 1 FROM tasks WHERE task_ref = ?", (request.task_ref,)).fetchone() is None:
+            task_row = db.execute("SELECT * FROM tasks WHERE task_ref = ?", (request.task_ref,)).fetchone()
+            if task_row is None:
                 raise KeyError(f"unknown task_ref: {request.task_ref}")
+            manifest = json.loads(task_row["manifest_json"])
+            metadata = dict(request.metadata)
+            metadata["task_digest"] = manifest.get("digest")
+            metadata["evaluator"] = manifest.get("evaluator")
+            metadata["runtime_image"] = manifest.get("runtime_image") or manifest.get("runtime")
+            metadata["event_id"] = f"execution:{execution_id}:result"
             db.execute(
                 """INSERT INTO executions(
                     execution_id,idempotency_key,task_ref,submission_path,callback_url,
@@ -349,7 +356,7 @@ class JudgeStore:
                     request.submission_path,
                     request.callback_url,
                     request.callback_token,
-                    json.dumps(request.metadata, sort_keys=True),
+                    json.dumps(metadata, sort_keys=True),
                     "queued",
                     "{}",
                     now,
@@ -504,6 +511,7 @@ class JudgeStore:
         return result
 
     def _result(self, row: sqlite3.Row) -> ExecutionResult:
+        metadata = json.loads(row["metadata_json"])
         return ExecutionResult(
             execution_id=row["execution_id"],
             task_ref=row["task_ref"],
@@ -511,10 +519,15 @@ class JudgeStore:
             score=row["score"],
             metrics=json.loads(row["metrics_json"]),
             failure_reason=row["failure_reason"],
-            metadata=json.loads(row["metadata_json"]),
+            metadata=metadata,
             queue=row["queue"],
             resource_class=row["resource_class"],
             priority=row["priority"],
+            task_digest=metadata.get("task_digest"),
+            evaluator=metadata.get("evaluator"),
+            runtime_image=metadata.get("runtime_image"),
+            seed=metadata.get("seed"),
+            event_id=metadata.get("event_id"),
         )
 
     @staticmethod

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from brunost_judge.artifacts import ArtifactError, ArtifactStore
+from brunost_judge.artifacts import ArtifactError, ArtifactStore, pack_directory
 from brunost_judge.contracts import TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
@@ -152,14 +152,31 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=404, detail=f"artifact not found: {identifier}") from exc
         return f"artifact://{identifier}"
 
+    def _directory_artifact(value: str, env_name: str) -> tuple[str, str]:
+        """Snapshot a directory immediately and return its immutable reference."""
+        path = Path(_allowed_path(value, env_name))
+        if not path.is_dir():
+            raise HTTPException(status_code=422, detail=f"path is not a directory: {path}")
+        try:
+            stored = artifact_store.put(pack_directory(path))
+        except (ArtifactError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=f"could not snapshot directory: {exc}") from exc
+        return f"artifact://{stored['artifact_id']}", str(stored["artifact_id"])
+
     def _validate_callback_url(url: str | None) -> str | None:
         if not url:
             return None
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise HTTPException(status_code=422, detail="callback_url must be an absolute http(s) URL")
+        production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+        require_https = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS", "false").lower() == "true"
+        if require_https and parsed.scheme != "https":
+            raise HTTPException(status_code=422, detail="callback_url must use https in production")
         allowlist = {host.strip().lower() for host in os.environ.get("BRUNOST_JUDGE_CALLBACK_HOSTS", "").split(",") if host.strip()}
-        if allowlist and parsed.hostname and parsed.hostname.lower() not in allowlist:
+        if production and not allowlist:
+            raise HTTPException(status_code=503, detail="BRUNOST_JUDGE_CALLBACK_HOSTS is required in production")
+        if allowlist and (not parsed.hostname or parsed.hostname.lower() not in allowlist):
             raise HTTPException(status_code=422, detail="callback host is not allowed")
         return url
 
@@ -299,23 +316,36 @@ def create_app(database: str | Path | None = None):
         if bool(request.path) == bool(request.artifact_id):
             raise HTTPException(status_code=422, detail="provide exactly one of path or artifact_id")
         digest = ""
+        artifact_identifier: str | None = None
         if request.path:
             task_path = _allowed_path(request.path, "BRUNOST_TASK_ROOT")
-            validation = validate_task(task_path)
-            if validation.valid:
-                digest = task_digest(validation.path)
+            try:
+                stored = artifact_store.put(pack_directory(task_path))
+                artifact_identifier = str(stored["artifact_id"])
+                materialized, temporary = artifact_store.materialize(artifact_identifier)
+                validation = validate_task(materialized)
+                if validation.valid:
+                    digest = task_digest(validation.path)
+                task_path = f"artifact://{artifact_identifier}"
+            except (ArtifactError, OSError) as exc:
+                raise HTTPException(status_code=422, detail=f"could not snapshot task: {exc}") from exc
+            finally:
+                if "temporary" in locals():
+                    temporary.cleanup()
         else:
             task_path = _artifact_path(request.artifact_id)
+            artifact_identifier = request.artifact_id
             try:
                 materialized, temporary = artifact_store.materialize(request.artifact_id or "")
                 validation = validate_task(materialized)
-                digest = request.artifact_id or ""
+                digest = task_digest(validation.path) if validation.valid else ""
             finally:
                 if "temporary" in locals():
                     temporary.cleanup()
         if not validation.valid:
             raise HTTPException(status_code=422, detail=list(validation.errors))
         manifest = {
+            **request.metadata,
             "kind": request.kind or validation.kind,
             "version": request.version,
             "runtime": request.runtime,
@@ -323,10 +353,9 @@ def create_app(database: str | Path | None = None):
             "resource_profile": request.resource_profile,
             "required_capabilities": request.required_capabilities,
             "digest": digest,
-            **request.metadata,
         }
-        if request.artifact_id:
-            manifest["artifact_id"] = request.artifact_id
+        if artifact_identifier:
+            manifest["artifact_id"] = artifact_identifier
         task = store.register_task(TaskRecord(request.task_ref, task_path, request.kind or validation.kind or "unknown", manifest))
         return task.as_dict()
 
@@ -342,10 +371,15 @@ def create_app(database: str | Path | None = None):
         submission_artifact_id = payload.pop("submission_artifact_id", None)
         if bool(submission_path) == bool(submission_artifact_id):
             raise HTTPException(status_code=422, detail="provide exactly one of submission_path or submission_artifact_id")
-        payload["submission_path"] = _allowed_path(submission_path, "BRUNOST_SUBMISSION_ROOT") if submission_path else _artifact_path(submission_artifact_id)
+        if submission_path:
+            payload["submission_path"], _ = _directory_artifact(submission_path, "BRUNOST_SUBMISSION_ROOT")
+        else:
+            payload["submission_path"] = _artifact_path(submission_artifact_id)
         payload["callback_url"] = _validate_callback_url(payload.get("callback_url"))
         metadata = dict(payload.pop("metadata", {}) or {})
         evaluation_kind = payload.pop("evaluation_kind", "batch")
+        if evaluation_kind in {"agent", "match"}:
+            raise HTTPException(status_code=501, detail=f"evaluation kind '{evaluation_kind}' requires an installed runner plugin")
         agent_refs = payload.pop("agent_refs", []) or []
         game_ref = payload.pop("game_ref", None)
         seed = payload.pop("seed", None)

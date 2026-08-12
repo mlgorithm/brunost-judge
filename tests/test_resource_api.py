@@ -52,9 +52,8 @@ def test_agent_game_and_match_api(tmp_path: Path):
             "seed": 7,
         },
     )
-    assert match.status_code == 202
-    assert match.json()["evaluation_id"] == match.json()["execution_id"]
-    assert match.json()["metadata"]["evaluation_kind"] == "match"
+    assert match.status_code == 501
+    assert "runner plugin" in match.json()["detail"]
 
 
 def test_evaluation_alias_and_capabilities(tmp_path: Path, monkeypatch):
@@ -68,9 +67,8 @@ def test_evaluation_alias_and_capabilities(tmp_path: Path, monkeypatch):
         "/v1/evaluations",
         json={"task_ref": "agent/v1", "submission_path": str(submission), "idempotency_key": "eval-1", "evaluation_kind": "agent"},
     )
-    assert response.status_code == 202
-    evaluation_id = response.json()["evaluation_id"]
-    assert client.get(f"/v1/evaluations/{evaluation_id}").status_code == 200
+    assert response.status_code == 501
+    assert "runner plugin" in response.json()["detail"]
     assert client.get("/v1/workers/capabilities").json()["capabilities"] == ["gpu:true", "runtime:docker"]
 
 

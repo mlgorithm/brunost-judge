@@ -19,7 +19,10 @@ can run it in its own infrastructure.
 1. Register one IOAI CPU task.
 2. Submit the same idempotency key twice; confirm one execution is created.
 3. Consume it with a CPU worker and confirm the callback signature verifies.
-4. Replay the callback after five minutes; the receiver must reject it.
+4. Replay the exact callback immediately and after five minutes; the receiver
+   must acknowledge an immediate duplicate without applying it twice and reject
+   the stale duplicate. The signed event ID is the durable deduplication key;
+   timestamp expiry is an additional freshness check.
 5. Stop the worker during a lease, wait for expiry, and confirm another worker
    reclaims the execution.
 6. Confirm `/v1/stats` returns zero queued/running work after the callback.

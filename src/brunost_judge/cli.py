@@ -252,8 +252,10 @@ def main(argv: list[str] | None = None) -> int:
             "\n".join([
                 f"BRUNOST_JUDGE_CLUSTER_ID={cluster_id}",
                 f"BRUNOST_JUDGE_DOMAIN={args.domain}",
-                "BRUNOST_JUDGE_IMAGE=ghcr.io/brunost/judge:0.8.0",
-                "BRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime:latest",
+                "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>",
+                "BRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>",
+                "BRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>",
+                "BRUNOST_JUDGE_CALLBACK_HOSTS=platform.example",
                 "POSTGRES_DB=brunost_judge",
                 "POSTGRES_USER=brunost",
                 f"BRUNOST_JUDGE_API_TOKEN={new_secret()}",

@@ -13,7 +13,9 @@ Before an official contest, operators must provide:
 - immutable, digest-pinned judge and runtime images;
 - private worker queues (`--queue`) and resource pools (`--resource-class`);
 - signed result callbacks using `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET` and the
-  `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers;
+  `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers. Production
+  requires HTTPS callback URLs, an explicit `BRUNOST_JUDGE_CALLBACK_HOSTS`
+  allowlist, and durable receiver-side deduplication of the signed event ID;
 - one-time node enrollment with `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true` and
   a separate scoped credential per worker;
 - backups, monitoring, alerting, and a rehearsed restore/failover plan;

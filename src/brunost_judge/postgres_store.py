@@ -264,20 +264,31 @@ class PostgresJudgeStore:
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id, now = str(uuid.uuid4()), _now()
         with self._connect() as db:
+            task_row = db.execute("SELECT * FROM tasks WHERE task_ref=%s", (request.task_ref,)).fetchone()
+            if not task_row:
+                raise KeyError(f"unknown task_ref: {request.task_ref}")
+            manifest = task_row["manifest_json"] if isinstance(task_row["manifest_json"], dict) else json.loads(task_row["manifest_json"])
+            metadata = dict(request.metadata)
+            metadata["task_digest"] = manifest.get("digest")
+            metadata["evaluator"] = manifest.get("evaluator")
+            metadata["runtime_image"] = manifest.get("runtime_image") or manifest.get("runtime")
+            metadata["event_id"] = f"execution:{execution_id}:result"
+            inserted = db.execute(
+                """INSERT INTO executions(execution_id,idempotency_key,task_ref,submission_path,callback_url,callback_token,
+                   metadata_json,status,metrics_json,created_at,updated_at,queue,resource_class,priority)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(idempotency_key) DO NOTHING
+                   RETURNING *""",
+                (execution_id, request.idempotency_key, request.task_ref, request.submission_path, request.callback_url,
+                 request.callback_token, json.dumps(metadata, sort_keys=True), "queued", json.dumps({}), now, now,
+                 request.queue, request.resource_class, request.priority),
+            ).fetchone()
+            if inserted:
+                return self._result(inserted)
             existing = db.execute("SELECT * FROM executions WHERE idempotency_key=%s", (request.idempotency_key,)).fetchone()
             if existing:
                 return self._result(existing)
-            if not db.execute("SELECT 1 FROM tasks WHERE task_ref=%s", (request.task_ref,)).fetchone():
-                raise KeyError(f"unknown task_ref: {request.task_ref}")
-            db.execute(
-                """INSERT INTO executions(execution_id,idempotency_key,task_ref,submission_path,callback_url,callback_token,
-                   metadata_json,status,metrics_json,created_at,updated_at,queue,resource_class,priority)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (execution_id, request.idempotency_key, request.task_ref, request.submission_path, request.callback_url,
-                 request.callback_token, json.dumps(request.metadata), "queued", json.dumps({}), now, now,
-                 request.queue, request.resource_class, request.priority),
-            )
-        return self.get_execution(execution_id)  # type: ignore[return-value]
+            raise RuntimeError("idempotent execution insert was lost before it could be read")
 
     def claim_next(self, *, worker_id: str = "local-worker", queues: tuple[str, ...] | None = None,
                    resource_classes: tuple[str, ...] | None = None, lease_seconds: int = 300):
@@ -362,7 +373,7 @@ class PostgresJudgeStore:
     def _result(row: dict[str, Any]) -> ExecutionResult:
         metrics = row["metrics_json"] if isinstance(row["metrics_json"], dict) else json.loads(row["metrics_json"])
         metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
-        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"])
+        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"], task_digest=metadata.get("task_digest"), evaluator=metadata.get("evaluator"), runtime_image=metadata.get("runtime_image"), seed=metadata.get("seed"), event_id=metadata.get("event_id"))
 
     @staticmethod
     def _worker(row: dict[str, Any]) -> WorkerRecord:

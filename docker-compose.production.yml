@@ -1,10 +1,28 @@
 # Hardened overlay. Run with:
 #   docker compose -f docker-compose.yml -f docker-compose.production.yml up --build
 #
-# This deliberately makes the Docker socket mount explicit. The socket is only
-# used by the worker launcher; the evaluator itself runs with no network,
-# read-only rootfs, dropped capabilities, quotas, and a gVisor/Kata runtime.
+# The worker never receives the host Docker socket. A constrained proxy is kept
+# on the dedicated worker host and exposes only the container lifecycle calls
+# required by the sandbox. Kubernetes/Kata/Firecracker executors are preferred
+# for larger deployments; this profile is the portable Docker-host fallback.
 services:
+  docker-socket-proxy:
+    image: ${BRUNOST_DOCKER_SOCKET_PROXY_IMAGE:?set BRUNOST_DOCKER_SOCKET_PROXY_IMAGE to a digest-pinned proxy image}
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      VERSION: "1"
+      POST: "1"
+      NETWORKS: "0"
+      VOLUMES: "0"
+      EXEC: "0"
+      AUTH: "0"
+      SECRETS: "0"
+      SWARM: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
   judge-worker:
     build:
       context: .
@@ -21,8 +39,12 @@ services:
       BRUNOST_JUDGE_SANDBOX_CPUS: ${BRUNOST_JUDGE_SANDBOX_CPUS:-2}
       BRUNOST_JUDGE_SANDBOX_PIDS_LIMIT: ${BRUNOST_JUDGE_SANDBOX_PIDS_LIMIT:-256}
       BRUNOST_JUDGE_LEASE_SECONDS: ${BRUNOST_JUDGE_LEASE_SECONDS:-300}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      BRUNOST_JUDGE_ENV: production
+      BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS: "true"
+    depends_on:
+      - docker-socket-proxy
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
       - ${BRUNOST_JUDGE_TASK_ROOT:-./examples}:/tasks:ro
       - ${BRUNOST_JUDGE_SUBMISSION_ROOT:-./local-submissions}:/submissions
       - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-/srv/brunost/security/brunost-seccomp.json}:/etc/docker/seccomp/brunost-seccomp.json:ro

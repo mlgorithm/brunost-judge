@@ -254,9 +254,17 @@ class JudgeClient:
         return self.submit(task_ref=task_ref, submission_artifact_id=str(uploaded["artifact_id"]), idempotency_key=idempotency_key, **kwargs)
 
     @staticmethod
-    def verify_callback(payload: bytes, *, secret: str, signature: str, timestamp: str) -> bool:
+    def verify_callback(
+        payload: bytes,
+        *,
+        secret: str,
+        signature: str,
+        timestamp: str,
+        event_id: str | None = None,
+        require_event_id: bool = False,
+    ) -> bool:
         """Verify the signed callback headers emitted by a worker."""
-        return verify_callback_signature(payload, secret, signature, timestamp)
+        return verify_callback_signature(payload, secret, signature, timestamp, event_id=event_id, require_event_id=require_event_id)
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/executions/{execution_id}")

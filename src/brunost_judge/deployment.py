@@ -31,6 +31,9 @@ CONTROL_PLANE_COMPOSE = """services:
       BRUNOST_JUDGE_CLUSTER_ID: ${BRUNOST_JUDGE_CLUSTER_ID}
       BRUNOST_JUDGE_ARTIFACT_ROOT: /var/lib/brunost/artifacts
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET}
+      BRUNOST_JUDGE_ENV: production
+      BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS: "true"
+      BRUNOST_JUDGE_CALLBACK_HOSTS: ${BRUNOST_JUDGE_CALLBACK_HOSTS:?set the platform callback hostname allowlist}
     ports:
       - \"8787:8787\"
     volumes:
@@ -46,6 +49,23 @@ volumes:
 """
 
 WORKER_COMPOSE = """services:
+  docker-socket-proxy:
+    image: ${BRUNOST_DOCKER_SOCKET_PROXY_IMAGE:?set BRUNOST_DOCKER_SOCKET_PROXY_IMAGE to a digest-pinned proxy image}
+    environment:
+      CONTAINERS: "1"
+      IMAGES: "1"
+      INFO: "1"
+      VERSION: "1"
+      POST: "1"
+      NETWORKS: "0"
+      VOLUMES: "0"
+      EXEC: "0"
+      AUTH: "0"
+      SECRETS: "0"
+      SWARM: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
   judge-worker:
     image: ${BRUNOST_JUDGE_IMAGE}
     command: [\"brunost\", \"worker\", \"--config\", \"/etc/brunost/node.json\"]
@@ -55,9 +75,13 @@ WORKER_COMPOSE = """services:
       BRUNOST_JUDGE_SANDBOX_RUNTIME: ${BRUNOST_JUDGE_SANDBOX_RUNTIME:-runsc}
       BRUNOST_JUDGE_REQUIRE_SECCOMP: \"true\"
       BRUNOST_JUDGE_SANDBOX_SECCOMP: ${BRUNOST_JUDGE_SANDBOX_SECCOMP:-/etc/docker/seccomp/brunost-seccomp.json}
+      BRUNOST_JUDGE_ENV: production
+      BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS: \"true\"
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+    depends_on:
+      - docker-socket-proxy
     volumes:
       - ${BRUNOST_NODE_CONFIG:-./brunost-node.json}:/etc/brunost/node.json:ro
-      - /var/run/docker.sock:/var/run/docker.sock
       - ${BRUNOST_TASK_ROOT:-./tasks}:/tasks:ro
       - ${BRUNOST_SUBMISSION_ROOT:-./submissions}: /submissions
     restart: unless-stopped
@@ -73,7 +97,7 @@ RUNBOOK = """# Country cluster runbook
 
 2. Issue one join token per worker from Node 1:
 
-   `brunost cluster issue-node-token --url https://judge.example --node-id node-2`
+`brunost cluster issue-node-token --url https://judge.example --node-id node-2`
 
 3. On each worker, run `brunost node join` and then:
 
@@ -84,8 +108,9 @@ RUNBOOK = """# Country cluster runbook
 6. Run the CPU canary before enabling contest traffic.
 
 The generated compose files are a reference deployment. Put the API behind
-TLS, keep the global API token on the control plane only, and use a replicated
-PostgreSQL/object-storage service for an official contest.
+TLS, replace the callback hostname placeholder before startup, keep the global
+API token on the control plane only, and use a replicated PostgreSQL/object-
+storage service for an official contest.
 """
 
 
@@ -98,7 +123,7 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         "docker-compose.control.yml": CONTROL_PLANE_COMPOSE,
         "docker-compose.worker.yml": WORKER_COMPOSE,
         "RUNBOOK.md": RUNBOOK,
-        "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/brunost/judge:0.8.0\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime:latest\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\n",
+        "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\n",
     }
     written: list[Path] = []
     for name, content in files.items():
@@ -108,4 +133,3 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         path.write_text(content, encoding="utf-8")
         written.append(path)
     return written
-

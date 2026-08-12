@@ -11,6 +11,8 @@ from brunost_judge.artifacts import (
     safe_extract,
 )
 from brunost_judge.server import create_app
+from brunost_judge.store import JudgeStore
+from brunost_judge.worker import LocalWorker
 
 
 def _task(root: Path) -> Path:
@@ -64,3 +66,34 @@ def test_task_and_submission_artifacts_remove_shared_mount_requirement(tmp_path:
     )
     assert submitted.status_code == 202
     assert submitted.json()["status"] == "queued"
+
+
+def test_registered_task_is_snapshot_and_worker_verifies_digest(tmp_path: Path, monkeypatch):
+    artifact_root = tmp_path / "artifacts"
+    monkeypatch.setenv("BRUNOST_JUDGE_ARTIFACT_ROOT", str(artifact_root))
+    task = _task(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    registered = client.post("/v1/tasks", json={"task_ref": "immutable/v1", "path": str(task)})
+    assert registered.status_code == 201
+    assert registered.json()["path"].startswith("artifact://")
+    original_digest = registered.json()["manifest"]["digest"]
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 0.0\n", encoding="utf-8")
+    queued = client.post(
+        "/v1/evaluations",
+        json={"task_ref": "immutable/v1", "submission_path": str(submission), "idempotency_key": "immutable-1"},
+    )
+    assert queued.status_code == 202
+
+    class CaptureRunner:
+        def run(self, submission_path: Path, task_path: Path, execution_id: str) -> dict:
+            _ = submission_path, execution_id
+            assert task_digest(task_path) == original_digest
+            return {"status": "completed", "score": 1.0, "metrics": {}}
+
+    from brunost_judge.task import task_digest
+
+    result = LocalWorker(JudgeStore(tmp_path / "judge.db"), sandbox_runner=CaptureRunner()).process_one()
+    assert result is not None
+    assert result.status == "completed"

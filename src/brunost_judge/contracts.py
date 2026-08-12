@@ -158,9 +158,10 @@ class EvaluationRequest:
     """Canonical high-level request for any judge evaluation.
 
     ``evaluation_kind`` is one of ``batch``, ``interactive``, ``agent``, or
-    ``match``.  The reference worker currently executes the same sealed task
-    seam for all kinds; richer agent/game runners can use the metadata and
-    definitions without changing the public request shape.
+    ``match``.  The reference distribution executes batch and interactive
+    tasks. Agent and match definitions are registry declarations only until a
+    runner plugin is installed; the HTTP API fails closed with ``501`` instead
+    of silently treating a game as a batch score.
     """
 
     task_ref: str
@@ -217,6 +218,11 @@ class ExecutionResult:
     queue: str = "default"
     resource_class: str = "cpu"
     priority: int = 0
+    task_digest: str | None = None
+    evaluator: str | None = None
+    runtime_image: str | None = None
+    seed: int | None = None
+    event_id: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)

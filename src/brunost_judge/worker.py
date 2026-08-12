@@ -16,12 +16,13 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
-from brunost_judge.artifacts import safe_extract
+from brunost_judge.artifacts import ArtifactError, ArtifactStore, safe_extract
 from brunost_judge.contracts import ExecutionResult, WorkerRecord
 from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
 from brunost_judge.sdk import JudgeClient
 from brunost_judge.security import callback_signature
 from brunost_judge.store import JudgeStore
+from brunost_judge.task import task_digest
 
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
@@ -30,9 +31,13 @@ def _notify(url: str, token: str | None, payload: dict, signing_secret: str | No
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:
-        timestamp, signature = callback_signature(body, signing_secret)
+        event_id = str(payload.get("event_id") or "")
+        if not event_id:
+            raise ValueError("signed callbacks require a result event_id")
+        timestamp, signature = callback_signature(body, signing_secret, event_id=event_id)
         headers["X-Brunost-Judge-Timestamp"] = timestamp
         headers["X-Brunost-Judge-Signature"] = signature
+        headers["X-Brunost-Judge-Event-ID"] = event_id
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=10):
         return
@@ -61,6 +66,11 @@ class LocalWorker:
         self.lease_seconds = lease_seconds
         self.callback_signing_secret = callback_signing_secret or os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
+        self.artifact_store = ArtifactStore(os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"))
+        self.require_immutable_artifacts = (
+            os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
+            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+        )
         advertised_capabilities = capabilities or tuple(
             value.strip() for value in os.environ.get("BRUNOST_JUDGE_CAPABILITIES", "runtime:local,resource:cpu").split(",") if value.strip()
         )
@@ -84,10 +94,12 @@ class LocalWorker:
             return None
         execution, task, context = claimed
         try:
-            submission = Path(context["submission_path"]).expanduser().resolve()
-            if not submission.is_dir():
-                raise ValueError(f"submission path is not a directory: {submission}")
-            raw = self.sandbox_runner.run(submission, Path(task.path), execution.execution_id)
+            with ExitStack() as stack:
+                submission = self._materialize(context["submission_path"], stack)
+                task_path = self._materialize_task(task.path, task.manifest, stack)
+                if not submission.is_dir():
+                    raise ValueError(f"submission path is not a directory: {submission}")
+                raw = self.sandbox_runner.run(submission, task_path, execution.execution_id)
             result = ExecutionResult(
                 execution_id=execution.execution_id,
                 task_ref=execution.task_ref,
@@ -99,6 +111,11 @@ class LocalWorker:
                 queue=execution.queue,
                 resource_class=execution.resource_class,
                 priority=execution.priority,
+                task_digest=execution.task_digest,
+                evaluator=execution.evaluator,
+                runtime_image=execution.runtime_image,
+                seed=execution.seed,
+                event_id=execution.event_id,
             )
         except Exception as exc:  # noqa: BLE001 - worker must contain task failures
             result = ExecutionResult(
@@ -110,6 +127,11 @@ class LocalWorker:
                 queue=execution.queue,
                 resource_class=execution.resource_class,
                 priority=execution.priority,
+                task_digest=execution.task_digest,
+                evaluator=execution.evaluator,
+                runtime_image=execution.runtime_image,
+                seed=execution.seed,
+                event_id=execution.event_id,
             )
         finished = self.store.finish(execution.execution_id, result)
         callback_url = context.get("callback_url")
@@ -117,6 +139,26 @@ class LocalWorker:
             self.store.enqueue_callback(execution.execution_id, callback_url, context.get("callback_token"))
             self.deliver_callbacks()
         return finished
+
+    def _materialize(self, value: str, stack: ExitStack) -> Path:
+        if value.startswith("artifact://"):
+            temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-local-artifact-"))
+            return safe_extract(self.artifact_store.get(value.removeprefix("artifact://")), temporary)
+        if self.require_immutable_artifacts:
+            raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
+        return Path(value).expanduser().resolve()
+
+    def _materialize_task(self, value: str, manifest: dict, stack: ExitStack) -> Path:
+        task_path = self._materialize(value, stack)
+        expected = str(manifest.get("digest") or "")
+        if not expected:
+            if self.require_immutable_artifacts:
+                raise ValueError("task is missing an immutable digest")
+            return task_path
+        actual = task_digest(task_path)
+        if actual != expected:
+            raise ArtifactError(f"task digest mismatch: expected {expected}, got {actual}")
+        return task_path
 
     def deliver_callbacks(self) -> int:
         delivered = 0
@@ -164,6 +206,10 @@ class RemoteWorker:
         self.poll_seconds = poll_seconds
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.path_map = path_map
+        self.require_immutable_artifacts = (
+            os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
+            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+        )
 
     def _local_path(self, value: str) -> Path:
         source = Path(value).expanduser()
@@ -181,7 +227,21 @@ class RemoteWorker:
             identifier = value.removeprefix("artifact://")
             temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-remote-artifact-"))
             return safe_extract(self.client.download_artifact(self.worker_id, identifier), temporary)
+        if self.require_immutable_artifacts:
+            raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
         return self._local_path(value)
+
+    def _materialize_task(self, value: str, manifest: dict, stack: ExitStack) -> Path:
+        task_path = self._materialize(value, stack)
+        expected = str(manifest.get("digest") or "")
+        if not expected:
+            if self.require_immutable_artifacts:
+                raise ValueError("task is missing an immutable digest")
+            return task_path
+        actual = task_digest(task_path)
+        if actual != expected:
+            raise ArtifactError(f"task digest mismatch: expected {expected}, got {actual}")
+        return task_path
 
     def process_one(self) -> ExecutionResult | None:
         self.client.heartbeat_worker(self.worker_id)
@@ -195,7 +255,7 @@ class RemoteWorker:
         try:
             with ExitStack() as stack:
                 submission = self._materialize(context["submission_path"], stack).resolve()
-                task_path = self._materialize(task_payload["path"], stack).resolve()
+                task_path = self._materialize_task(task_payload["path"], task_payload.get("manifest") or {}, stack).resolve()
                 if not submission.is_dir():
                     raise ValueError(f"submission path is not a directory: {submission}")
                 raw = self.sandbox_runner.run(submission, task_path, execution_id)
@@ -210,6 +270,11 @@ class RemoteWorker:
                 queue=execution_payload.get("queue", "default"),
                 resource_class=execution_payload.get("resource_class", "cpu"),
                 priority=execution_payload.get("priority", 0),
+                task_digest=execution_payload.get("task_digest"),
+                evaluator=execution_payload.get("evaluator"),
+                runtime_image=execution_payload.get("runtime_image"),
+                seed=execution_payload.get("seed"),
+                event_id=execution_payload.get("event_id"),
             )
         except Exception as exc:  # noqa: BLE001 - worker must contain task failures
             result = ExecutionResult(
@@ -221,6 +286,11 @@ class RemoteWorker:
                 queue=execution_payload.get("queue", "default"),
                 resource_class=execution_payload.get("resource_class", "cpu"),
                 priority=execution_payload.get("priority", 0),
+                task_digest=execution_payload.get("task_digest"),
+                evaluator=execution_payload.get("evaluator"),
+                runtime_image=execution_payload.get("runtime_image"),
+                seed=execution_payload.get("seed"),
+                event_id=execution_payload.get("event_id"),
             )
         finished = self.client.finish_worker(self.worker_id, result.as_dict())
         callback_url = context.get("callback_url")

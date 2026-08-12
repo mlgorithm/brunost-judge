@@ -16,7 +16,7 @@ evaluation = judge.submit_evaluation(
     task_ref="ioai/radar-v1",
     submission_path="/var/lib/submissions/attempt-1",
     idempotency_key="student-42-attempt-1",
-    evaluation_kind="agent",
+    evaluation_kind="batch",
 )
 ```
 
@@ -45,9 +45,12 @@ match = judge.submit_match(
 )
 ```
 
-The reference worker still uses the task/evaluator seam for execution. A game
-runner can consume the same definitions and metadata without changing the
-public API.
+The reference judge intentionally returns `501 Not Implemented` for agent and
+match execution until a real runner plugin is installed. This keeps the public
+contract honest: a plugin must launch agent processes, run the referee, capture
+a replay, and persist tournament state. The reference distribution does not
+enable these declarations as executable evaluations; a future runner plugin
+must be installed and selected explicitly before they can be accepted.
 
 ## Platform Kit
 
