@@ -1,16 +1,17 @@
 # Brunost Judge
 
-Current release: `0.2.0` — standalone reference control plane and SDK.
+Current release: `0.3.0` — standalone control plane, production store adapter,
+worker routing, and signed callbacks.
 
 Brunost Judge is the platform-independent judging layer for ICPC, IOI, IOAI,
 and agent tasks. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary.
 
-The reference distribution includes the scorer core, task package validator,
-local CLI, SQLite-backed control plane, HTTP API, SDK, local worker, and Docker
-Compose deployment. Production worker isolation and provider adapters remain
-replaceable implementations behind these contracts.
+The distribution includes the scorer core, task package validator, local CLI,
+SQLite development control plane, optional PostgreSQL control plane, HTTP API,
+SDK, queue-aware worker, signed callbacks, operator console, and Docker Compose
+deployment. High-assurance sandboxing remains a replaceable host adapter.
 
 ## Quick start
 
@@ -37,6 +38,9 @@ Install the server extra and start the reference control plane:
 python -m pip install -e '.[server]'
 brunost server
 brunost worker
+
+# PostgreSQL and production HTTP dependencies
+python -m pip install -e '.[production]'
 ```
 
 Then register and submit through the SDK:
@@ -64,9 +68,9 @@ mkdir -p local-submissions
 docker compose up --build
 ```
 
-See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow and
-[`docs/production.md`](docs/production.md) for the controls required before an
-official contest.
+See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow,
+[`docs/production.md`](docs/production.md) for production controls, and
+[`docs/rollout.md`](docs/rollout.md) for the supervised canary checklist.
 
 ## The contract
 

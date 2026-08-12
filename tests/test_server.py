@@ -23,6 +23,8 @@ def test_api_registers_and_submits(tmp_path: Path):
     assert response.status_code == 202
     execution_id = response.json()["execution_id"]
     assert client.get(f"/v1/executions/{execution_id}").json()["status"] == "queued"
+    assert client.get("/v1/stats").json()["queued"] == 1
+    assert client.get("/v1/executions").json()[0]["queue"] == "default"
 
 
 def test_api_token_protects_control_plane(tmp_path: Path, monkeypatch):

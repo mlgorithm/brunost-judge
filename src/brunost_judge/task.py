@@ -8,6 +8,7 @@ the CLI without a large framework.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,26 @@ def validate_task(path: str | Path) -> TaskValidation:
         errors.append("missing private/ hidden-assets directory")
 
     return TaskValidation(root, kind, tuple(errors))
+
+
+def task_digest(path: str | Path) -> str:
+    """Return a stable SHA-256 digest for a task package.
+
+    File names and bytes are both covered, in sorted order, so operators can
+    pin exactly the package a worker is expected to execute.
+    """
+    root = Path(path).expanduser().resolve()
+    digest = hashlib.sha256()
+    for item in sorted(root.rglob("*")):
+        if not item.is_file() or item.is_symlink():
+            continue
+        relative = item.relative_to(root).as_posix().encode("utf-8")
+        content = item.read_bytes()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:

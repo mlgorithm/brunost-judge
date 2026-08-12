@@ -18,6 +18,21 @@ from typing import Any
 from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
 
 
+def create_store(database: str | Path = "judge.db"):
+    """Create the configured durable store.
+
+    SQLite remains the zero-dependency local default. A PostgreSQL URL selects
+    the optional production adapter, allowing the same API and worker code to
+    run against a shared multi-node control-plane database.
+    """
+    value = str(database)
+    if value.startswith(("postgresql://", "postgres://", "postgresql+psycopg://")):
+        from brunost_judge.postgres_store import PostgresJudgeStore
+
+        return PostgresJudgeStore(value)
+    return JudgeStore(database)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -61,7 +76,12 @@ class JudgeStore:
                     failure_reason TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    cancel_requested INTEGER NOT NULL DEFAULT 0
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    queue TEXT NOT NULL DEFAULT 'default',
+                    resource_class TEXT NOT NULL DEFAULT 'cpu',
+                    priority INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT,
+                    lease_expires_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS ix_executions_queue
                     ON executions(status, created_at);
@@ -76,6 +96,20 @@ class JudgeStore:
                 );
                 """
             )
+            # Keep existing reference deployments upgradeable without a manual
+            # migration command.  New installations get these columns from the
+            # CREATE TABLE above; old SQLite files are extended in place.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(executions)")}
+            for name, definition in (
+                ("queue", "TEXT NOT NULL DEFAULT 'default'"),
+                ("resource_class", "TEXT NOT NULL DEFAULT 'cpu'"),
+                ("priority", "INTEGER NOT NULL DEFAULT 0"),
+                ("worker_id", "TEXT"),
+                ("lease_expires_at", "TEXT"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE executions ADD COLUMN {name} {definition}")
+            db.execute("CREATE INDEX IF NOT EXISTS ix_executions_lease ON executions(status, lease_expires_at)")
 
     def register_task(self, task: TaskRecord) -> TaskRecord:
         with self._lock, self._connect() as db:
@@ -115,7 +149,8 @@ class JudgeStore:
                 """INSERT INTO executions(
                     execution_id,idempotency_key,task_ref,submission_path,callback_url,
                     callback_token,metadata_json,status,metrics_json,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    ,queue,resource_class,priority
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     execution_id,
                     request.idempotency_key,
@@ -128,21 +163,51 @@ class JudgeStore:
                     "{}",
                     now,
                     now,
+                    request.queue,
+                    request.resource_class,
+                    request.priority,
                 ),
             )
         return self.get_execution(execution_id)  # type: ignore[return-value]
 
-    def claim_next(self) -> tuple[ExecutionResult, TaskRecord, dict[str, Any]] | None:
+    def claim_next(
+        self,
+        *,
+        worker_id: str = "local-worker",
+        queues: tuple[str, ...] | None = None,
+        resource_classes: tuple[str, ...] | None = None,
+        lease_seconds: int = 300,
+    ) -> tuple[ExecutionResult, TaskRecord, dict[str, Any]] | None:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            now = datetime.now(UTC)
+            db.execute(
+                """UPDATE executions SET status='queued', worker_id=NULL, lease_expires_at=NULL, updated_at=?
+                   WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
+                (now.isoformat(), now.isoformat()),
+            )
+            clauses = ["status = 'queued'", "cancel_requested = 0"]
+            params: list[Any] = []
+            if queues:
+                clauses.append("queue IN (" + ",".join("?" for _ in queues) + ")")
+                params.extend(queues)
+            if resource_classes:
+                clauses.append("resource_class IN (" + ",".join("?" for _ in resource_classes) + ")")
+                params.extend(resource_classes)
             row = db.execute(
-                "SELECT * FROM executions WHERE status = 'queued' AND cancel_requested = 0 ORDER BY created_at LIMIT 1"
+                "SELECT * FROM executions WHERE " + " AND ".join(clauses) +
+                " ORDER BY priority DESC, created_at LIMIT 1",
+                params,
             ).fetchone()
             if row is None:
                 db.commit()
                 return None
-            now = _now()
-            db.execute("UPDATE executions SET status='running', updated_at=? WHERE execution_id=?", (now, row["execution_id"]))
+            now_text = now.isoformat()
+            lease = (now + timedelta(seconds=max(1, lease_seconds))).isoformat()
+            db.execute(
+                "UPDATE executions SET status='running', worker_id=?, lease_expires_at=?, updated_at=? WHERE execution_id=?",
+                (worker_id, lease, now_text, row["execution_id"]),
+            )
             task_row = db.execute("SELECT * FROM tasks WHERE task_ref=?", (row["task_ref"],)).fetchone()
             db.commit()
         if task_row is None:
@@ -153,13 +218,15 @@ class JudgeStore:
             "callback_url": row["callback_url"],
             "callback_token": row["callback_token"],
             "submission_path": row["submission_path"],
+            "queue": row["queue"],
+            "resource_class": row["resource_class"],
         }
 
     def finish(self, execution_id: str, result: ExecutionResult) -> ExecutionResult:
         with self._lock, self._connect() as db:
             db.execute(
                 """UPDATE executions SET status=?,score=?,metrics_json=?,failure_reason=?,
-                   metadata_json=?,updated_at=? WHERE execution_id=?""",
+                   metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=? WHERE execution_id=?""",
                 (
                     result.status,
                     result.score,
@@ -200,8 +267,13 @@ class JudgeStore:
             db.execute(
                 """UPDATE callback_deliveries SET attempts=attempts+1,
                    next_attempt_at=?,last_error=? WHERE execution_id=?""",
-                ((datetime.now(UTC) + timedelta(seconds=5)).isoformat(), error[:2000], execution_id),
+                ((datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, self._callback_attempts(db, execution_id)))))).isoformat(), error[:2000], execution_id),
             )
+
+    @staticmethod
+    def _callback_attempts(db: sqlite3.Connection, execution_id: str) -> int:
+        row = db.execute("SELECT attempts FROM callback_deliveries WHERE execution_id=?", (execution_id,)).fetchone()
+        return int(row[0]) if row else 0
 
     def cancel(self, execution_id: str) -> ExecutionResult | None:
         with self._lock, self._connect() as db:
@@ -216,6 +288,25 @@ class JudgeStore:
             row = db.execute("SELECT * FROM executions WHERE execution_id = ?", (execution_id,)).fetchone()
         return self._result(row) if row is not None else None
 
+    def list_executions(self, *, status: str | None = None, limit: int = 100) -> list[ExecutionResult]:
+        limit = max(1, min(1000, int(limit)))
+        with self._connect() as db:
+            if status:
+                rows = db.execute(
+                    "SELECT * FROM executions WHERE status=? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM executions ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [self._result(row) for row in rows]
+
+    def stats(self) -> dict[str, int]:
+        with self._connect() as db:
+            rows = db.execute("SELECT status, COUNT(*) AS count FROM executions GROUP BY status").fetchall()
+        result = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "canceled": 0}
+        result.update({str(row["status"]): int(row["count"]) for row in rows})
+        return result
+
     def _result(self, row: sqlite3.Row) -> ExecutionResult:
         return ExecutionResult(
             execution_id=row["execution_id"],
@@ -225,4 +316,7 @@ class JudgeStore:
             metrics=json.loads(row["metrics_json"]),
             failure_reason=row["failure_reason"],
             metadata=json.loads(row["metadata_json"]),
+            queue=row["queue"],
+            resource_class=row["resource_class"],
+            priority=row["priority"],
         )

@@ -1,6 +1,6 @@
 [project]
 name = "brunost-judge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Open-source, platform-independent judging contracts and task tooling"
 requires-python = ">=3.11"
 dependencies = []
@@ -10,6 +10,7 @@ brunost = "brunost_judge.cli:main"
 
 [project.optional-dependencies]
 server = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1"]
+production = ["fastapi>=0.115,<1", "uvicorn[standard]>=0.30,<1", "psycopg[binary]>=3.2,<4"]
 dev = ["pytest>=8", "numpy>=1.26", "ruff>=0.6", "fastapi>=0.115,<1", "httpx>=0.27,<1"]
 
 

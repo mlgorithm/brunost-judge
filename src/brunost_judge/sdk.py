@@ -7,6 +7,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from brunost_judge.security import verify_callback_signature
+
 
 class JudgeAPIError(RuntimeError):
     """An HTTP request to the judge API failed."""
@@ -41,7 +43,19 @@ class JudgeClient:
     def register_task(self, *, task_ref: str, path: str) -> dict[str, Any]:
         return self._request("POST", "/v1/tasks", {"task_ref": task_ref, "path": path})
 
-    def submit(self, *, task_ref: str, submission_path: str, idempotency_key: str, callback_url: str | None = None, callback_token: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def submit(
+        self,
+        *,
+        task_ref: str,
+        submission_path: str,
+        idempotency_key: str,
+        callback_url: str | None = None,
+        callback_token: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        queue: str = "default",
+        resource_class: str = "cpu",
+        priority: int = 0,
+    ) -> dict[str, Any]:
         return self._request("POST", "/v1/executions", {
             "task_ref": task_ref,
             "submission_path": submission_path,
@@ -49,7 +63,15 @@ class JudgeClient:
             "callback_url": callback_url,
             "callback_token": callback_token,
             "metadata": metadata or {},
+            "queue": queue,
+            "resource_class": resource_class,
+            "priority": priority,
         })
+
+    @staticmethod
+    def verify_callback(payload: bytes, *, secret: str, signature: str, timestamp: str) -> bool:
+        """Verify the signed callback headers emitted by a worker."""
+        return verify_callback_signature(payload, secret, signature, timestamp)
 
     def get_execution(self, execution_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/executions/{execution_id}")

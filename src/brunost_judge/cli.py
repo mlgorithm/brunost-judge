@@ -9,7 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from brunost_judge.task import SUPPORTED_KINDS, scaffold_task, validate_task
+from brunost_judge.task import (
+    SUPPORTED_KINDS,
+    scaffold_task,
+    task_digest,
+    validate_task,
+)
 from grader.harness import run
 
 
@@ -25,6 +30,8 @@ def _parser() -> argparse.ArgumentParser:
     new.add_argument("--force", action="store_true")
     validate = task_sub.add_parser("validate", help="validate a task package")
     validate.add_argument("path", type=Path)
+    digest = task_sub.add_parser("digest", help="compute an immutable task package digest")
+    digest.add_argument("path", type=Path)
 
     run_parser = subparsers.add_parser("run", help="run a task scorer locally")
     run_parser.add_argument("task", type=Path)
@@ -34,11 +41,15 @@ def _parser() -> argparse.ArgumentParser:
     server = subparsers.add_parser("server", help="run the standalone HTTP API")
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", default=8787, type=int)
-    server.add_argument("--database", type=Path)
+    server.add_argument("--database", type=str)
 
     worker = subparsers.add_parser("worker", help="run a local execution worker")
-    worker.add_argument("--database", type=Path)
+    worker.add_argument("--database", type=str)
     worker.add_argument("--poll-seconds", default=1.0, type=float)
+    worker.add_argument("--worker-id")
+    worker.add_argument("--queue", action="append", dest="queues", help="queue to consume (repeatable)")
+    worker.add_argument("--resource-class", action="append", dest="resource_classes", help="resource class to consume (repeatable)")
+    worker.add_argument("--lease-seconds", default=300, type=int)
     worker.add_argument("--once", action="store_true")
     init = subparsers.add_parser("init", help="create a local judge project")
     init.add_argument("path", nargs="?", type=Path, default=Path("."))
@@ -71,6 +82,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "task" and args.task_command == "validate":
         return _validate(args.path)
+    if args.command == "task" and args.task_command == "digest":
+        validation = validate_task(args.path)
+        if not validation.valid:
+            return _validate(args.path)
+        print(task_digest(args.path))
+        return 0
     if args.command == "run":
         validation = validate_task(args.task)
         if not validation.valid:
@@ -94,10 +111,17 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(args.database), host=args.host, port=args.port)
         return 0
     if args.command == "worker":
-        from brunost_judge.store import JudgeStore
+        from brunost_judge.store import create_store
         from brunost_judge.worker import LocalWorker
 
-        worker = LocalWorker(JudgeStore(args.database or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")), poll_seconds=args.poll_seconds)
+        worker = LocalWorker(
+            create_store(args.database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")),
+            poll_seconds=args.poll_seconds,
+            worker_id=args.worker_id,
+            queues=tuple(args.queues) if args.queues else None,
+            resource_classes=tuple(args.resource_classes) if args.resource_classes else None,
+            lease_seconds=args.lease_seconds,
+        )
         if args.once:
             return 0 if worker.process_one() is not None else 1
         worker.run_forever()
@@ -108,10 +132,10 @@ def main(argv: list[str] | None = None) -> int:
         (root / "tasks").mkdir(exist_ok=True)
         config = root / "brunost.yaml"
         if not config.exists():
-            config.write_text("version: 1\nname: my-judge\ndatabase: judge.db\n", encoding="utf-8")
+            config.write_text("version: 1\nname: my-judge\ndatabase: judge.db\nqueues:\n  - default\nresource_classes:\n  - cpu\n", encoding="utf-8")
         env = root / ".env.example"
         if not env.exists():
-            env.write_text("# Set this for a non-local deployment\nBRUNOST_JUDGE_API_TOKEN=replace-me\n", encoding="utf-8")
+            env.write_text("# Required before exposing the API\nBRUNOST_JUDGE_API_TOKEN=replace-me\nBRUNOST_JUDGE_REQUIRE_API_TOKEN=true\n# Required for signed result callbacks\nBRUNOST_JUDGE_CALLBACK_SIGNING_SECRET=replace-with-a-long-random-secret\n", encoding="utf-8")
         print(f"initialized judge project: {root}")
         return 0
     if args.command == "up":

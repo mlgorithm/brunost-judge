@@ -27,6 +27,9 @@ class ExecutionRequest:
     callback_url: str | None = None
     callback_token: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    queue: str = "default"
+    resource_class: str = "cpu"
+    priority: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -42,6 +45,9 @@ class ExecutionResult:
     failure_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     judge_version: str = "local"
+    queue: str = "default"
+    resource_class: str = "cpu"
+    priority: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

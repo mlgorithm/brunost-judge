@@ -22,10 +22,20 @@ The API is available at `http://127.0.0.1:8787`, with interactive docs at
 `POST /v1/tasks`, submit an execution through `POST /v1/executions`, and poll the
 execution or receive a callback.
 
-Set `BRUNOST_JUDGE_API_TOKEN` before exposing the API beyond localhost. The
-reference SQLite worker is intended for development, classrooms, and small
-single-node events. It is not a substitute for the hardened production worker
-profile described below.
+Set `BRUNOST_JUDGE_API_TOKEN`, `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET`, and
+`POSTGRES_PASSWORD` to non-default values before exposing the API beyond a local
+test. The Compose profile uses PostgreSQL; a direct `brunost server` invocation
+still defaults to SQLite for development.
+
+Workers can be split by queue and hardware:
+
+```bash
+brunost worker --queue default --resource-class cpu --worker-id cpu-1
+brunost worker --queue ioai-gpu --resource-class gpu --worker-id gpu-1
+```
+
+The API exposes `/v1/stats` and `/v1/executions` for a lightweight operator
+view; the `/console` page uses the API token stored in the current browser.
 
 ## Existing platform integration
 

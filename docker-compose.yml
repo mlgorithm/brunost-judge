@@ -1,30 +1,56 @@
 services:
+  judge-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-brunost_judge}
+      POSTGRES_USER: ${POSTGRES_USER:-brunost}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-development-only}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-brunost} -d ${POSTGRES_DB:-brunost_judge}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - judge-postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   judge-api:
     build: .
     command: ["brunost", "server", "--host", "0.0.0.0", "--port", "8787"]
     environment:
-      BRUNOST_JUDGE_DB: /var/lib/brunost/judge.db
-      BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN:-}
+      BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
+      BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN:-change-me-before-exposure}
+      BRUNOST_JUDGE_REQUIRE_API_TOKEN: "true"
+      BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
     ports:
       - "8787:8787"
     volumes:
-      - judge-data:/var/lib/brunost
       - ./examples:/tasks:ro
       - ./local-submissions:/submissions
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      judge-postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   judge-worker:
     build: .
-    command: ["brunost", "worker", "--poll-seconds", "1"]
+    command: ["brunost", "worker", "--poll-seconds", "1", "--queue", "default", "--resource-class", "cpu"]
     environment:
-      BRUNOST_JUDGE_DB: /var/lib/brunost/judge.db
+      BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
+      BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
     volumes:
-      - judge-data:/var/lib/brunost
       - ./examples:/tasks:ro
       - ./local-submissions:/submissions
+    read_only: true
+    tmpfs:
+      - /tmp
     depends_on:
-      - judge-api
+      judge-postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
-  judge-data:
+  judge-postgres-data:
