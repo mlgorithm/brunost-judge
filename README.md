@@ -71,6 +71,8 @@ docker compose up --build
 See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow,
 [`docs/production.md`](docs/production.md) for production controls, and
 [`docs/rollout.md`](docs/rollout.md) for the supervised canary checklist.
+See [`docs/ownership.md`](docs/ownership.md) for the boundary between the judge
+and an LMS/platform.
 
 ## The contract
 
