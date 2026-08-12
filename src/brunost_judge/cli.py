@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,6 +30,21 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", type=Path)
     run_parser.add_argument("--submission", required=True, type=Path)
     run_parser.add_argument("--result", type=Path, help="write canonical JSON result to this file")
+
+    server = subparsers.add_parser("server", help="run the standalone HTTP API")
+    server.add_argument("--host", default="127.0.0.1")
+    server.add_argument("--port", default=8787, type=int)
+    server.add_argument("--database", type=Path)
+
+    worker = subparsers.add_parser("worker", help="run a local execution worker")
+    worker.add_argument("--database", type=Path)
+    worker.add_argument("--poll-seconds", default=1.0, type=float)
+    worker.add_argument("--once", action="store_true")
+    init = subparsers.add_parser("init", help="create a local judge project")
+    init.add_argument("path", nargs="?", type=Path, default=Path("."))
+    up = subparsers.add_parser("up", help="start the Docker Compose reference deployment")
+    up.add_argument("--detach", action="store_true")
+    up.add_argument("--file", type=Path, default=Path("docker-compose.yml"))
     return parser
 
 
@@ -65,4 +82,41 @@ def main(argv: list[str] | None = None) -> int:
             args.result.write_text(encoded + "\n", encoding="utf-8")
         print(encoded)
         return 0 if result.get("status") == "completed" else 1
+    if args.command == "server":
+        try:
+            import uvicorn
+
+            from brunost_judge.server import create_app
+        except ImportError:
+            print("Install brunost-judge[server] to run the API", file=sys.stderr)
+            return 2
+        os.environ["BRUNOST_JUDGE_IMPORT_APP"] = "false"
+        uvicorn.run(create_app(args.database), host=args.host, port=args.port)
+        return 0
+    if args.command == "worker":
+        from brunost_judge.store import JudgeStore
+        from brunost_judge.worker import LocalWorker
+
+        worker = LocalWorker(JudgeStore(args.database or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")), poll_seconds=args.poll_seconds)
+        if args.once:
+            return 0 if worker.process_one() is not None else 1
+        worker.run_forever()
+        return 0
+    if args.command == "init":
+        root = args.path.expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "tasks").mkdir(exist_ok=True)
+        config = root / "brunost.yaml"
+        if not config.exists():
+            config.write_text("version: 1\nname: my-judge\ndatabase: judge.db\n", encoding="utf-8")
+        env = root / ".env.example"
+        if not env.exists():
+            env.write_text("# Set this for a non-local deployment\nBRUNOST_JUDGE_API_TOKEN=replace-me\n", encoding="utf-8")
+        print(f"initialized judge project: {root}")
+        return 0
+    if args.command == "up":
+        command = ["docker", "compose", "-f", str(args.file), "up", "--build"]
+        if args.detach:
+            command.append("--detach")
+        return subprocess.run(command, check=False).returncode
     return 2

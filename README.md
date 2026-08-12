@@ -5,10 +5,10 @@ and agent tasks. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary.
 
-This first public extraction is deliberately small. It contains the scorer core,
-task package validator, and local CLI. The server, worker fleet, and reference
-console will be added behind the same contracts rather than copied from a
-platform-specific backend.
+The reference distribution includes the scorer core, task package validator,
+local CLI, SQLite-backed control plane, HTTP API, SDK, local worker, and Docker
+Compose deployment. Production worker isolation and provider adapters remain
+replaceable implementations behind these contracts.
 
 ## Quick start
 
@@ -17,11 +17,54 @@ python -m pip install -e '.[dev]'
 brunost task new ioai tasks/example
 brunost task validate tasks/example
 brunost run tasks/example --submission ./submission
+
+# standalone API + worker
+brunost server
+brunost worker
 ```
 
 The generated task can be run locally without a database, Redis, cloud account,
 or Brunost platform. Official workers mount the same task package into a sealed
 sandbox.
+
+## Standalone API
+
+Install the server extra and start the reference control plane:
+
+```bash
+python -m pip install -e '.[server]'
+brunost server
+brunost worker
+```
+
+Then register and submit through the SDK:
+
+```python
+from brunost_judge.sdk import JudgeClient
+
+judge = JudgeClient("http://127.0.0.1:8787")
+judge.register_task(task_ref="demo/v1", path="./tasks/demo")
+execution = judge.submit(
+    task_ref="demo/v1",
+    submission_path="./submissions/run-1",
+    idempotency_key="student-1-demo-attempt-1",
+)
+```
+
+The API is deliberately execution-oriented. A consuming LMS owns users,
+contest rules, official leaderboard visibility, and appeals. The standalone
+console is an operator health/API surface; it is not a replacement LMS.
+
+Docker Compose provides the same flow for a small country or classroom:
+
+```bash
+mkdir -p local-submissions
+docker compose up --build
+```
+
+See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow and
+[`docs/production.md`](docs/production.md) for the controls required before an
+official contest.
 
 ## The contract
 

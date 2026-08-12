@@ -1,0 +1,30 @@
+services:
+  judge-api:
+    build: .
+    command: ["brunost", "server", "--host", "0.0.0.0", "--port", "8787"]
+    environment:
+      BRUNOST_JUDGE_DB: /var/lib/brunost/judge.db
+      BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN:-}
+    ports:
+      - "8787:8787"
+    volumes:
+      - judge-data:/var/lib/brunost
+      - ./examples:/tasks:ro
+      - ./local-submissions:/submissions
+    restart: unless-stopped
+
+  judge-worker:
+    build: .
+    command: ["brunost", "worker", "--poll-seconds", "1"]
+    environment:
+      BRUNOST_JUDGE_DB: /var/lib/brunost/judge.db
+    volumes:
+      - judge-data:/var/lib/brunost
+      - ./examples:/tasks:ro
+      - ./local-submissions:/submissions
+    depends_on:
+      - judge-api
+    restart: unless-stopped
+
+volumes:
+  judge-data:
