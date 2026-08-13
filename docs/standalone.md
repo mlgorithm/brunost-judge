@@ -48,6 +48,10 @@ brunost node doctor --config /etc/brunost/node.json
 
 See [`node-onboarding.md`](node-onboarding.md) for the complete three-node
 operator workflow and path-mount requirements.
+For a copy-paste local test of a real API process and separately running remote
+worker, see [`local-worker-smoke-test.md`](local-worker-smoke-test.md). That
+walkthrough is Judge-only; it deliberately does not start the Platform UI,
+users, contests, or leaderboard services.
 
 The API exposes `/v1/stats` and `/v1/executions` for a lightweight operator
 view; the `/console` page uses the API token stored in the current browser. It

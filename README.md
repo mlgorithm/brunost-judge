@@ -92,7 +92,8 @@ docker compose up --build
 
 See [`docs/standalone.md`](docs/standalone.md) for the country/operator flow,
 [`docs/node-onboarding.md`](docs/node-onboarding.md) for zero-code three-node
-onboarding,
+onboarding, and [`docs/local-worker-smoke-test.md`](docs/local-worker-smoke-test.md)
+for a reproducible local Judge-plus-worker test,
 [`docs/production.md`](docs/production.md) for production controls, and
 [`docs/rollout.md`](docs/rollout.md) for the supervised canary checklist.
 See [`docs/ownership.md`](docs/ownership.md) for the boundary between the judge
