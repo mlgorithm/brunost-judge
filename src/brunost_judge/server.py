@@ -173,7 +173,11 @@ def create_app(database: str | Path | None = None):
         production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
         require_https = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS", "false").lower() == "true"
         if require_https and parsed.scheme != "https":
-            raise HTTPException(status_code=422, detail="callback_url must use https in production")
+            allowlist = {host.strip().lower() for host in os.environ.get("BRUNOST_JUDGE_CALLBACK_HOSTS", "").split(",") if host.strip()}
+            internal_http = os.environ.get("BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS", "false").lower() == "true"
+            internal_http_allowed = internal_http and parsed.hostname and parsed.hostname.lower() in allowlist
+            if not internal_http_allowed:
+                raise HTTPException(status_code=422, detail="callback_url must use https in production")
         allowlist = {host.strip().lower() for host in os.environ.get("BRUNOST_JUDGE_CALLBACK_HOSTS", "").split(",") if host.strip()}
         if production and not allowlist:
             raise HTTPException(status_code=503, detail="BRUNOST_JUDGE_CALLBACK_HOSTS is required in production")

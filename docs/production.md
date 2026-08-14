@@ -15,7 +15,10 @@ Before an official contest, operators must provide:
 - signed result callbacks using `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET` and the
   `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers. Production
   requires HTTPS callback URLs, an explicit `BRUNOST_JUDGE_CALLBACK_HOSTS`
-  allowlist, and durable receiver-side deduplication of the signed event ID;
+  allowlist, and durable receiver-side deduplication of the signed event ID.
+  An isolated service mesh may set
+  `BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=true` for an allowlisted
+  internal hostname only; public callbacks remain HTTPS-only;
 - one-time node enrollment with `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true` and
   a separate scoped credential per worker;
 - backups, monitoring, alerting, and a rehearsed restore/failover plan;

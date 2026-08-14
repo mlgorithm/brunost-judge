@@ -33,6 +33,9 @@ CONTROL_PLANE_COMPOSE = """services:
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET}
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS: "true"
+      # Keep this false for public callbacks.  An isolated service mesh may
+      # explicitly enable it only for a hostname in BRUNOST_JUDGE_CALLBACK_HOSTS.
+      BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS: ${BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS:-false}
       BRUNOST_JUDGE_CALLBACK_HOSTS: ${BRUNOST_JUDGE_CALLBACK_HOSTS:?set the platform callback hostname allowlist}
     ports:
       - \"8787:8787\"
@@ -123,7 +126,7 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         "docker-compose.control.yml": CONTROL_PLANE_COMPOSE,
         "docker-compose.worker.yml": WORKER_COMPOSE,
         "RUNBOOK.md": RUNBOOK,
-        "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\n",
+        "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\nBRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=false\n",
     }
     written: list[Path] = []
     for name, content in files.items():
