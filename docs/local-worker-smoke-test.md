@@ -39,6 +39,16 @@ Leave the server running. The `process` sandbox is for local development only;
 it executes the scorer in the worker process. Production workers should use
 Docker with gVisor/Kata/Firecracker or another certified isolation runtime.
 
+If this worker will deliver callbacks to a Platform Kit application, also set
+the same signing secret in the worker environment and in the platform:
+
+```bash
+export BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET=local-callback-secret
+```
+
+The Platform Kit rejects unsigned callbacks. A temporary callback receiver
+outage is retried by the remote worker without terminating the worker loop.
+
 ## 2. Issue and consume a worker token
 
 In Terminal 2, use the path printed by Terminal 1:

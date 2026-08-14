@@ -2,7 +2,7 @@ from pathlib import Path
 
 from brunost_judge.contracts import ExecutionRequest, TaskRecord
 from brunost_judge.store import JudgeStore
-from brunost_judge.worker import LocalWorker
+from brunost_judge.worker import LocalWorker, RemoteWorker
 
 
 def test_idempotent_execution_and_local_worker(tmp_path: Path):
@@ -47,3 +47,20 @@ def test_callback_delivery_is_durable(tmp_path: Path, monkeypatch):
     worker.process_one()
     assert calls
     assert store.pending_callbacks() == []
+
+
+def test_remote_callback_failure_does_not_crash_worker(monkeypatch):
+    worker = RemoteWorker.__new__(RemoteWorker)
+    worker._pending_callbacks = []
+
+    def fail(*_args):
+        raise OSError("callback receiver unavailable")
+
+    monkeypatch.setattr("brunost_judge.worker._notify", fail)
+    payload = {"execution_id": "eval-1", "event_id": "execution:eval-1:result"}
+    worker._send_callback("http://callback.invalid", None, payload)
+    assert len(worker._pending_callbacks) == 1
+
+    monkeypatch.setattr("brunost_judge.worker._notify", lambda *_args: None)
+    worker._deliver_pending_callbacks()
+    assert worker._pending_callbacks == []

@@ -8,6 +8,7 @@ container/microVM worker profile.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -27,6 +28,8 @@ from brunost_judge.sdk import JudgeClient
 from brunost_judge.security import callback_signature
 from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
@@ -210,6 +213,7 @@ class RemoteWorker:
         self.poll_seconds = poll_seconds
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.path_map = path_map
+        self._pending_callbacks: list[tuple[str, str | None, dict, str | None]] = []
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
             or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
@@ -248,6 +252,7 @@ class RemoteWorker:
         return task_path
 
     def process_one(self) -> ExecutionResult | None:
+        self._deliver_pending_callbacks()
         self.client.heartbeat_worker(self.worker_id)
         claimed = self.client.claim_worker(self.worker_id)
         if not claimed:
@@ -299,13 +304,27 @@ class RemoteWorker:
         finished = self.client.finish_worker(self.worker_id, result.as_dict())
         callback_url = context.get("callback_url")
         if callback_url:
-            _notify(
-                callback_url,
-                context.get("callback_token"),
-                finished,
-                os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET"),
-            )
+            self._send_callback(callback_url, context.get("callback_token"), finished)
         return result
+
+    def _send_callback(self, callback_url: str, callback_token: str | None, payload: dict) -> None:
+        signing_secret = os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+        try:
+            _notify(callback_url, callback_token, payload, signing_secret)
+        except Exception as exc:  # noqa: BLE001 - retain the result and retry without crashing the worker
+            LOGGER.warning("callback delivery failed for %s: %s", payload.get("execution_id"), exc)
+            self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret))
+
+    def _deliver_pending_callbacks(self) -> None:
+        if not self._pending_callbacks:
+            return
+        pending, self._pending_callbacks = self._pending_callbacks, []
+        for callback_url, callback_token, payload, signing_secret in pending:
+            try:
+                _notify(callback_url, callback_token, payload, signing_secret)
+            except Exception as exc:  # noqa: BLE001 - leave the item queued for the next poll
+                LOGGER.warning("callback retry failed for %s: %s", payload.get("execution_id"), exc)
+                self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret))
 
     def run_forever(self) -> None:
         while True:
