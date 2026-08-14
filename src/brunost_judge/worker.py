@@ -150,7 +150,12 @@ class LocalWorker:
     def _materialize(self, value: str, stack: ExitStack) -> Path:
         if value.startswith("artifact://"):
             temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-local-artifact-"))
-            return safe_extract(self.artifact_store.get(value.removeprefix("artifact://")), temporary)
+            # Sandbox containers run as an unprivileged UID.  TemporaryDirectory
+            # defaults to 0700, which would make an otherwise valid artifact
+            # invisible to that UID when the directory is bind-mounted.
+            root = Path(temporary)
+            root.chmod(0o755)
+            return safe_extract(self.artifact_store.get(value.removeprefix("artifact://")), root)
         if self.require_immutable_artifacts:
             raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
         return Path(value).expanduser().resolve()
@@ -234,7 +239,12 @@ class RemoteWorker:
         if value.startswith("artifact://"):
             identifier = value.removeprefix("artifact://")
             temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-remote-artifact-"))
-            return safe_extract(self.client.download_artifact(self.worker_id, identifier), temporary)
+            # The Docker/gVisor sandbox uses UID 65534 and needs to traverse
+            # this bind-mounted extraction root.  Keep files read-only but make
+            # the directory searchable by the sandbox user.
+            root = Path(temporary)
+            root.chmod(0o755)
+            return safe_extract(self.client.download_artifact(self.worker_id, identifier), root)
         if self.require_immutable_artifacts:
             raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
         return self._local_path(value)

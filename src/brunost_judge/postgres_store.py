@@ -314,7 +314,11 @@ class PostgresJudgeStore:
 
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
         with self._connect() as db:
-            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
+            # PostgreSQL cannot infer the type of a parameter used only in
+            # ``%s IS NULL`` when the worker id is absent.  Explicitly cast
+            # that guard to the column type so finishing an execution works
+            # for both scoped and unscoped callers.
+            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s::text IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
