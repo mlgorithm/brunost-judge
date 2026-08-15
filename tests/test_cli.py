@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from brunost_judge.cli import main
+from brunost_judge.deployment import render_country_bundle
 
 
 def test_task_scaffold_and_validation(tmp_path: Path, capsys):
@@ -29,3 +30,12 @@ def test_cluster_init_generates_private_operator_environment(tmp_path: Path, cap
     assert (tmp_path / "docker-compose.worker.yml").exists()
     assert (tmp_path / "RUNBOOK.md").exists()
     assert "created cluster configuration" in capsys.readouterr().out
+
+
+def test_generated_bundle_respects_container_entrypoints(tmp_path: Path):
+    render_country_bundle(tmp_path, force=True)
+    control = (tmp_path / "docker-compose.control.yml").read_text(encoding="utf-8")
+    worker = (tmp_path / "docker-compose.worker.yml").read_text(encoding="utf-8")
+    assert 'command: ["server"' in control
+    assert 'command: ["worker"' in worker
+    assert 'command: ["brunost"' not in control + worker

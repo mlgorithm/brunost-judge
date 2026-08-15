@@ -22,7 +22,7 @@ CONTROL_PLANE_COMPOSE = """services:
 
   judge-api:
     image: ${BRUNOST_JUDGE_IMAGE}
-    command: [\"brunost\", \"server\", \"--host\", \"0.0.0.0\", \"--port\", \"8787\"]
+    command: [\"server\", \"--host\", \"0.0.0.0\", \"--port\", \"8787\"]
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@judge-postgres:5432/${POSTGRES_DB}
       BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN}
@@ -71,7 +71,7 @@ WORKER_COMPOSE = """services:
     restart: unless-stopped
   judge-worker:
     image: ${BRUNOST_JUDGE_IMAGE}
-    command: [\"brunost\", \"worker\", \"--config\", \"/etc/brunost/node.json\"]
+    command: [\"worker\", \"--config\", \"/etc/brunost/node.json\"]
     environment:
       BRUNOST_JUDGE_SANDBOX_MODE: ${BRUNOST_JUDGE_SANDBOX_MODE:-docker}
       BRUNOST_JUDGE_SANDBOX_IMAGE: ${BRUNOST_JUDGE_SANDBOX_IMAGE}
