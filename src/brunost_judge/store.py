@@ -92,6 +92,9 @@ class JudgeStore:
                     status TEXT NOT NULL,
                     score REAL,
                     metrics_json TEXT NOT NULL,
+                    scores_json TEXT NOT NULL DEFAULT '{}',
+                    winner TEXT,
+                    artifacts_json TEXT NOT NULL DEFAULT '{}',
                     failure_reason TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -160,6 +163,9 @@ class JudgeStore:
                 ("priority", "INTEGER NOT NULL DEFAULT 0"),
                 ("worker_id", "TEXT"),
                 ("lease_expires_at", "TEXT"),
+                ("scores_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("winner", "TEXT"),
+                ("artifacts_json", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE executions ADD COLUMN {name} {definition}")
@@ -355,12 +361,14 @@ class JudgeStore:
             metadata["evaluator"] = manifest.get("evaluator")
             metadata["runtime_image"] = manifest.get("runtime_image") or manifest.get("runtime")
             metadata["event_id"] = f"execution:{execution_id}:result"
+            if request.timeout_seconds is not None:
+                metadata["timeout_seconds"] = request.timeout_seconds
             db.execute(
                 """INSERT INTO executions(
                     execution_id,idempotency_key,task_ref,submission_path,callback_url,
-                    callback_token,metadata_json,status,metrics_json,created_at,updated_at
+                    callback_token,metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at
                     ,queue,resource_class,priority
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     execution_id,
                     request.idempotency_key,
@@ -370,6 +378,8 @@ class JudgeStore:
                     request.callback_token,
                     json.dumps(metadata, sort_keys=True),
                     "queued",
+                    "{}",
+                    "{}",
                     "{}",
                     now,
                     now,
@@ -447,13 +457,16 @@ class JudgeStore:
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
         with self._lock, self._connect() as db:
             cursor = db.execute(
-                """UPDATE executions SET status=?,score=?,metrics_json=?,failure_reason=?,
+                """UPDATE executions SET status=?,score=?,metrics_json=?,scores_json=?,winner=?,artifacts_json=?,failure_reason=?,
                    metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=?
                    WHERE execution_id=? AND (? IS NULL OR worker_id=?)""",
                 (
                     result.status,
                     result.score,
                     json.dumps(result.metrics, sort_keys=True),
+                    json.dumps(result.scores, sort_keys=True),
+                    result.winner,
+                    json.dumps(result.artifacts, sort_keys=True),
                     result.failure_reason,
                     json.dumps(result.metadata, sort_keys=True),
                     _now(),
@@ -510,6 +523,11 @@ class JudgeStore:
             )
         return self.get_execution(execution_id)
 
+    def is_cancel_requested(self, execution_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute("SELECT cancel_requested FROM executions WHERE execution_id=?", (execution_id,)).fetchone()
+        return bool(row and row[0])
+
     def get_execution(self, execution_id: str) -> ExecutionResult | None:
         with self._connect() as db:
             row = db.execute("SELECT * FROM executions WHERE execution_id = ?", (execution_id,)).fetchone()
@@ -552,6 +570,9 @@ class JudgeStore:
             runtime_image=metadata.get("runtime_image"),
             seed=metadata.get("seed"),
             event_id=metadata.get("event_id"),
+            scores=json.loads(row["scores_json"] or "{}"),
+            winner=row["winner"],
+            artifacts=json.loads(row["artifacts_json"] or "{}"),
         )
 
     @staticmethod

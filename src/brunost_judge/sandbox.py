@@ -12,8 +12,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -27,13 +29,109 @@ class SandboxRunner(Protocol):
     def run(self, submission: Path, task: Path, execution_id: str) -> dict[str, Any]: ...
 
 
+def _artifact_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("BRUNOST_JUDGE_RESULT_ARTIFACT_MAX_BYTES", str(64 * 1024 * 1024))))
+    except ValueError:
+        return 64 * 1024 * 1024
+
+
+def collect_result_artifacts(result: dict[str, Any], output_root: Path) -> dict[str, Any]:
+    """Package runner-declared files for the worker's content-addressed store."""
+
+    declarations = result.get("artifacts") or {}
+    if not declarations:
+        return result
+    artifact_root = (output_root / "artifacts").resolve()
+    payloads: dict[str, dict[str, Any]] = {}
+    total_bytes = 0
+    for name, descriptor in declarations.items():
+        path_value = descriptor.get("path") if isinstance(descriptor, dict) else descriptor
+        if not isinstance(path_value, str):
+            return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"result artifact {name!r} has no path"}
+        target = (artifact_root / path_value).resolve()
+        if target != artifact_root and artifact_root not in target.parents:
+            return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"result artifact {name!r} escapes output_path"}
+        if not target.exists():
+            return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"result artifact {name!r} was not created"}
+        if target.is_dir():
+            package_root = target
+            size = sum(item.stat().st_size for item in target.rglob("*") if item.is_file())
+            filename = target.name
+        elif target.is_file():
+            package_root = Path(tempfile.mkdtemp(prefix="brunost-result-artifact-"))
+            filename = target.name
+            shutil.copyfile(target, package_root / filename)
+            size = target.stat().st_size
+        else:
+            return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"result artifact {name!r} is not a file or directory"}
+        try:
+            if size > _artifact_limit():
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"result artifact {name!r} exceeds configured size limit"}
+            total_bytes += size
+            if total_bytes > _artifact_limit() * 4:
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": "result artifacts exceed configured total size limit"}
+            payloads[name] = {
+                "data": pack_directory(package_root),
+                "media_type": descriptor.get("media_type") if isinstance(descriptor, dict) else None,
+                "kind": descriptor.get("kind") if isinstance(descriptor, dict) else None,
+                "filename": filename,
+            }
+        finally:
+            if target.is_file():
+                shutil.rmtree(package_root, ignore_errors=True)
+    result = dict(result)
+    result["_artifact_payloads"] = payloads
+    return result
+
+
+class _SandboxTimeout(BaseException):
+    pass
+
+
+def _run_with_timeout(callback, timeout_seconds: int):  # type: ignore[no-untyped-def]
+    if timeout_seconds <= 0 or threading.current_thread() is not threading.main_thread():
+        return callback()
+
+    def raise_timeout(_signum, _frame):  # type: ignore[no-untyped-def]
+        raise _SandboxTimeout(f"sandbox timed out after {timeout_seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return callback()
+    except _SandboxTimeout:
+        return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"sandbox timed out after {timeout_seconds}s"}
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 @dataclass(frozen=True)
 class ProcessSandboxRunner:
     """Development runner; task code executes in the worker process."""
 
+    timeout_seconds: int = 900
+
+    def with_timeout(self, timeout_seconds: int | None):
+        if timeout_seconds is None:
+            return self
+        return type(self)(max(1, int(timeout_seconds)))
+
     def run(self, submission: Path, task: Path, execution_id: str) -> dict[str, Any]:
         _ = execution_id
-        return run(str(submission), str(task))
+        with tempfile.TemporaryDirectory(prefix="brunost-process-output-") as output_dir:
+            artifact_path = str(Path(output_dir) / "artifacts")
+            previous = os.environ.get("RESULT_ARTIFACTS_PATH")
+            os.environ["RESULT_ARTIFACTS_PATH"] = artifact_path
+            try:
+                result = _run_with_timeout(lambda: run(str(submission), str(task)), self.timeout_seconds)
+            finally:
+                if previous is None:
+                    os.environ.pop("RESULT_ARTIFACTS_PATH", None)
+                else:
+                    os.environ["RESULT_ARTIFACTS_PATH"] = previous
+            return collect_result_artifacts(result, Path(output_dir))
 
 
 @dataclass(frozen=True)
@@ -61,6 +159,8 @@ class DockerSandboxRunner:
                 return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": str(exc)}
             output = Path(output_dir)
             output.chmod(0o777)
+            (output / "artifacts").mkdir()
+            (output / "artifacts").chmod(0o777)
             label = f"brunost.judge.execution={execution_id}"
             command = [
                 "docker", "run", "--rm", "--interactive", "--label", label,
@@ -81,6 +181,7 @@ class DockerSandboxRunner:
                 "--env", "SUBMISSION_PATH=/workspace/submission",
                 "--env", "BRUNOST_JUDGE_TASK_BUNDLE=stdin",
                 "--env", "RESULT_PATH=/workspace/output/results.json",
+                "--env", "RESULT_ARTIFACTS_PATH=/workspace/output/artifacts",
                 "--env", "HOME=/tmp",
                 # The task bundle is delivered on evaluator stdin and extracted
                 # into root-only tmpfs; it is never mounted into the container.
@@ -120,12 +221,25 @@ class DockerSandboxRunner:
                         if completed.returncode != 0 and result.get("status") == "completed":
                             result["status"] = "failed"
                             result["failure_reason"] = "sandbox exited unsuccessfully"
-                        return result
+                        return collect_result_artifacts(result, output)
                 except (OSError, json.JSONDecodeError):
                     pass
             raw_detail = completed.stderr or completed.stdout or b"sandbox produced no result"
             detail = raw_detail.decode("utf-8", errors="replace") if isinstance(raw_detail, bytes) else str(raw_detail)
             return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"sandbox exit {completed.returncode}: {detail[:1800]}"}
+
+    def with_timeout(self, timeout_seconds: int | None):
+        if timeout_seconds is None:
+            return self
+        return type(self)(
+            image=self.image,
+            runtime=self.runtime,
+            timeout_seconds=max(1, int(timeout_seconds)),
+            memory=self.memory,
+            cpus=self.cpus,
+            pids_limit=self.pids_limit,
+            seccomp_profile=self.seccomp_profile,
+        )
 
     @staticmethod
     def _cleanup(label: str) -> None:

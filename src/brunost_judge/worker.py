@@ -105,6 +105,42 @@ def _validated_runner_result(raw: object) -> dict:
     return raw
 
 
+def _execution_timeout(metadata: dict[str, Any], task_manifest: dict[str, Any]) -> int | None:
+    value = metadata.get("timeout_seconds")
+    if value is None and task_manifest.get("time_limit_ms") is not None:
+        value = (int(task_manifest["time_limit_ms"]) + 999) // 1000
+    if value is None:
+        return None
+    try:
+        return max(1, min(86400, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _configured_sandbox(runner: SandboxRunner, timeout_seconds: int | None) -> SandboxRunner:
+    configure = getattr(runner, "with_timeout", None)
+    if callable(configure):
+        return configure(timeout_seconds)
+    return runner
+
+
+def _persist_result_artifacts(payloads: object, put_artifact) -> dict[str, dict[str, Any]]:  # type: ignore[no-untyped-def]
+    if not isinstance(payloads, dict):
+        return {}
+    references: dict[str, dict[str, Any]] = {}
+    for name, payload in payloads.items():
+        if not isinstance(name, str) or not isinstance(payload, dict) or not isinstance(payload.get("data"), bytes):
+            raise TypeError(f"invalid result artifact payload: {name!r}")
+        stored = put_artifact(payload["data"])
+        reference = dict(stored)
+        reference["name"] = name
+        for key in ("media_type", "kind", "filename"):
+            if payload.get(key) is not None:
+                reference[key] = payload[key]
+        references[name] = reference
+    return references
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Callbacks must not turn an allowlisted URL into an SSRF redirect."""
 
@@ -187,27 +223,39 @@ class LocalWorker:
         execution, task, context = claimed
         try:
             with ExitStack() as stack:
-                submission = self._materialize(context["submission_path"], stack)
-                task_path = self._materialize_task(task.path, task.manifest, stack)
-                if not submission.is_dir():
-                    raise ValueError(f"submission path is not a directory: {submission}")
-                if _needs_plugin_runner(task.kind, execution.metadata):
-                    submission = _stage_plugin_submission(
-                        submission,
-                        execution_id=execution.execution_id,
-                        task_ref=execution.task_ref,
-                        task_kind=task.kind,
-                        metadata=execution.metadata,
-                        stack=stack,
-                        materialize=lambda value: self._materialize(value, stack),
-                    )
-                raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution.execution_id))
+                if self.store.is_cancel_requested(execution.execution_id):
+                    raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled before start"}
+                else:
+                    submission = self._materialize(context["submission_path"], stack)
+                    task_path = self._materialize_task(task.path, task.manifest, stack)
+                    if not submission.is_dir():
+                        raise ValueError(f"submission path is not a directory: {submission}")
+                    if _needs_plugin_runner(task.kind, execution.metadata):
+                        submission = _stage_plugin_submission(
+                            submission,
+                            execution_id=execution.execution_id,
+                            task_ref=execution.task_ref,
+                            task_kind=task.kind,
+                            metadata=execution.metadata,
+                            stack=stack,
+                            materialize=lambda value: self._materialize(value, stack),
+                        )
+                    runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(execution.metadata, task.manifest))
+                    raw = runner.run(submission, task_path, execution.execution_id)
+                    if self.store.is_cancel_requested(execution.execution_id):
+                        raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
+                    else:
+                        raw = _validated_runner_result(raw)
+                artifact_refs = _persist_result_artifacts(raw.pop("_artifact_payloads", {}), self.artifact_store.put) if raw.get("status") != "canceled" else {}
             result = ExecutionResult(
                 execution_id=execution.execution_id,
                 task_ref=execution.task_ref,
                 status=raw.get("status", "failed"),
                 score=raw.get("score"),
                 metrics=raw.get("metrics") or {},
+                scores=raw.get("scores") or {},
+                winner=raw.get("winner"),
+                artifacts=artifact_refs,
                 failure_reason=raw.get("failure_reason"),
                 metadata=execution.metadata,
                 queue=execution.queue,
@@ -372,27 +420,44 @@ class RemoteWorker:
         execution_id = execution_payload["execution_id"]
         try:
             with ExitStack() as stack:
-                submission = self._materialize(context["submission_path"], stack).resolve()
-                task_path = self._materialize_task(task_payload["path"], task_payload.get("manifest") or {}, stack).resolve()
-                if not submission.is_dir():
-                    raise ValueError(f"submission path is not a directory: {submission}")
-                if _needs_plugin_runner(str(task_payload.get("kind") or ""), execution_payload.get("metadata") or {}):
-                    submission = _stage_plugin_submission(
-                        submission,
-                        execution_id=execution_id,
-                        task_ref=str(execution_payload["task_ref"]),
-                        task_kind=str(task_payload.get("kind") or ""),
-                        metadata=execution_payload.get("metadata") or {},
-                        stack=stack,
-                        materialize=lambda value: self._materialize(value, stack),
-                    )
-                raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution_id))
+                metadata = execution_payload.get("metadata") or {}
+                task_manifest = task_payload.get("manifest") or {}
+                if self.client.execution_cancel_requested(self.worker_id, execution_id):
+                    raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled before start"}
+                else:
+                    submission = self._materialize(context["submission_path"], stack).resolve()
+                    task_path = self._materialize_task(task_payload["path"], task_manifest, stack).resolve()
+                    if not submission.is_dir():
+                        raise ValueError(f"submission path is not a directory: {submission}")
+                    if _needs_plugin_runner(str(task_payload.get("kind") or ""), metadata):
+                        submission = _stage_plugin_submission(
+                            submission,
+                            execution_id=execution_id,
+                            task_ref=str(execution_payload["task_ref"]),
+                            task_kind=str(task_payload.get("kind") or ""),
+                            metadata=metadata,
+                            stack=stack,
+                            materialize=lambda value: self._materialize(value, stack),
+                        )
+                    runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(metadata, task_manifest))
+                    raw = runner.run(submission, task_path, execution_id)
+                    if self.client.execution_cancel_requested(self.worker_id, execution_id):
+                        raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
+                    else:
+                        raw = _validated_runner_result(raw)
+                artifact_refs = _persist_result_artifacts(
+                    raw.pop("_artifact_payloads", {}),
+                    lambda data: self.client.upload_worker_artifact_bytes(self.worker_id, data),
+                ) if raw.get("status") != "canceled" else {}
             result = ExecutionResult(
                 execution_id=execution_id,
                 task_ref=execution_payload["task_ref"],
                 status=raw.get("status", "failed"),
                 score=raw.get("score"),
                 metrics=raw.get("metrics") or {},
+                scores=raw.get("scores") or {},
+                winner=raw.get("winner"),
+                artifacts=artifact_refs,
                 failure_reason=raw.get("failure_reason"),
                 metadata=execution_payload.get("metadata") or {},
                 queue=execution_payload.get("queue", "default"),

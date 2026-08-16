@@ -53,6 +53,8 @@ class PostgresJudgeStore:
                     task_ref TEXT NOT NULL REFERENCES tasks(task_ref), submission_path TEXT NOT NULL,
                     callback_url TEXT, callback_token TEXT, metadata_json JSONB NOT NULL,
                     status TEXT NOT NULL, score DOUBLE PRECISION, metrics_json JSONB NOT NULL,
+                    scores_json JSONB NOT NULL DEFAULT '{}'::jsonb, winner TEXT,
+                    artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                     failure_reason TEXT, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
                     cancel_requested BOOLEAN NOT NULL DEFAULT FALSE, queue TEXT NOT NULL DEFAULT 'default',
                     resource_class TEXT NOT NULL DEFAULT 'cpu', priority INTEGER NOT NULL DEFAULT 0,
@@ -98,7 +100,10 @@ class PostgresJudgeStore:
                     token_hash TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL,
                     revoked_at TIMESTAMPTZ
-                );"""
+                );
+                ALTER TABLE executions ADD COLUMN IF NOT EXISTS scores_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE executions ADD COLUMN IF NOT EXISTS winner TEXT;
+                ALTER TABLE executions ADD COLUMN IF NOT EXISTS artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb;"""
             )
 
     def register_task(self, task: TaskRecord) -> TaskRecord:
@@ -273,14 +278,16 @@ class PostgresJudgeStore:
             metadata["evaluator"] = manifest.get("evaluator")
             metadata["runtime_image"] = manifest.get("runtime_image") or manifest.get("runtime")
             metadata["event_id"] = f"execution:{execution_id}:result"
+            if request.timeout_seconds is not None:
+                metadata["timeout_seconds"] = request.timeout_seconds
             inserted = db.execute(
                 """INSERT INTO executions(execution_id,idempotency_key,task_ref,submission_path,callback_url,callback_token,
-                   metadata_json,status,metrics_json,created_at,updated_at,queue,resource_class,priority)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at,queue,resource_class,priority)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT(idempotency_key) DO NOTHING
                    RETURNING *""",
                 (execution_id, request.idempotency_key, request.task_ref, request.submission_path, request.callback_url,
-                 request.callback_token, json.dumps(metadata, sort_keys=True), "queued", json.dumps({}), now, now,
+                 request.callback_token, json.dumps(metadata, sort_keys=True), "queued", json.dumps({}), json.dumps({}), json.dumps({}), now, now,
                  request.queue, request.resource_class, request.priority),
             ).fetchone()
             if inserted:
@@ -329,7 +336,7 @@ class PostgresJudgeStore:
             # ``%s IS NULL`` when the worker id is absent.  Explicitly cast
             # that guard to the column type so finishing an execution works
             # for both scoped and unscoped callers.
-            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s::text IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
+            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,scores_json=%s,winner=%s,artifacts_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s::text IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), json.dumps(result.scores), result.winner, json.dumps(result.artifacts), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
@@ -357,6 +364,11 @@ class PostgresJudgeStore:
         with self._connect() as db:
             db.execute("UPDATE executions SET cancel_requested=TRUE,status=CASE WHEN status='queued' THEN 'canceled' ELSE status END,updated_at=%s WHERE execution_id=%s", (_now(), execution_id))
         return self.get_execution(execution_id)
+
+    def is_cancel_requested(self, execution_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute("SELECT cancel_requested FROM executions WHERE execution_id=%s", (execution_id,)).fetchone()
+        return bool(row and row["cancel_requested"])
 
     def get_execution(self, execution_id: str) -> ExecutionResult | None:
         with self._connect() as db:
@@ -388,7 +400,9 @@ class PostgresJudgeStore:
     def _result(row: dict[str, Any]) -> ExecutionResult:
         metrics = row["metrics_json"] if isinstance(row["metrics_json"], dict) else json.loads(row["metrics_json"])
         metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
-        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"], task_digest=metadata.get("task_digest"), evaluator=metadata.get("evaluator"), runtime_image=metadata.get("runtime_image"), seed=metadata.get("seed"), event_id=metadata.get("event_id"))
+        scores = row["scores_json"] if isinstance(row["scores_json"], dict) else json.loads(row["scores_json"] or "{}")
+        artifacts = row["artifacts_json"] if isinstance(row["artifacts_json"], dict) else json.loads(row["artifacts_json"] or "{}")
+        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"], task_digest=metadata.get("task_digest"), evaluator=metadata.get("evaluator"), runtime_image=metadata.get("runtime_image"), seed=metadata.get("seed"), event_id=metadata.get("event_id"), scores=scores, winner=row["winner"], artifacts=artifacts)
 
     @staticmethod
     def _worker(row: dict[str, Any]) -> WorkerRecord:

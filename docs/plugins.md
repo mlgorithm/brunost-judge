@@ -33,12 +33,42 @@ def run(context: dict) -> dict:
 
 The context includes `protocol_version`, `execution_id`, `task_ref`,
 `evaluation_kind` (`agent` or `match`), `task_path`, `submission_path`,
-`participants`, `seats`, `seed`, and JSON metadata. Participant paths are
-staged inside the evaluator submission mount. `participants` is keyed by agent
-ID; `seats` preserves match order and supports the same agent occupying more
-than one seat. A plugin must return a terminal result with a finite numeric
-`score` and object `metrics`; match-specific `scores` and `replay` values are
-retained under `metrics`.
+`participants`, `seats`, `seed`, `output_path`, and JSON metadata. Participant
+paths are staged inside the evaluator submission mount. `participants` is keyed
+by agent ID; `seats` preserves match order and supports the same agent
+occupying more than one seat. A plugin must return a terminal result with a
+finite numeric `score` and object `metrics`. Match results may also return
+finite per-seat `scores`, a `winner`, and inline `replay` metadata. Large
+replays or other outputs should be written below `output_path` and declared as
+relative files in `artifacts`, for example:
+
+```python
+Path(context["output_path"]).mkdir(parents=True, exist_ok=True)
+Path(context["output_path"], "replay.jsonl").write_text("...", encoding="utf-8")
+return {
+    "status": "completed",
+    "score": 1.0,
+    "scores": {"red": 1.0, "blue": 0.0},
+    "winner": "red",
+    "artifacts": {
+        "replay": {"path": "replay.jsonl", "kind": "replay"},
+    },
+}
+```
+
+Workers package declared files into immutable content-addressed artifacts and
+return their references under the execution result's `artifacts` field. The
+API serves those bundles from `GET /v1/artifacts/{artifact_id}`. Artifact files
+are bounded by the worker's configured result-artifact size limit.
+
+## Execution safety
+
+An evaluation may set `timeout_seconds`; otherwise the worker derives a limit
+from `time_limit_ms` or the sandbox default. A cancellation request is checked
+before execution and immediately after the sandbox boundary, so a result that
+finishes after cancellation is recorded as `canceled` rather than completed.
+Docker workers additionally enforce the wall-clock limit while the evaluator
+container is running.
 
 ## Registering participants
 

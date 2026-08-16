@@ -23,9 +23,15 @@ responses expose both `evaluation_id` (canonical) and `execution_id` (legacy
 compatibility).
 
 Result payloads use stable `result_version: 1` semantics: terminal `status`,
-numeric or null `score`, object `metrics`, optional `failure_reason`, and the
+numeric or null `score`, optional per-seat `scores`, optional `winner`, object
+`metrics`, immutable result `artifacts`, optional `failure_reason`, and the
 compatibility pair `evaluation_id`/`execution_id`. Workers reject malformed or
-non-finite sandbox results before they are persisted.
+non-finite sandbox results before they are persisted. A plugin can declare
+relative files such as a replay under `output_path`; workers upload them as
+content-addressed bundles and expose them through `GET /v1/artifacts/{artifact_id}`.
+Set `timeout_seconds` on an evaluation for a per-run wall-clock limit. A
+running worker checks cancellation at the sandbox boundary and records a
+finished-after-cancel run as `canceled`.
 
 `ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` and
 `ioi` tasks use the classic batch runner and return structured compile, test,
@@ -75,6 +81,7 @@ POST /v1/workers/{worker_id}/heartbeat?status=ready
 POST /v1/workers/{worker_id}/drain?draining=true
 POST /v1/workers/{worker_id}/claim
 POST /v1/workers/{worker_id}/finish
+GET /v1/workers/{worker_id}/executions/{execution_id}/cancel-requested
 ```
 
 The scheduler must never infer a GPU or runtime capability from a hostname. A

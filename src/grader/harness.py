@@ -154,6 +154,7 @@ def _run_plugin(submission_path: str, assets_path: str) -> dict[str, Any]:
         participants=resolved_participants,
         seats=tuple(seats),
         seed=manifest.get("seed") if isinstance(manifest.get("seed"), int) else None,
+        output_path=os.environ.get("RESULT_ARTIFACTS_PATH", "/tmp/brunost-output/artifacts"),
         metadata=manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {},
     )
     return default_registry().run(kind, context)

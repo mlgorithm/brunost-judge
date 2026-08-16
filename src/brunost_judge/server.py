@@ -51,6 +51,7 @@ def create_app(database: str | Path | None = None):
         queue: str = Field(default="default", min_length=1, max_length=100)
         resource_class: str = Field(default="cpu", min_length=1, max_length=50)
         priority: int = Field(default=0, ge=-100, le=100)
+        timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
         evaluation_kind: str = Field(default="batch", min_length=1, max_length=50)
         agent_refs: list[str] = Field(default_factory=list, max_length=32)
         game_ref: str | None = None
@@ -125,6 +126,9 @@ def create_app(database: str | Path | None = None):
         status: str = Field(min_length=1, max_length=50)
         score: float | None = None
         metrics: dict[str, Any] = Field(default_factory=dict)
+        scores: dict[str, float] = Field(default_factory=dict)
+        winner: str | None = None
+        artifacts: dict[str, dict[str, Any]] = Field(default_factory=dict)
         failure_reason: str | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
         result_version: int = Field(default=1, ge=1)
@@ -136,7 +140,7 @@ def create_app(database: str | Path | None = None):
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
-    app = FastAPI(title="Brunost Judge", version="0.8.0")
+    app = FastAPI(title="Brunost Judge", version="0.9.0")
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
 
     def _allowed_path(value: str, env_name: str) -> str:
@@ -232,7 +236,7 @@ def create_app(database: str | Path | None = None):
         return {
             "status": "ok",
             "service": "brunost-judge",
-            "version": "0.8.0",
+            "version": "0.9.0",
             "database": type(store).__name__,
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
         }
@@ -243,7 +247,7 @@ def create_app(database: str | Path | None = None):
         return {
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
             "service": "brunost-judge",
-            "version": "0.8.0",
+            "version": "0.9.0",
             "workers": len(workers),
             "ready_workers": sum(1 for worker in workers if worker.status == "ready" and not worker.draining),
         }
@@ -271,8 +275,21 @@ def create_app(database: str | Path | None = None):
         except ArtifactError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.put("/v1/workers/{worker_id}/artifacts/{artifact_id}", status_code=201, dependencies=[Depends(require_worker_token)])
+    async def upload_worker_artifact(worker_id: str, artifact_id: str, request: Request) -> dict[str, object]:
+        _ = worker_id
+        return await upload_artifact(artifact_id, request)
+
     @app.get("/v1/workers/{worker_id}/artifacts/{artifact_id}", dependencies=[Depends(require_worker_token)])
     def download_artifact(worker_id: str, artifact_id: str) -> Response:
+        try:
+            data = artifact_store.get(artifact_id)
+        except (ArtifactError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="artifact not found") from exc
+        return Response(content=data, media_type="application/gzip", headers={"X-Brunost-Artifact-SHA256": artifact_id})
+
+    @app.get("/v1/artifacts/{artifact_id}", dependencies=[Depends(require_api_token)])
+    def download_result_artifact(artifact_id: str) -> Response:
         try:
             data = artifact_store.get(artifact_id)
         except (ArtifactError, FileNotFoundError) as exc:
@@ -613,6 +630,14 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=404, detail="worker not found")
         return worker.as_dict()
 
+    @app.get("/v1/workers/{worker_id}/executions/{execution_id}/cancel-requested", dependencies=[Depends(require_worker_token)])
+    def cancel_requested(worker_id: str, execution_id: str) -> dict[str, Any]:
+        if store.get_worker(worker_id) is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        if store.get_execution(execution_id) is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        return {"execution_id": execution_id, "cancel_requested": store.is_cancel_requested(execution_id)}
+
     @app.post("/v1/workers/{worker_id}/claim", response_model=None, dependencies=[Depends(require_worker_token)])
     def claim_worker(worker_id: str) -> dict[str, Any] | Response:
         worker = store.get_worker(worker_id)
@@ -634,12 +659,26 @@ def create_app(database: str | Path | None = None):
 
     @app.post("/v1/workers/{worker_id}/finish", dependencies=[Depends(require_worker_token)])
     def finish_worker(worker_id: str, request: WorkerFinishModel) -> dict[str, Any]:
+        from brunost_judge.conformance import validate_result_payload
         from brunost_judge.contracts import RESULT_SCHEMA_VERSION, ExecutionResult
 
         if request.result_version != RESULT_SCHEMA_VERSION:
             raise HTTPException(status_code=422, detail=f"result_version must be {RESULT_SCHEMA_VERSION}")
         if request.status not in {"completed", "failed", "canceled"}:
             raise HTTPException(status_code=422, detail="worker results must be terminal")
+        result_errors = validate_result_payload({
+            "execution_id": request.execution_id,
+            "task_ref": request.task_ref,
+            "status": request.status,
+            "score": request.score,
+            "scores": request.scores,
+            "winner": request.winner,
+            "metrics": request.metrics,
+            "artifacts": request.artifacts,
+            "result_version": request.result_version,
+        })
+        if result_errors:
+            raise HTTPException(status_code=422, detail="invalid worker result: " + "; ".join(result_errors))
 
         result = store.finish(
             request.execution_id,
@@ -649,6 +688,9 @@ def create_app(database: str | Path | None = None):
                 status=request.status,
                 score=request.score,
                 metrics=request.metrics,
+                scores=request.scores,
+                winner=request.winner,
+                artifacts=request.artifacts,
                 failure_reason=request.failure_reason,
                 metadata=request.metadata,
                 result_version=request.result_version,

@@ -93,4 +93,4 @@ __all__ = [
     "validate_result_payload",
     "validate_runner_result_payload",
 ]
-__version__ = "0.8.0"
+__version__ = "0.9.0"

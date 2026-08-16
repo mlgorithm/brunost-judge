@@ -33,6 +33,7 @@ class RunnerContext:
     participants: Mapping[str, str] = field(default_factory=dict)
     seats: tuple[Mapping[str, Any], ...] = ()
     seed: int | None = None
+    output_path: str = "/tmp/brunost-output/artifacts"
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -46,6 +47,7 @@ class RunnerContext:
             "participants": dict(self.participants),
             "seats": [dict(seat) for seat in self.seats],
             "seed": self.seed,
+            "output_path": self.output_path,
             "metadata": dict(self.metadata),
         }
 
@@ -81,9 +83,55 @@ def normalize_plugin_result(raw: Any) -> dict[str, Any]:
     result = {"status": status, "score": float(score), "metrics": dict(metrics)}
     if raw.get("failure_reason") is not None:
         result["failure_reason"] = str(raw["failure_reason"])[:2000]
-    for key in ("scores", "replay"):
-        if key in raw:
-            result["metrics"][key] = raw[key]
+    scores = raw.get("scores")
+    if scores is not None:
+        if not isinstance(scores, Mapping):
+            return _failed("runner result scores must be an object")
+        normalized_scores: dict[str, float] = {}
+        for seat, value in scores.items():
+            if not isinstance(seat, str) or not seat:
+                return _failed("runner result score keys must be non-empty strings")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return _failed("runner result scores must be finite numbers")
+            normalized_scores[seat] = float(value)
+        result["scores"] = normalized_scores
+        result["metrics"]["scores"] = normalized_scores
+    if "winner" in raw:
+        winner = raw["winner"]
+        if winner is not None and (not isinstance(winner, str) or not winner):
+            return _failed("runner result winner must be a non-empty string or null")
+        result["winner"] = winner
+    if "replay" in raw:
+        result["metrics"]["replay"] = raw["replay"]
+    artifacts = raw.get("artifacts", {})
+    if not isinstance(artifacts, Mapping):
+        return _failed("runner result artifacts must be an object")
+    normalized_artifacts: dict[str, dict[str, str]] = {}
+    for name, descriptor in artifacts.items():
+        if not isinstance(name, str) or not name or len(name) > 100:
+            return _failed("runner artifact names must be non-empty strings")
+        if isinstance(descriptor, str):
+            descriptor = {"path": descriptor}
+        if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("path"), str):
+            return _failed(f"runner artifact {name!r} must declare a path")
+        path = Path(descriptor["path"])
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            return _failed(f"runner artifact {name!r} path must stay below output_path")
+        normalized = {"path": path.as_posix()}
+        media_type = descriptor.get("media_type")
+        if media_type is not None:
+            if not isinstance(media_type, str) or not media_type or len(media_type) > 200:
+                return _failed(f"runner artifact {name!r} media_type is invalid")
+            normalized["media_type"] = media_type
+        kind = descriptor.get("kind")
+        if kind is not None:
+            if not isinstance(kind, str) or not kind or len(kind) > 100:
+                return _failed(f"runner artifact {name!r} kind is invalid")
+            normalized["kind"] = kind
+        normalized_artifacts[name] = normalized
+    if len(normalized_artifacts) > 32:
+        return _failed("runner returned too many artifacts")
+    result["artifacts"] = normalized_artifacts
     if status == "failed" and not result.get("failure_reason"):
         result["failure_reason"] = "runner failed without a reason"
     return result

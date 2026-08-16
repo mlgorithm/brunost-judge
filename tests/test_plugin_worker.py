@@ -2,6 +2,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from brunost_judge.artifacts import safe_extract
 from brunost_judge.sandbox import ProcessSandboxRunner
 from brunost_judge.server import create_app
 from brunost_judge.store import JudgeStore
@@ -26,11 +27,16 @@ def run(context):
         return {"status": "failed", "score": 0.0, "failure_reason": "wrong participants"}
     if not all(Path(path).is_dir() for path in participants.values()):
         return {"status": "failed", "score": 0.0, "failure_reason": "participant is not a directory"}
+    output = Path(context["output_path"])
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "replay.jsonl").write_text('{"round": 1}\\n', encoding="utf-8")
     return {
         "status": "completed",
         "score": 1.0,
         "scores": {"red": 1.0, "blue": 0.0},
+        "winner": "red",
         "replay": {"seed": context["seed"]},
+        "artifacts": {"replay": {"path": "replay.jsonl", "media_type": "application/jsonl", "kind": "replay"}},
         "metrics": {"runner": "reference-game"},
     }
 """,
@@ -77,5 +83,13 @@ def run(context):
     assert result is not None
     assert result.status == "completed"
     assert result.score == 1.0
+    assert result.scores == {"red": 1.0, "blue": 0.0}
+    assert result.winner == "red"
     assert result.metrics["scores"] == {"red": 1.0, "blue": 0.0}
     assert result.metrics["replay"] == {"seed": 17}
+    replay = result.artifacts["replay"]
+    assert replay["media_type"] == "application/jsonl"
+    downloaded = client.get(f"/v1/artifacts/{replay['artifact_id']}")
+    assert downloaded.status_code == 200
+    extracted = safe_extract(downloaded.content, tmp_path / "downloaded-replay")
+    assert b'"round": 1' in extracted.joinpath("replay.jsonl").read_bytes()

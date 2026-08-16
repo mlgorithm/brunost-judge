@@ -149,6 +149,7 @@ class ExecutionRequest:
     queue: str = "default"
     resource_class: str = "cpu"
     priority: int = 0
+    timeout_seconds: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -178,6 +179,7 @@ class EvaluationRequest:
     queue: str = "default"
     resource_class: str = "cpu"
     priority: int = 0
+    timeout_seconds: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -203,6 +205,7 @@ class EvaluationRequest:
             queue=self.queue,
             resource_class=self.resource_class,
             priority=self.priority,
+            timeout_seconds=self.timeout_seconds,
         )
 
 
@@ -225,6 +228,9 @@ class ExecutionResult:
     runtime_image: str | None = None
     seed: int | None = None
     event_id: str | None = None
+    scores: dict[str, float] = field(default_factory=dict)
+    winner: str | None = None
+    artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)

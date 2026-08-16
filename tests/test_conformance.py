@@ -40,3 +40,38 @@ def test_conformance_rejects_non_finite_and_invalid_sandbox_results():
     assert "sandbox result score must be numeric or null" in validate_runner_result_payload(
         {"status": "completed", "score": True, "metrics": {}}
     )
+
+
+def test_conformance_validates_match_scores_and_artifacts():
+    assert validate_runner_result_payload(
+        {
+            "status": "completed",
+            "score": 1.0,
+            "scores": {"red": 1.0, "blue": 0.0},
+            "winner": "red",
+            "artifacts": {"replay": {"path": "replay.jsonl", "kind": "replay"}},
+            "metrics": {},
+        }
+    ) == ()
+    errors = validate_runner_result_payload(
+        {
+            "status": "completed",
+            "score": 1.0,
+            "scores": {"red": float("inf")},
+            "artifacts": {"replay": {"path": "../secret"}},
+            "metrics": {},
+        }
+    )
+    assert "sandbox result scores values must be finite" in errors
+    assert "sandbox result artifacts.replay path must be relative" in errors
+    assert validate_result_payload(
+        {
+            "execution_id": "eval-1",
+            "task_ref": "game/v1",
+            "status": "completed",
+            "score": 1.0,
+            "scores": {"red": 1.0},
+            "artifacts": {"replay": {"artifact_id": "a" * 64, "size_bytes": 10}},
+            "metrics": {},
+        }
+    ) == ()

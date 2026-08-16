@@ -93,7 +93,10 @@ def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):
         "from pathlib import Path\n"
         "def run(context):\n"
         "    assert Path(context['participants']['red']).is_dir()\n"
-        "    return {'status': 'completed', 'score': 1.0, 'scores': {'red': 1.0}, 'replay': {'seed': context['seed']}}\n",
+        "    output = Path(context['output_path'])\n"
+        "    output.mkdir(parents=True, exist_ok=True)\n"
+        "    (output / 'replay.jsonl').write_text('{\\\"round\\\": 1}\\n', encoding='utf-8')\n"
+        "    return {'status': 'completed', 'score': 1.0, 'scores': {'red': 1.0}, 'replay': {'seed': context['seed']}, 'artifacts': {'replay': {'path': 'replay.jsonl', 'kind': 'replay'}}}\n",
         encoding="utf-8",
     )
     (submission / "participants" / "agent-0").mkdir(parents=True)
@@ -123,3 +126,4 @@ def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):
     assert result["status"] == "completed", result
     assert result["score"] == pytest.approx(1.0), result
     assert result["metrics"]["scores"] == {"red": 1.0}
+    assert result["_artifact_payloads"]["replay"]["data"]

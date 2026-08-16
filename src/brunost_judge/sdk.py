@@ -72,7 +72,19 @@ class JudgeClient:
 
         data = pack_directory(path)
         identifier = artifact_id or digest_artifact(data)
+        return self.upload_artifact_bytes(data, artifact_id=identifier)
+
+    def upload_artifact_bytes(self, data: bytes, *, artifact_id: str | None = None) -> dict[str, Any]:
+        from brunost_judge.artifacts import artifact_id as digest_artifact
+
+        identifier = artifact_id or digest_artifact(data)
         return self._request_json_bytes("PUT", f"/v1/artifacts/{identifier}", data)
+
+    def upload_worker_artifact_bytes(self, worker_id: str, data: bytes, *, artifact_id: str | None = None) -> dict[str, Any]:
+        from brunost_judge.artifacts import artifact_id as digest_artifact
+
+        identifier = artifact_id or digest_artifact(data)
+        return self._request_json_bytes("PUT", f"/v1/workers/{worker_id}/artifacts/{identifier}", data)
 
     def _request_json_bytes(self, method: str, path: str, data: bytes) -> dict[str, Any]:
         response = self._raw(method, path, data, content_type="application/gzip")
@@ -80,6 +92,9 @@ class JudgeClient:
 
     def download_artifact(self, worker_id: str, identifier: str) -> bytes:
         return self._raw("GET", f"/v1/workers/{worker_id}/artifacts/{identifier}")
+
+    def download_result_artifact(self, identifier: str) -> bytes:
+        return self._raw("GET", f"/v1/artifacts/{identifier}")
 
     def register_agent(
         self,
@@ -211,6 +226,10 @@ class JudgeClient:
     def worker_status(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/workers/{worker_id}/status")
 
+    def execution_cancel_requested(self, worker_id: str, execution_id: str) -> bool:
+        payload = self._request("GET", f"/v1/workers/{worker_id}/executions/{execution_id}/cancel-requested")
+        return bool(payload.get("cancel_requested"))
+
     def claim_worker(self, worker_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/claim")
 
@@ -236,6 +255,7 @@ class JudgeClient:
         queue: str = "default",
         resource_class: str = "cpu",
         priority: int = 0,
+        timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         payload = {
             "task_ref": task_ref,
@@ -248,6 +268,7 @@ class JudgeClient:
             "queue": queue,
             "resource_class": resource_class,
             "priority": priority,
+            "timeout_seconds": timeout_seconds,
         }
         return self._request("POST", "/v1/executions", payload)
 
