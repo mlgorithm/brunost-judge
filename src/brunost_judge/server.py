@@ -140,7 +140,7 @@ def create_app(database: str | Path | None = None):
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
-    app = FastAPI(title="Brunost Judge", version="0.9.0")
+    app = FastAPI(title="Brunost Judge", version="1.0.0")
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
 
     def _allowed_path(value: str, env_name: str) -> str:
@@ -236,7 +236,7 @@ def create_app(database: str | Path | None = None):
         return {
             "status": "ok",
             "service": "brunost-judge",
-            "version": "0.9.0",
+            "version": "1.0.0",
             "database": type(store).__name__,
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
         }
@@ -247,7 +247,7 @@ def create_app(database: str | Path | None = None):
         return {
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
             "service": "brunost-judge",
-            "version": "0.9.0",
+            "version": "1.0.0",
             "workers": len(workers),
             "ready_workers": sum(1 for worker in workers if worker.status == "ready" and not worker.draining),
         }

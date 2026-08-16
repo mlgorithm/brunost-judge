@@ -76,7 +76,12 @@ def _stage_plugin_submission(
         relative = Path("participants") / f"agent-{index}"
         shutil.copytree(participant, root / relative)
         participants[agent_id] = relative.as_posix()
-        seats.append({"agent_id": agent_id, "seat": index, "path": relative.as_posix()})
+        seat = {"agent_id": agent_id, "seat": index, "path": relative.as_posix()}
+        if isinstance(definition.get("metadata"), dict):
+            seat["metadata"] = dict(definition["metadata"])
+            if isinstance(definition["metadata"].get("command"), (str, list)):
+                seat["command"] = definition["metadata"]["command"]
+        seats.append(seat)
     plugin_metadata = dict(metadata)
     plugin_metadata.pop("agent_definitions", None)
     manifest = {
@@ -153,7 +158,7 @@ _CALLBACK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/0.8"}
+    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.0"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:

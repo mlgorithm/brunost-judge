@@ -1,6 +1,6 @@
 # Brunost Judge
 
-Current release: `0.9.0` — zero-code node enrollment, portable artifacts, worker credentials, capability scheduling, provider
+Current release: `1.0.0` — isolated agent runtime, deterministic match orchestration, portable artifacts, worker credentials, capability scheduling, provider
 adapters, deterministic game contracts, and replay artifact results.
 
 Brunost Judge is the platform-independent judging layer for scorer-backed IOAI,

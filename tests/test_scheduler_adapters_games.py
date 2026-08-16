@@ -1,5 +1,14 @@
+from pathlib import Path
+
 from brunost_judge.adapters import KubernetesAdapter, LaunchRequest, SlurmAdapter
-from brunost_judge.games import AgentSeat, GameRunner, MatchRequest, MatchResult
+from brunost_judge.agent_runtime import AgentLimits
+from brunost_judge.games import (
+    AgentGameRunner,
+    AgentSeat,
+    GameRunner,
+    MatchRequest,
+    MatchResult,
+)
 from brunost_judge.scheduler import (
     CapabilityScheduler,
     SchedulingRequest,
@@ -34,3 +43,44 @@ def test_game_runner_enforces_seats_and_deterministic_referee():
     assert first.scores == second.scores
     failed = GameRunner().run(MatchRequest("game-1", "match-2", request.agents[:1]), Referee(), expected_seats=2)
     assert failed.status == "failed"
+
+
+def test_agent_game_runner_orchestrates_isolated_stdio_agents(tmp_path: Path):
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "agent.py").write_text(
+        """import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message[\"type\"] == \"init\":
+        print(json.dumps({\"type\": \"ready\"}), flush=True)
+    elif message[\"type\"] == \"turn\":
+        print(json.dumps({\"type\": \"action\", \"action\": message[\"seat\"]}), flush=True)
+    elif message[\"type\"] == \"shutdown\":
+        break
+""",
+        encoding="utf-8",
+    )
+
+    class Referee:
+        def run(self, request, *, rng, agents):
+            actions = agents.step({"round": 1})
+            return MatchResult(request.match_id, "completed", {"red": float(actions[0]), "blue": float(actions[1])})
+
+    request = MatchRequest(
+        "game-1",
+        "match-runtime",
+        (AgentSeat("red", str(agent), 0), AgentSeat("blue", str(agent), 1)),
+        seed=17,
+    )
+    result = AgentGameRunner().run(
+        request,
+        Referee(),
+        expected_seats=2,
+        limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=3),
+    )
+
+    assert result.status == "completed"
+    assert result.scores == {"red": 0.0, "blue": 1.0}

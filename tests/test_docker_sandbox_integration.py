@@ -91,8 +91,13 @@ def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):
     (task / "judge.yaml").write_text("version: 1\nkind: game\nrunner: python\n", encoding="utf-8")
     (task / "runner.py").write_text(
         "from pathlib import Path\n"
+        "from grader.agent_runtime import AgentLimits, AgentRuntime\n"
         "def run(context):\n"
         "    assert Path(context['participants']['red']).is_dir()\n"
+        "    runtime = AgentRuntime.from_context(context, limits=AgentLimits(turn_timeout_seconds=0.5, total_timeout_seconds=5))\n"
+        "    with runtime:\n"
+        "        actions = runtime.step({'round': 1})\n"
+        "    assert actions == {0: {'seat': 0, 'round': 1}}\n"
         "    output = Path(context['output_path'])\n"
         "    output.mkdir(parents=True, exist_ok=True)\n"
         "    (output / 'replay.jsonl').write_text('{\\\"round\\\": 1}\\n', encoding='utf-8')\n"
@@ -100,7 +105,19 @@ def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):
         encoding="utf-8",
     )
     (submission / "participants" / "agent-0").mkdir(parents=True)
-    (submission / "participants" / "agent-0" / "agent.py").write_text("print('red')\n", encoding="utf-8")
+    (submission / "participants" / "agent-0" / "agent.py").write_text(
+        "import json\n"
+        "import sys\n"
+        "for line in sys.stdin:\n"
+        "    message = json.loads(line)\n"
+        "    if message['type'] == 'init':\n"
+        "        print(json.dumps({'type': 'ready'}), flush=True)\n"
+        "    elif message['type'] == 'turn':\n"
+        "        print(json.dumps({'type': 'action', 'action': {'seat': message['seat'], 'round': message['state']['round']}}), flush=True)\n"
+        "    elif message['type'] == 'shutdown':\n"
+        "        break\n",
+        encoding="utf-8",
+    )
     (submission / ".brunost").mkdir()
     (submission / ".brunost" / "plugin.json").write_text(
         json.dumps(
@@ -110,6 +127,7 @@ def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):
                 "task_ref": "game/v1",
                 "evaluation_kind": "match",
                 "participants": {"red": "participants/agent-0"},
+                "seats": [{"agent_id": "red", "seat": 0, "path": "participants/agent-0"}],
                 "seed": 19,
                 "metadata": {},
             }

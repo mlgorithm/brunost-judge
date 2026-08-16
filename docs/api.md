@@ -39,6 +39,10 @@ subtask, verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
 runner-plugin contract; registered participant artifacts are staged into the
 evaluator sandbox and game scores/replays are retained in result metrics.
+Trusted game runners can use the bundled dependency-free `AgentRuntime` to
+launch one bounded JSONL process per seat with deterministic turn ordering;
+see the [runner-plugin protocol](plugins.md#agent-protocol) for the wire
+contract and resource limits.
 
 ## Authentication
 

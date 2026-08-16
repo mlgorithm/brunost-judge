@@ -12,6 +12,16 @@ from brunost_judge.adapters import (
     OpenStackAdapter,
     SlurmAdapter,
 )
+from brunost_judge.agent_runtime import (
+    AgentCrashed,
+    AgentLaunchError,
+    AgentLimits,
+    AgentProtocolError,
+    AgentRuntime,
+    AgentRuntimeError,
+    AgentSpec,
+    AgentTimeout,
+)
 from brunost_judge.artifacts import (
     ArtifactError,
     ArtifactStore,
@@ -36,7 +46,13 @@ from brunost_judge.contracts import (
     TaskDefinition,
     WorkerRecord,
 )
-from brunost_judge.games import AgentSeat, GameRunner, MatchRequest, MatchResult
+from brunost_judge.games import (
+    AgentGameRunner,
+    AgentSeat,
+    GameRunner,
+    MatchRequest,
+    MatchResult,
+)
 from brunost_judge.plugins import (
     PLUGIN_KINDS,
     PLUGIN_PROTOCOL_VERSION,
@@ -56,8 +72,17 @@ __all__ = [
     "PLUGIN_KINDS",
     "PLUGIN_PROTOCOL_VERSION",
     "RESULT_SCHEMA_VERSION",
+    "AgentCrashed",
     "AgentDefinition",
+    "AgentGameRunner",
+    "AgentLaunchError",
+    "AgentLimits",
+    "AgentProtocolError",
+    "AgentRuntime",
+    "AgentRuntimeError",
     "AgentSeat",
+    "AgentSpec",
+    "AgentTimeout",
     "ArtifactError",
     "ArtifactStore",
     "CapabilityScheduler",
@@ -93,4 +118,4 @@ __all__ = [
     "validate_result_payload",
     "validate_runner_result_payload",
 ]
-__version__ = "0.9.0"
+__version__ = "1.0.0"

@@ -61,6 +61,35 @@ return their references under the execution result's `artifacts` field. The
 API serves those bundles from `GET /v1/artifacts/{artifact_id}`. Artifact files
 are bounded by the worker's configured result-artifact size limit.
 
+## Agent protocol
+
+Trusted game runners can launch one process per seat with the dependency-free
+runtime available in the evaluator image:
+
+```python
+from grader.agent_runtime import AgentLimits, AgentRuntime
+
+runtime = AgentRuntime.from_context(
+    context,
+    limits=AgentLimits(turn_timeout_seconds=0.5, total_timeout_seconds=30),
+)
+with runtime:
+    actions = runtime.step({"round": 1})
+```
+
+Each agent uses newline-delimited UTF-8 JSON on stdin/stdout. It receives an
+`init` message and must answer `{"type": "ready"}`. Each `turn` message must
+receive `{"type": "action", "action": ...}`. A `shutdown` message is sent at
+the end of a normal match. The runtime launches a separate process for every
+seat, orders `step()` calls by seat number, bounds message sizes and turns,
+terminates stalled or crashed agents, and applies POSIX CPU, memory, file-size,
+and open-file limits where the host supports them. Production Docker/gVisor
+workers provide the network and filesystem isolation boundary.
+
+An artifact may provide `agent.yaml` with a shell-free `command:` or
+`entrypoint:` declaration. Without a declaration, `agent.py` is launched with
+the evaluator's Python interpreter.
+
 ## Execution safety
 
 An evaluation may set `timeout_seconds`; otherwise the worker derives a limit
