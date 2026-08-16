@@ -37,6 +37,13 @@ from brunost_judge.contracts import (
     WorkerRecord,
 )
 from brunost_judge.games import AgentSeat, GameRunner, MatchRequest, MatchResult
+from brunost_judge.plugins import (
+    PLUGIN_KINDS,
+    PLUGIN_PROTOCOL_VERSION,
+    RunnerContext,
+    RunnerPlugin,
+    RunnerRegistry,
+)
 from brunost_judge.scheduler import (
     CapabilityScheduler,
     SchedulingRequest,
@@ -46,6 +53,8 @@ from brunost_judge.task import task_digest
 from grader.harness import normalize_result, run
 
 __all__ = [
+    "PLUGIN_KINDS",
+    "PLUGIN_PROTOCOL_VERSION",
     "RESULT_SCHEMA_VERSION",
     "AgentDefinition",
     "AgentSeat",
@@ -65,6 +74,9 @@ __all__ = [
     "MatchResult",
     "OpenStackAdapter",
     "ResourceProfile",
+    "RunnerContext",
+    "RunnerPlugin",
+    "RunnerRegistry",
     "SchedulingRequest",
     "SlurmAdapter",
     "TaskDefinition",

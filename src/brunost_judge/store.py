@@ -386,6 +386,7 @@ class JudgeStore:
         worker_id: str = "local-worker",
         queues: tuple[str, ...] | None = None,
         resource_classes: tuple[str, ...] | None = None,
+        capabilities: tuple[str, ...] | None = None,
         lease_seconds: int = 300,
     ) -> tuple[ExecutionResult, TaskRecord, dict[str, Any]] | None:
         with self._lock, self._connect() as db:
@@ -396,19 +397,30 @@ class JudgeStore:
                    WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
                 (now.isoformat(), now.isoformat()),
             )
-            clauses = ["status = 'queued'", "cancel_requested = 0"]
+            clauses = ["e.status = 'queued'", "e.cancel_requested = 0"]
             params: list[Any] = []
             if queues:
-                clauses.append("queue IN (" + ",".join("?" for _ in queues) + ")")
+                clauses.append("e.queue IN (" + ",".join("?" for _ in queues) + ")")
                 params.extend(queues)
             if resource_classes:
-                clauses.append("resource_class IN (" + ",".join("?" for _ in resource_classes) + ")")
+                clauses.append("e.resource_class IN (" + ",".join("?" for _ in resource_classes) + ")")
                 params.extend(resource_classes)
-            row = db.execute(
-                "SELECT * FROM executions WHERE " + " AND ".join(clauses) +
-                " ORDER BY priority DESC, created_at LIMIT 1",
+            rows = db.execute(
+                "SELECT e.*, t.manifest_json AS task_manifest_json FROM executions e "
+                "JOIN tasks t ON t.task_ref = e.task_ref WHERE " + " AND ".join(clauses) +
+                " ORDER BY e.priority DESC, e.created_at LIMIT 100",
                 params,
-            ).fetchone()
+            ).fetchall()
+            available_capabilities = set(capabilities or ())
+            row = None
+            for candidate in rows:
+                task_manifest = json.loads(candidate["task_manifest_json"])
+                execution_metadata = json.loads(candidate["metadata_json"])
+                required = set(task_manifest.get("required_capabilities") or ())
+                required.update(execution_metadata.get("required_capabilities") or ())
+                if required.issubset(available_capabilities):
+                    row = candidate
+                    break
             if row is None:
                 db.commit()
                 return None

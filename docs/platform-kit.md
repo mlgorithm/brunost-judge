@@ -29,7 +29,12 @@ shown on its leaderboard.
 Agents and games are durable judge-side definitions:
 
 ```python
-judge.register_agent(agent_id="baseline", name="Baseline")
+agent = judge.upload_artifact("agents/baseline")
+judge.register_agent(
+    agent_id="baseline",
+    name="Baseline",
+    artifact_id=agent["artifact_id"],
+)
 judge.register_game(
     game_id="connect-four-v1",
     name="Connect Four",
@@ -45,12 +50,12 @@ match = judge.submit_match(
 )
 ```
 
-The reference judge intentionally returns `501 Not Implemented` for agent and
-match execution until a real runner plugin is installed. This keeps the public
-contract honest: a plugin must launch agent processes, run the referee, capture
-a replay, and persist tournament state. The reference distribution does not
-enable these declarations as executable evaluations; a future runner plugin
-must be installed and selected explicitly before they can be accepted.
+Agent and match evaluations are executable when their task package contains a
+versioned `runner.py` plugin. The worker stages the registered participant
+artifacts, runs the plugin in the configured evaluator sandbox, and persists
+the canonical result plus match scores/replay metadata. See
+[`plugins.md`](plugins.md) for the plugin contract and custom evaluator-image
+extension point.
 
 ## Platform Kit
 

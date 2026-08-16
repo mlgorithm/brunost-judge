@@ -5,5 +5,6 @@ extraction seam (ADR-0010) and must stay self-contained.
 """
 
 from grader.harness import normalize_result, run
+from grader.plugins import RunnerContext, RunnerPlugin, RunnerRegistry
 
-__all__ = ["normalize_result", "run"]
+__all__ = ["RunnerContext", "RunnerPlugin", "RunnerRegistry", "normalize_result", "run"]

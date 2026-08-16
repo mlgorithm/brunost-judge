@@ -6,13 +6,13 @@ from brunost_judge.contracts import EvaluationRequest, ResourceProfile
 from brunost_judge.server import create_app
 
 
-def _task(root: Path) -> Path:
+def _task(root: Path, *, kind: str = "agent") -> Path:
     task = root / "task"
     (task / "public").mkdir(parents=True)
     (task / "private").mkdir()
     (task / "scorer").mkdir()
-    (task / "judge.yaml").write_text("version: 1\nkind: agent\n", encoding="utf-8")
-    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return {'public': 1.0}\n", encoding="utf-8")
+    (task / "judge.yaml").write_text(f"version: 1\nkind: {kind}\nrunner: python\n", encoding="utf-8")
+    (task / "runner.py").write_text("def run(context): return {'status': 'completed', 'score': 1.0, 'metrics': {}}\n", encoding="utf-8")
     return task
 
 
@@ -32,13 +32,16 @@ def test_public_contracts_are_serializable():
 
 
 def test_agent_game_and_match_api(tmp_path: Path):
-    task = _task(tmp_path)
+    task = _task(tmp_path, kind="game")
     submission = tmp_path / "submission"
     submission.mkdir()
     client = TestClient(create_app(tmp_path / "judge.db"))
 
     assert client.post("/v1/tasks", json={"task_ref": "game/v1", "path": str(task)}).status_code == 201
-    agent = client.post("/v1/agents", json={"agent_id": "baseline", "name": "Baseline"})
+    agent = client.post(
+        "/v1/agents",
+        json={"agent_id": "baseline", "name": "Baseline", "artifact_path": str(submission)},
+    )
     assert agent.status_code == 201
     assert client.get("/v1/agents/baseline").json()["name"] == "Baseline"
     game = client.post("/v1/games", json={"game_id": "connect4", "name": "Connect Four", "task_ref": "game/v1", "seats": 2})
@@ -52,8 +55,8 @@ def test_agent_game_and_match_api(tmp_path: Path):
             "seed": 7,
         },
     )
-    assert match.status_code == 501
-    assert "runner plugin" in match.json()["detail"]
+    assert match.status_code == 202
+    assert match.json()["status"] == "queued"
 
 
 def test_evaluation_alias_and_capabilities(tmp_path: Path, monkeypatch):
@@ -63,12 +66,22 @@ def test_evaluation_alias_and_capabilities(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_CAPABILITIES", "gpu:true, runtime:docker, gpu:true")
     client = TestClient(create_app(tmp_path / "judge.db"))
     assert client.post("/v1/tasks", json={"task_ref": "agent/v1", "path": str(task)}).status_code == 201
+    assert client.post(
+        "/v1/agents",
+        json={"agent_id": "baseline", "name": "Baseline", "artifact_path": str(submission)},
+    ).status_code == 201
     response = client.post(
         "/v1/evaluations",
-        json={"task_ref": "agent/v1", "submission_path": str(submission), "idempotency_key": "eval-1", "evaluation_kind": "agent"},
+        json={
+            "task_ref": "agent/v1",
+            "submission_path": str(submission),
+            "idempotency_key": "eval-1",
+            "evaluation_kind": "agent",
+            "agent_refs": ["baseline"],
+        },
     )
-    assert response.status_code == 501
-    assert "runner plugin" in response.json()["detail"]
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
     assert client.get("/v1/workers/capabilities").json()["capabilities"] == ["gpu:true", "runtime:docker"]
 
 

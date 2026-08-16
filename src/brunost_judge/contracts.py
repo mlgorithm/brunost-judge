@@ -160,10 +160,9 @@ class EvaluationRequest:
 
     ``evaluation_kind`` is one of ``batch``, ``interactive``, ``agent``, or
     ``match``. The built-in distribution executes scorer-backed batch tasks,
-    classic ICPC/IOI tasks, and line-oriented interactive tasks. Agent and
-    match definitions remain registry declarations until a runner plugin is
-    installed; the HTTP API fails closed with ``501`` instead of silently
-    treating them as batch scores.
+    classic ICPC/IOI tasks, line-oriented interactive tasks, and versioned
+    agent/game runner plugins. Unsupported future kinds fail closed instead of
+    silently being treated as batch scores.
     """
 
     task_ref: str

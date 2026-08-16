@@ -102,6 +102,11 @@ for a reproducible local Judge-plus-worker test,
 See [`docs/ownership.md`](docs/ownership.md) for the boundary between the judge
 and an LMS/platform.
 
+Agent and game competitions use the versioned runner-plugin SDK documented in
+[`docs/plugins.md`](docs/plugins.md). Participant bundles are content-addressed,
+worker claims honor required capabilities, and custom runners are installed as
+trusted evaluator-image extensions.
+
 For the generated application layer, framework adapters, and standalone/
 embedded/hybrid integration modes, see [`docs/platform-kit.md`](docs/platform-kit.md).
 Plugin authors can use the dependency-free conformance helpers in

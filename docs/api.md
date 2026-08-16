@@ -30,8 +30,9 @@ non-finite sandbox results before they are persisted.
 `ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` and
 `ioi` tasks use the classic batch runner and return structured compile, test,
 subtask, verdict, time, and output metrics. `interactive` tasks use the
-line-oriented interactor runner. Agent and game execution remain plugin
-extension points and fail closed until a corresponding runner is installed.
+line-oriented interactor runner. `agent` and `game` tasks use the versioned
+runner-plugin contract; registered participant artifacts are staged into the
+evaluator sandbox and game scores/replays are retained in result metrics.
 
 ## Authentication
 

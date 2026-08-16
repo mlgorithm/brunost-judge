@@ -61,6 +61,7 @@ def create_app(database: str | Path | None = None):
         name: str = Field(min_length=1, max_length=200)
         version: str = Field(default="1", min_length=1, max_length=100)
         artifact_path: str | None = None
+        artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         protocol: str = Field(default="stdio", min_length=1, max_length=100)
         resource_profile: dict[str, Any] = Field(default_factory=dict)
         required_capabilities: list[str] = Field(default_factory=list, max_length=32)
@@ -79,7 +80,8 @@ def create_app(database: str | Path | None = None):
 
     class MatchRequestModel(BaseModel):
         agent_refs: list[str] = Field(min_length=2, max_length=64)
-        submission_path: str = Field(min_length=1)
+        submission_path: str | None = Field(default=None, min_length=1)
+        submission_artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         idempotency_key: str = Field(min_length=1, max_length=255)
         seed: int | None = None
         callback_url: str | None = None
@@ -425,11 +427,43 @@ def create_app(database: str | Path | None = None):
         payload["callback_url"] = _validate_callback_url(payload.get("callback_url"))
         metadata = dict(payload.pop("metadata", {}) or {})
         evaluation_kind = payload.pop("evaluation_kind", "batch")
-        if evaluation_kind in {"agent", "match"}:
-            raise HTTPException(status_code=501, detail=f"evaluation kind '{evaluation_kind}' requires an installed runner plugin")
+        if evaluation_kind not in {"batch", "agent", "match"}:
+            raise HTTPException(status_code=422, detail="evaluation_kind must be batch, agent, or match")
         agent_refs = payload.pop("agent_refs", []) or []
         game_ref = payload.pop("game_ref", None)
         seed = payload.pop("seed", None)
+        if task.kind == "agent" and evaluation_kind != "agent":
+            raise HTTPException(status_code=422, detail="agent tasks require evaluation_kind=agent")
+        if task.kind == "game" and evaluation_kind != "match":
+            raise HTTPException(status_code=422, detail="game tasks require evaluation_kind=match")
+        if evaluation_kind == "agent" and not agent_refs:
+            raise HTTPException(status_code=422, detail="agent evaluations require at least one agent_ref")
+        if evaluation_kind == "match" and not game_ref:
+            raise HTTPException(status_code=422, detail="match evaluations require game_ref")
+        agent_definitions: list[dict[str, Any]] = []
+        for agent_ref in agent_refs:
+            definition = store.get_definition("agent", str(agent_ref))
+            if definition is None:
+                raise HTTPException(status_code=404, detail=f"unknown agent: {agent_ref}")
+            if not definition.get("artifact_path"):
+                raise HTTPException(status_code=422, detail=f"agent '{agent_ref}' has no executable artifact")
+            agent_definitions.append(definition)
+        if agent_definitions:
+            metadata["agent_definitions"] = agent_definitions
+        if game_ref:
+            game = store.get_definition("game", str(game_ref))
+            if game is None:
+                raise HTTPException(status_code=404, detail=f"unknown game: {game_ref}")
+            if game.get("task_ref") != task.task_ref:
+                raise HTTPException(status_code=422, detail="game task_ref does not match evaluation task_ref")
+            metadata["game_definition"] = game
+        required_capabilities = set(task.manifest.get("required_capabilities") or ())
+        for definition in agent_definitions:
+            required_capabilities.update(definition.get("required_capabilities") or ())
+        if game_ref:
+            required_capabilities.update(metadata["game_definition"].get("required_capabilities") or ())
+        if required_capabilities:
+            metadata["required_capabilities"] = sorted(required_capabilities)
         metadata["evaluation_kind"] = evaluation_kind
         if agent_refs:
             metadata["agent_refs"] = list(agent_refs)
@@ -482,8 +516,13 @@ def create_app(database: str | Path | None = None):
     def register_agent(request: AgentDefinitionModel) -> dict[str, Any]:
         payload = request.model_dump()
         artifact_path = payload.get("artifact_path")
-        if artifact_path:
-            payload["artifact_path"] = _allowed_path(artifact_path, "BRUNOST_AGENT_ROOT")
+        artifact_id = payload.pop("artifact_id", None)
+        if bool(artifact_path) and bool(artifact_id):
+            raise HTTPException(status_code=422, detail="provide exactly one of artifact_path or artifact_id")
+        if artifact_id:
+            payload["artifact_path"] = _artifact_path(artifact_id)
+        elif artifact_path:
+            payload["artifact_path"], _ = _directory_artifact(artifact_path, "BRUNOST_AGENT_ROOT")
         return store.register_definition("agent", request.agent_id, payload)
 
     @app.get("/v1/agents", dependencies=[Depends(require_api_token)])
@@ -585,6 +624,7 @@ def create_app(database: str | Path | None = None):
             worker_id=worker_id,
             queues=worker.queues,
             resource_classes=worker.resource_classes,
+            capabilities=worker.capabilities,
             lease_seconds=int(os.environ.get("BRUNOST_JUDGE_LEASE_SECONDS", "300")),
         )
         if claimed is None:

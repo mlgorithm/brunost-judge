@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from brunost_judge.contracts import ExecutionRequest, TaskRecord
+from brunost_judge.plugins import RunnerContext, RunnerRegistry
 from brunost_judge.security import callback_signature, verify_callback_signature
 from brunost_judge.store import JudgeStore
 
@@ -27,6 +28,25 @@ def test_priority_queue_and_worker_lease(tmp_path: Path):
     assert claimed[0].metadata["event_id"].startswith("execution:")
     assert claimed[2]["queue"] == "cpu"
     assert store.claim_next(worker_id="gpu-1", queues=("gpu",)) is None
+
+
+def test_worker_claim_filters_required_capabilities(tmp_path: Path):
+    store = _store(tmp_path)
+    store.register_task(
+        TaskRecord(
+            "gpu/v1",
+            str(tmp_path / "task"),
+            "ioai",
+            {"required_capabilities": ["gpu:true"]},
+        )
+    )
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    store.submit(ExecutionRequest("gpu/v1", str(submission), "gpu-key"))
+    assert store.claim_next(worker_id="cpu-1", capabilities=("resource:cpu",)) is None
+    claimed = store.claim_next(worker_id="gpu-1", capabilities=("resource:cpu", "gpu:true"))
+    assert claimed is not None
+    assert claimed[0].task_ref == "gpu/v1"
 
 
 def test_callback_signature_rejects_stale_payload():
@@ -58,3 +78,19 @@ def test_callback_signature_binds_event_id():
         require_event_id=True,
     )
     assert not verify_callback_signature(body, "secret", signature, timestamp, require_event_id=True)
+
+
+def test_runner_registry_validates_and_replaces_plugins():
+    class Plugin:
+        name = "test-plugin"
+        version = "1"
+        kinds = frozenset({"agent"})
+
+        def run(self, context):
+            return {"status": "completed", "score": 1.0, "metrics": {"id": context.execution_id}}
+
+    registry = RunnerRegistry()
+    registry.register(Plugin())
+    result = registry.run("agent", RunnerContext("e-1", "agent/v1", "agent", "/task", "/submission"))
+    assert result["metrics"] == {"id": "e-1"}
+    assert registry.names() == {"agent": "test-plugin"}

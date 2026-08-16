@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import time
 import urllib.error
@@ -17,6 +18,7 @@ import urllib.request
 import uuid
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 from brunost_judge.artifacts import (
     ArtifactError,
@@ -33,6 +35,65 @@ from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _needs_plugin_runner(task_kind: str, metadata: dict) -> bool:
+    return task_kind in {"agent", "game"} or str(metadata.get("evaluation_kind")) in {"agent", "match"}
+
+
+def _stage_plugin_submission(
+    submission: Path,
+    *,
+    execution_id: str,
+    task_ref: str,
+    task_kind: str,
+    metadata: dict,
+    stack: ExitStack,
+    materialize,
+) -> Path:  # type: ignore[no-untyped-def]
+    """Build the read-only participant bundle consumed by ``runner.py``."""
+
+    temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-plugin-"))
+    root = Path(temporary)
+    root.chmod(0o755)
+    primary = root / "submission"
+    shutil.copytree(submission, primary)
+    participants: dict[str, str] = {}
+    seats: list[dict[str, Any]] = []
+    definitions = metadata.get("agent_definitions") or []
+    if not isinstance(definitions, list):
+        raise TypeError("agent_definitions must be a list")
+    for index, definition in enumerate(definitions):
+        if not isinstance(definition, dict):
+            raise TypeError("agent definition must be an object")
+        agent_id = str(definition.get("agent_id") or "")
+        artifact_path = definition.get("artifact_path")
+        if not agent_id or not artifact_path:
+            raise ValueError(f"agent {agent_id or '<unknown>'} has no immutable artifact")
+        participant = materialize(str(artifact_path))
+        if not participant.is_dir():
+            raise ValueError(f"agent artifact is not a directory: {agent_id}")
+        relative = Path("participants") / f"agent-{index}"
+        shutil.copytree(participant, root / relative)
+        participants[agent_id] = relative.as_posix()
+        seats.append({"agent_id": agent_id, "seat": index, "path": relative.as_posix()})
+    plugin_metadata = dict(metadata)
+    plugin_metadata.pop("agent_definitions", None)
+    manifest = {
+        "version": 1,
+        "execution_id": execution_id,
+        "task_ref": task_ref,
+        "task_kind": task_kind,
+        "evaluation_kind": str(metadata.get("evaluation_kind") or ("match" if task_kind == "game" else "agent")),
+        "participants": participants,
+        "seats": seats,
+        "seed": metadata.get("seed"),
+        "metadata": plugin_metadata,
+    }
+    control = root / ".brunost"
+    control.mkdir()
+    control.joinpath("plugin.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
+    return root
 
 
 def _validated_runner_result(raw: object) -> dict:
@@ -103,6 +164,7 @@ class LocalWorker:
         advertised_capabilities = capabilities or tuple(
             value.strip() for value in os.environ.get("BRUNOST_JUDGE_CAPABILITIES", "runtime:local,resource:cpu").split(",") if value.strip()
         )
+        self.capabilities = advertised_capabilities
         self.store.register_worker(WorkerRecord(
             worker_id=self.worker_id,
             capabilities=advertised_capabilities,
@@ -117,6 +179,7 @@ class LocalWorker:
             worker_id=self.worker_id,
             queues=self.queues,
             resource_classes=self.resource_classes,
+            capabilities=self.capabilities,
             lease_seconds=self.lease_seconds,
         )
         if claimed is None:
@@ -128,6 +191,16 @@ class LocalWorker:
                 task_path = self._materialize_task(task.path, task.manifest, stack)
                 if not submission.is_dir():
                     raise ValueError(f"submission path is not a directory: {submission}")
+                if _needs_plugin_runner(task.kind, execution.metadata):
+                    submission = _stage_plugin_submission(
+                        submission,
+                        execution_id=execution.execution_id,
+                        task_ref=execution.task_ref,
+                        task_kind=task.kind,
+                        metadata=execution.metadata,
+                        stack=stack,
+                        materialize=lambda value: self._materialize(value, stack),
+                    )
                 raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution.execution_id))
             result = ExecutionResult(
                 execution_id=execution.execution_id,
@@ -303,6 +376,16 @@ class RemoteWorker:
                 task_path = self._materialize_task(task_payload["path"], task_payload.get("manifest") or {}, stack).resolve()
                 if not submission.is_dir():
                     raise ValueError(f"submission path is not a directory: {submission}")
+                if _needs_plugin_runner(str(task_payload.get("kind") or ""), execution_payload.get("metadata") or {}):
+                    submission = _stage_plugin_submission(
+                        submission,
+                        execution_id=execution_id,
+                        task_ref=str(execution_payload["task_ref"]),
+                        task_kind=str(task_payload.get("kind") or ""),
+                        metadata=execution_payload.get("metadata") or {},
+                        stack=stack,
+                        materialize=lambda value: self._materialize(value, stack),
+                    )
                 raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution_id))
             result = ExecutionResult(
                 execution_id=execution_id,

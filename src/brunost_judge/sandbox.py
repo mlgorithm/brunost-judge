@@ -89,6 +89,9 @@ class DockerSandboxRunner:
             ]
             if self.seccomp_profile:
                 command.extend(["--security-opt", f"seccomp={self.seccomp_profile}"])
+            plugin_module = os.environ.get("BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE", "").strip()
+            if plugin_module:
+                command.extend(["--env", f"BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE={plugin_module}"])
             command.extend([self.image, "python", "-m", "grader.evaluate"])
             try:
                 completed = subprocess.run(

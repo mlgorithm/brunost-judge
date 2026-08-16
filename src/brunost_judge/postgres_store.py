@@ -291,7 +291,8 @@ class PostgresJudgeStore:
             raise RuntimeError("idempotent execution insert was lost before it could be read")
 
     def claim_next(self, *, worker_id: str = "local-worker", queues: tuple[str, ...] | None = None,
-                   resource_classes: tuple[str, ...] | None = None, lease_seconds: int = 300):
+                   resource_classes: tuple[str, ...] | None = None, capabilities: tuple[str, ...] | None = None,
+                   lease_seconds: int = 300):
         with self._connect() as db:
             now = datetime.now(UTC)
             db.execute("UPDATE executions SET status='queued',worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=%s", (now, now))
@@ -302,7 +303,17 @@ class PostgresJudgeStore:
             if resource_classes:
                 clauses.append("resource_class = ANY(%s)")
                 params.append(list(resource_classes))
-            row = db.execute("SELECT * FROM executions WHERE " + " AND ".join(clauses) + " ORDER BY priority DESC,created_at LIMIT 1 FOR UPDATE SKIP LOCKED", params).fetchone()
+            rows = db.execute("SELECT e.*,t.manifest_json AS task_manifest_json FROM executions e JOIN tasks t ON t.task_ref=e.task_ref WHERE " + " AND ".join(clauses) + " ORDER BY e.priority DESC,e.created_at LIMIT 100 FOR UPDATE SKIP LOCKED", params).fetchall()
+            available_capabilities = set(capabilities or ())
+            row = None
+            for candidate in rows:
+                task_manifest = candidate["task_manifest_json"] if isinstance(candidate["task_manifest_json"], dict) else json.loads(candidate["task_manifest_json"])
+                execution_metadata = candidate["metadata_json"] if isinstance(candidate["metadata_json"], dict) else json.loads(candidate["metadata_json"])
+                required = set(task_manifest.get("required_capabilities") or ())
+                required.update(execution_metadata.get("required_capabilities") or ())
+                if required.issubset(available_capabilities):
+                    row = candidate
+                    break
             if not row:
                 return None
             lease = now + timedelta(seconds=max(1, lease_seconds))

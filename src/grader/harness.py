@@ -10,6 +10,7 @@ import importlib.util
 import math
 import os
 import traceback
+from pathlib import Path
 from typing import Any
 
 _MAX_REASON_CHARS = 2000
@@ -108,6 +109,56 @@ def _load_metrics_module(assets_path: str):
     return module
 
 
+def _task_kind(assets_path: str) -> str:
+    manifest_path = os.path.join(assets_path, "judge.yaml")
+    if not os.path.isfile(manifest_path):
+        return ""
+    with open(manifest_path, encoding="utf-8") as manifest_file:
+        return next(
+            (
+                line.split(":", 1)[1].strip().strip("\"'").lower()
+                for line in manifest_file
+                if line.strip().startswith("kind:")
+            ),
+            "",
+        )
+
+
+def _run_plugin(submission_path: str, assets_path: str) -> dict[str, Any]:
+    from grader.plugins import RunnerContext, default_registry, read_context_manifest
+
+    manifest = read_context_manifest(submission_path)
+    kind = "match" if manifest.get("evaluation_kind") == "match" else "agent"
+    participants = manifest.get("participants", {})
+    if not isinstance(participants, dict):
+        participants = {}
+    root = Path(submission_path)
+    resolved_participants = {
+        str(agent_id): str((root / str(relative)).resolve())
+        for agent_id, relative in participants.items()
+        if isinstance(agent_id, str) and isinstance(relative, str)
+    }
+    seats = []
+    for item in manifest.get("seats", []):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            continue
+        seat = dict(item)
+        seat["path"] = str((root / seat["path"]).resolve())
+        seats.append(seat)
+    context = RunnerContext(
+        execution_id=str(manifest.get("execution_id") or "local-plugin-execution"),
+        task_ref=str(manifest.get("task_ref") or "local-plugin-task"),
+        evaluation_kind=kind,
+        task_path=str(Path(assets_path).resolve()),
+        submission_path=str(root.resolve()),
+        participants=resolved_participants,
+        seats=tuple(seats),
+        seed=manifest.get("seed") if isinstance(manifest.get("seed"), int) else None,
+        metadata=manifest.get("metadata") if isinstance(manifest.get("metadata"), dict) else {},
+    )
+    return default_registry().run(kind, context)
+
+
 def run(submission_path: str, assets_path: str) -> dict[str, Any]:
     """Score a submission with the task's metrics.py; never raise.
 
@@ -115,22 +166,14 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
     'failed' result with a reason instead of crashing the sandbox.
     """
     try:
-        manifest_path = os.path.join(assets_path, "judge.yaml")
-        if os.path.isfile(manifest_path):
-            with open(manifest_path, encoding="utf-8") as manifest_file:
-                kind = next(
-                    (
-                        line.split(":", 1)[1].strip().strip("\"'").lower()
-                        for line in manifest_file
-                        if line.strip().startswith("kind:")
-                    ),
-                    "",
-                )
-            if kind in {"icpc", "ioi", "interactive"}:
-                from grader.classic import run_classic, run_interactive
+        kind = _task_kind(assets_path)
+        if kind in {"icpc", "ioi", "interactive"}:
+            from grader.classic import run_classic, run_interactive
 
-                runner = run_interactive if kind == "interactive" else run_classic
-                return runner(submission_path, assets_path)
+            runner = run_interactive if kind == "interactive" else run_classic
+            return runner(submission_path, assets_path)
+        if kind in {"agent", "game"}:
+            return _run_plugin(submission_path, assets_path)
         module = _load_metrics_module(assets_path)
         if module is None:
             return _failed("Task has no metrics.py scorer in its assets")

@@ -16,13 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "ioi", "model", "output-only"})
-# These are the task kinds executed by the built-in scorer sandbox. The other
-# public kinds remain valid manifest vocabulary, but require an evaluator
-# plugin; they must never silently fall through to metrics.py.
+# These are the task kinds executed by the built-in scorer sandbox.
 SCORER_KINDS = frozenset({"ioai", "model", "output-only"})
 CLASSIC_KINDS = frozenset({"icpc", "ioi"})
 INTERACTIVE_KINDS = frozenset({"interactive"})
-BUILTIN_KINDS = SCORER_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS
+PLUGIN_KINDS = frozenset({"agent", "game"})
+BUILTIN_KINDS = SCORER_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
 MANIFEST_VERSION = 1
 CLASSIC_LANGUAGES = frozenset({"python", "py", "c", "cpp", "c++", "c++17", "gnu++17", "g++", "rust", "rs"})
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
@@ -173,6 +172,13 @@ def validate_task(path: str | Path) -> TaskValidation:
             errors.append("interactive tasks need interactor.py")
         if not (root / "tests").is_dir() or not list((root / "tests").rglob("*.in")):
             errors.append("interactive tasks need tests/*.in files")
+    elif kind in PLUGIN_KINDS:
+        if _manifest_field(manifest_text, "runner") not in {None, "python"}:
+            errors.append("agent/game tasks must declare runner: python")
+        entrypoint = _manifest_field(manifest_text, "entrypoint") or "runner.py"
+        _validate_relative_path(entrypoint, "entrypoint", errors)
+        if not (root / entrypoint).is_file():
+            errors.append(f"{kind} tasks need {entrypoint}")
     elif not (root / "scorer" / "metrics.py").is_file() and not (root / "metrics.py").is_file():
         errors.append("missing scorer/metrics.py (or legacy root metrics.py)")
     if not (root / "public").is_dir():
@@ -228,14 +234,20 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
             encoding="utf-8",
         )
     else:
+        runner = "\nrunner: python" if normalized_kind in PLUGIN_KINDS else ""
         (root / "judge.yaml").write_text(
-            f"""# Brunost Judge task manifest\nversion: 1\nkind: {normalized_kind}\nruntime: python-3.13\nscoring: scorer.metrics:evaluate\nnetwork: disabled\n\n# Add resource_profile and feedback policy before publishing an official task.\n""",
+            f"""# Brunost Judge task manifest\nversion: 1\nkind: {normalized_kind}{runner}\nruntime: python-3.13\nscoring: scorer.metrics:evaluate\nnetwork: disabled\n\n# Add resource_profile and feedback policy before publishing an official task.\n""",
             encoding="utf-8",
         )
         (root / "scorer" / "metrics.py").write_text(
             '''"""Task scorer. Hidden assets are available under assets_path/private."""\n\n\ndef evaluate(submission_path: str, assets_path: str) -> dict[str, float]:\n    # Replace this example with deterministic task scoring.\n    _ = submission_path, assets_path\n    return {"public": 0.0}\n''',
             encoding="utf-8",
         )
+        if normalized_kind in PLUGIN_KINDS:
+            (root / "runner.py").write_text(
+                '''"""Reference agent/game runner. Return a canonical result mapping."""\n\n\ndef run(context: dict) -> dict:\n    _ = context\n    return {"status": "completed", "score": 0.0, "metrics": {}}\n''',
+                encoding="utf-8",
+            )
     (root / "public" / "README.md").write_text("Put contestant-visible data here.\n", encoding="utf-8")
     (root / "private" / ".gitkeep").write_text("", encoding="utf-8")
     (root / "tests" / "test_task.py").write_text(

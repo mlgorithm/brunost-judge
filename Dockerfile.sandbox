@@ -10,6 +10,7 @@ RUN apt-get update \
 
 COPY src/grader /opt/brunost/grader
 COPY src/brunost_judge/artifacts.py /opt/brunost/artifacts.py
+COPY src/brunost_judge/plugins.py /opt/brunost/brunost_judge/plugins.py
 ENV PYTHONPATH=/opt/brunost
 WORKDIR /workspace
 
