@@ -3,10 +3,12 @@
 Current release: `0.8.0` — zero-code node enrollment, portable artifacts, worker credentials, capability scheduling, provider
 adapters, and deterministic game contracts.
 
-Brunost Judge is the platform-independent judging layer for ICPC, IOI, IOAI,
-and agent tasks. It is intentionally separate from the NOKI/Brunost education
+Brunost Judge is the platform-independent judging layer for scorer-backed IOAI,
+model, and output-only tasks, with versioned contracts for ICPC, IOI, interactive,
+and agent runners. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
-platform integrates through the SDK/API boundary.
+platform integrates through the SDK/API boundary. The built-in runtime fails
+closed for runner kinds that do not have an installed evaluator plugin.
 
 The distribution includes the scorer core, task package validator, local CLI,
 SQLite development control plane, optional PostgreSQL control plane, HTTP API,
@@ -23,6 +25,7 @@ brunost task validate tasks/example
 brunost run tasks/example --submission ./submission
 
 # standalone API + worker
+export BRUNOST_JUDGE_API_TOKEN=local-development-only
 brunost server
 brunost worker
 ```
@@ -70,7 +73,7 @@ Then register and submit through the SDK:
 ```python
 from brunost_judge.sdk import JudgeClient
 
-judge = JudgeClient("http://127.0.0.1:8787")
+judge = JudgeClient("http://127.0.0.1:8787", token="local-development-only")
 judge.register_task(task_ref="demo/v1", path="./tasks/demo")
 execution = judge.submit(
     task_ref="demo/v1",
@@ -136,6 +139,53 @@ def evaluate(submission_path: str, assets_path: str) -> dict | float:
   in `metrics["private"]`, which the platform gates behind leaderboard freeze/reveal.
 - Any error (missing file, bad shape, scorer exception) → `{"status": "failed", "score": 0.0,
   "failure_reason": "..."}` — the harness never crashes the sandbox.
+
+### Classic batch tasks
+
+`icpc` and `ioi` task packages use the built-in classic runner. A minimal
+manifest is flat and dependency-free:
+
+```yaml
+version: 1
+kind: ioi
+runner: classic
+language: cpp
+time_limit_ms: 2000
+memory_limit_mb: 512
+output_limit_bytes: 1048576
+```
+
+The task contains matching `tests/**/*.in` and `.ans`/`.out` files. Without a
+`subtasks.json`, all tests are worth 100 points. For IOI scoring, define a list
+of point-bearing subtasks and assign every test exactly once:
+
+```json
+{"subtasks": [
+  {"id": "basic", "points": 30, "tests": ["basic/01"]},
+  {"id": "full", "points": 70, "tests": ["full/01", "full/02"]}
+]}
+```
+
+The default checker compares whitespace-separated tokens. A task can provide
+`checker.py` with `check(input_path, answer_path, output_path)` for custom
+validation. Supported submission languages are Python, C, C++17, and Rust.
+Compile errors, runtime errors, time limits, output limits, and partial scores
+are returned as structured test/subtask metrics.
+
+For production, the Docker evaluator image installs compilers and bubblewrap;
+private task assets stream into a root-only evaluator tmpfs and are never mounted
+into the contestant process. Contestant/compiler processes run as dedicated UID
+65533; runtimes that permit nested user namespaces also get bubblewrap isolation.
+The local process runner remains a development mode only.
+
+Production workers fail closed unless `BRUNOST_JUDGE_SANDBOX_MODE=docker` is
+explicitly configured with a digest-pinned evaluator image. Artifact-backed
+tasks and submissions are verified by SHA-256 before execution.
+
+`interactive` task packages use the same manifest and `tests/**/*.in` layout,
+but provide an `interactor.py` with `interact(session, input_path)`. The
+interactor exchanges newline-delimited UTF-8 messages through `session.send()`
+and `session.receive()`, then returns `True`/`False` or a verdict/score object.
 
 ## Usage in the sandbox
 

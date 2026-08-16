@@ -16,9 +16,13 @@ can run it in its own infrastructure.
 
 ## Smoke test
 
-1. Register one IOAI CPU task.
-2. Submit the same idempotency key twice; confirm one execution is created.
-3. Consume it with a CPU worker and confirm the callback signature verifies.
+1. Run `scripts/canary.sh` against one IOI/CPU task. The command uploads the
+   task and submission as immutable artifacts, registers the task by digest,
+   submits twice with one idempotency key, and waits for a completed result.
+2. Confirm the canary output reports `immutable_task_artifact`,
+   `immutable_submission_artifact`, `idempotency`, and `completed` as `true`.
+3. If `BRUNOST_JUDGE_CANARY_CALLBACK_URL` is configured, confirm the callback
+   receiver verifies the signature with the event ID and records one result.
 4. Replay the exact callback immediately and after five minutes; the receiver
    must acknowledge an immediate duplicate without applying it twice and reject
    the stale duplicate. The signed event ID is the durable deduplication key;
@@ -26,6 +30,11 @@ can run it in its own infrastructure.
 5. Stop the worker during a lease, wait for expiry, and confirm another worker
    reclaims the execution.
 6. Confirm `/v1/stats` returns zero queued/running work after the callback.
+
+The same workflow is covered in CI by
+`tests/test_distributed_canary.py`. It starts a real HTTP API, enrolls a remote
+worker, downloads artifacts over the worker API, verifies a signed callback,
+and reclaims a deliberately expired lease with a second worker.
 
 ## Canary and rollback
 

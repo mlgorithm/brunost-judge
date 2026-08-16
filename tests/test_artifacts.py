@@ -40,9 +40,37 @@ def test_artifact_store_rejects_traversal(tmp_path: Path):
         raise AssertionError("path traversal was accepted")
 
 
+def test_artifact_store_rejects_archive_bombs(tmp_path: Path):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        info = tarfile.TarInfo("large.bin")
+        info.size = 8
+        archive.addfile(info, io.BytesIO(b"12345678"))
+    try:
+        safe_extract(output.getvalue(), tmp_path / "out", max_member_bytes=4)
+    except ArtifactError:
+        pass
+    else:
+        raise AssertionError("oversized archive member was accepted")
+
+
 def test_directory_bundle_is_deterministic(tmp_path: Path):
     task = _task(tmp_path)
     assert pack_directory(task) == pack_directory(task)
+
+
+def test_generated_bytecode_is_not_part_of_artifact_or_task_digest(tmp_path: Path):
+    task = _task(tmp_path)
+    from brunost_judge.task import task_digest
+
+    before_bundle = pack_directory(task)
+    before_digest = task_digest(task)
+    cache = task / "scorer" / "__pycache__"
+    cache.mkdir()
+    (cache / "metrics.cpython-314.pyc").write_bytes(b"generated")
+
+    assert pack_directory(task) == before_bundle
+    assert task_digest(task) == before_digest
 
 
 def test_artifact_store_from_environment_defaults_to_filesystem(tmp_path: Path, monkeypatch):

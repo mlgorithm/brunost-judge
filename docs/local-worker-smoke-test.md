@@ -195,3 +195,8 @@ test directory can then be removed.
 It does not test Platform users, contest registration, UI pages, leaderboard
 policy, or Platform callbacks. Those are covered by the Platform Kit and its
 integration flow.
+
+For the shorter artifact-first control-plane canary, use
+`BRUNOST_JUDGE_API_TOKEN=... scripts/canary.sh`. Unlike the manual path above,
+it never submits mutable filesystem paths and is suitable for verifying that a
+separate API and worker can share only the artifact backend.

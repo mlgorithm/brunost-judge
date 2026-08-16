@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
+RESULT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -158,10 +159,11 @@ class EvaluationRequest:
     """Canonical high-level request for any judge evaluation.
 
     ``evaluation_kind`` is one of ``batch``, ``interactive``, ``agent``, or
-    ``match``.  The reference distribution executes batch and interactive
-    tasks. Agent and match definitions are registry declarations only until a
-    runner plugin is installed; the HTTP API fails closed with ``501`` instead
-    of silently treating a game as a batch score.
+    ``match``. The built-in distribution executes scorer-backed batch tasks,
+    classic ICPC/IOI tasks, and line-oriented interactive tasks. Agent and
+    match definitions remain registry declarations until a runner plugin is
+    installed; the HTTP API fails closed with ``501`` instead of silently
+    treating them as batch scores.
     """
 
     task_ref: str
@@ -214,6 +216,7 @@ class ExecutionResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     failure_reason: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    result_version: int = RESULT_SCHEMA_VERSION
     judge_version: str = "local"
     queue: str = "default"
     resource_class: str = "cpu"

@@ -22,6 +22,12 @@ The API is available at `http://127.0.0.1:8787`, with interactive docs at
 `POST /v1/tasks`, submit an execution through `POST /v1/executions`, and poll the
 execution or receive a callback.
 
+The control plane is authenticated by default. For local development, set
+`BRUNOST_JUDGE_API_TOKEN` and send it as a bearer token, or explicitly set
+`BRUNOST_JUDGE_ALLOW_ANONYMOUS_API=true` only when the service is bound to a
+trusted loopback interface. Never use anonymous mode for a shared or production
+deployment.
+
 Set `BRUNOST_JUDGE_API_TOKEN`, `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET`, and
 `POSTGRES_PASSWORD` to non-default values before exposing the API beyond a local
 test. The Compose profile uses PostgreSQL; a direct `brunost server` invocation

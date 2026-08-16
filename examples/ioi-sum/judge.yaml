@@ -1,0 +1,8 @@
+version: 1
+kind: ioi
+runner: classic
+language: python
+time_limit_ms: 1000
+memory_limit_mb: 256
+output_limit_bytes: 1048576
+network: disabled

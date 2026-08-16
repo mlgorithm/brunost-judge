@@ -7,6 +7,7 @@ canonical result to RESULT_PATH. Works whether the grader is importable as a pac
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pathlib
@@ -19,9 +20,26 @@ except ImportError:  # bundled flat in the task assets (harness.py next to this 
     from harness import run  # type: ignore[no-redef]
 
 
+def _materialize_task_bundle() -> str | None:
+    if os.environ.get("BRUNOST_JUDGE_TASK_BUNDLE", "").lower() != "stdin":
+        return None
+    module_path = pathlib.Path(__file__).resolve().parents[1] / "artifacts.py"
+    spec = importlib.util.spec_from_file_location("sandbox_artifacts", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("sandbox artifact extractor is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    root = pathlib.Path("/tmp/brunost-assets")
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o700)
+    module.safe_extract(sys.stdin.buffer.read(), root)
+    root.chmod(0o700)
+    return str(root)
+
+
 def main() -> int:
     submission_path = os.environ.get("SUBMISSION_PATH", "/workspace/submission")
-    assets_path = os.environ.get("ASSETS_PATH", "/workspace/assets")
+    assets_path = _materialize_task_bundle() or os.environ.get("ASSETS_PATH", "/workspace/assets")
     result_path = os.environ.get("RESULT_PATH", "/workspace/output/results.json")
 
     result = run(submission_path, assets_path)

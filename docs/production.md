@@ -11,6 +11,13 @@ Before an official contest, operators must provide:
 - object storage for submissions, task packages, and bounded artifacts;
 - isolated worker hosts using gVisor/Kata/Firecracker or an equivalent boundary;
 - immutable, digest-pinned judge and runtime images;
+- `BRUNOST_JUDGE_ENV=production`, explicit `BRUNOST_JUDGE_SANDBOX_MODE=docker`,
+  and `BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS=true`; production refuses the
+  in-process runner and unpinned evaluator images;
+- a sandbox image built from `Dockerfile.sandbox` with the required compiler
+  toolchains and `bubblewrap`; task bundles stream over evaluator stdin into a
+  root-only tmpfs, while classic contestants run as dedicated UID 65533;
+  bubblewrap remains available when the runtime supports nested user namespaces;
 - private worker queues (`--queue`) and resource pools (`--resource-class`);
 - signed result callbacks using `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET` and the
   `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers. Production
@@ -37,7 +44,11 @@ docker compose -f docker-compose.yml -f docker-compose.production.yml up --build
 
 The overlay makes the worker's Docker socket explicit, but every evaluator is
 still launched with no network, read-only rootfs, dropped capabilities, quotas,
-and the configured gVisor/Kata runtime. Build the sandbox image with
+and the configured gVisor/Kata runtime. The classic runner gives the evaluator
+root access only to the private task tmpfs, then drops contestant/compiler
+processes to dedicated UID 65533; task assets are never mounted into that
+contestant process. On runtimes that permit it, bubblewrap adds a second mount
+namespace as defense in depth. Build the sandbox image with
 `Dockerfile.sandbox` on top of the pinned task runtime, then publish it by
 digest. GPU workers should use a separately
 certified runtime because gVisor GPU support is limited.
@@ -46,6 +57,11 @@ The reference artifact backend is a content-addressed filesystem. For a
 multi-node country deployment, put that root on replicated S3/MinIO-compatible
 object storage or deploy an equivalent artifact adapter; the worker protocol
 does not require shared POSIX mounts.
+
+Every task manifest must declare `version: 1`. Registration snapshots the task
+as a content-addressed artifact and workers verify its digest again immediately
+before evaluation. Generated Python bytecode is excluded from both snapshots
+and digests so local caches cannot change the task identity.
 
 ## Deployment sequence
 
@@ -60,14 +76,28 @@ does not require shared POSIX mounts.
 6. Promote additional worker pools after queue-drain, failure-injection, and
    restore tests pass.
 
+When Docker is available on the worker host, run the real sandbox check against
+the published image before a canary:
+
+```bash
+BRUNOST_JUDGE_RUN_DOCKER_TESTS=true \
+BRUNOST_JUDGE_SANDBOX_IMAGE='registry.example/judge@sha256:<digest>' \
+pytest -q tests/test_docker_sandbox_integration.py
+```
+
+The integration test verifies a classic submission completes while a deliberate
+attempt to open the task answer path is denied.
+
 For country-operated nodes, use the join workflow in
 [`node-onboarding.md`](node-onboarding.md). Do not copy the global API token to
 workers; workers should use the credential returned by `brunost node join`.
 
 ## Repeatable drills
 
-- `scripts/canary.sh` registers the CPU task, submits twice with one idempotency
-  key, and waits for a terminal result.
+- `scripts/canary.sh` uploads immutable task/submission artifacts, registers the
+  CPU task by digest, submits twice with one idempotency key, and waits for a
+  terminal result. Set `BRUNOST_JUDGE_CANARY_CALLBACK_URL` to exercise the
+  platform callback receiver as part of the run.
 - `scripts/backup_postgres.sh` writes an atomic custom-format dump and checksum;
   copy the resulting directory to a different failure domain.
 - `scripts/restore_drill.sh` restores that dump into a throwaway PostgreSQL
@@ -75,6 +105,10 @@ workers; workers should use the credential returned by `brunost node join`.
 - `scripts/failover_drill.sh` prints the supervised worker-loss sequence. Stop
   the first worker, wait for its lease, start a second worker, and confirm the
   same execution completes once.
+
+The HTTP-level artifact, enrollment, callback-signature, idempotency, and lease
+reclaim path is also exercised by `tests/test_distributed_canary.py` before a
+release is promoted.
 
 The platform integration should switch traffic using its existing gateway and
 outbox, not by sharing judge tables. Keep the current in-repo worker available

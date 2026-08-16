@@ -269,6 +269,9 @@ class JudgeClient:
     def get_execution(self, execution_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/executions/{execution_id}")
 
+    def stats(self) -> dict[str, int]:
+        return self._request("GET", "/v1/stats")  # type: ignore[return-value]
+
     def submit_evaluation(self, **kwargs: Any) -> dict[str, Any]:
         """Submit using the canonical evaluation resource name."""
         return self._request("POST", "/v1/evaluations", kwargs)

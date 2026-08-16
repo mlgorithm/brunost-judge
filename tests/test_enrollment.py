@@ -24,7 +24,13 @@ def test_enrollment_is_one_time_and_worker_scoped(tmp_path: Path, monkeypatch):
     issued = client.post(
         "/v1/nodes/enrollment-tokens",
         headers=admin,
-        json={"node_id": "node-2", "worker_id": "cpu-2", "capabilities": ["runtime:docker"], "region": "north"},
+        json={
+            "node_id": "node-2",
+            "worker_id": "cpu-2",
+            "capabilities": ["runtime:docker", "gpu:true"],
+            "resource_classes": ["cpu", "gpu"],
+            "region": "north",
+        },
     )
     assert issued.status_code == 201
     join_token = issued.json()["join_token"]
@@ -86,3 +92,20 @@ def test_enrolled_worker_claims_and_finishes_only_its_lease(tmp_path: Path, monk
     assert finish.status_code == 200
     assert finish.json()["status"] == "completed"
     assert client.post("/v1/workers/cpu-1/claim", headers=worker_headers).status_code == 204
+
+
+def test_node_cannot_elevate_capabilities_beyond_operator_grant(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_API_TOKEN", "admin-secret")
+    monkeypatch.setenv("BRUNOST_JUDGE_REQUIRE_API_TOKEN", "true")
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    admin = {"Authorization": "Bearer admin-secret"}
+    issued = client.post(
+        "/v1/nodes/enrollment-tokens",
+        headers=admin,
+        json={"node_id": "node-3", "worker_id": "cpu-3", "capabilities": ["runtime:docker"]},
+    )
+    response = client.post(
+        "/v1/nodes/enroll",
+        json={"join_token": issued.json()["join_token"], "capabilities": ["gpu:true"]},
+    )
+    assert response.status_code == 422

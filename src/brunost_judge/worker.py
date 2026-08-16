@@ -12,6 +12,7 @@ import logging
 import os
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 from contextlib import ExitStack
@@ -19,9 +20,11 @@ from pathlib import Path
 
 from brunost_judge.artifacts import (
     ArtifactError,
+    artifact_limits_from_environment,
     artifact_store_from_environment,
     safe_extract,
 )
+from brunost_judge.conformance import validate_runner_result_payload
 from brunost_judge.contracts import ExecutionResult, WorkerRecord
 from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
 from brunost_judge.sdk import JudgeClient
@@ -30,6 +33,25 @@ from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _validated_runner_result(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raise TypeError("sandbox returned a non-object result")
+    errors = validate_runner_result_payload(raw)
+    if errors:
+        raise ValueError("invalid sandbox result: " + "; ".join(errors))
+    return raw
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Callbacks must not turn an allowlisted URL into an SSRF redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(req.full_url, code, "callback redirects are disabled", headers, fp)
+
+
+_CALLBACK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
@@ -46,7 +68,7 @@ def _notify(url: str, token: str | None, payload: dict, signing_secret: str | No
         headers["X-Brunost-Judge-Signature"] = signature
         headers["X-Brunost-Judge-Event-ID"] = event_id
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=10):
+    with _CALLBACK_OPENER.open(request, timeout=10):
         return
 
 
@@ -106,7 +128,7 @@ class LocalWorker:
                 task_path = self._materialize_task(task.path, task.manifest, stack)
                 if not submission.is_dir():
                     raise ValueError(f"submission path is not a directory: {submission}")
-                raw = self.sandbox_runner.run(submission, task_path, execution.execution_id)
+                raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution.execution_id))
             result = ExecutionResult(
                 execution_id=execution.execution_id,
                 task_ref=execution.task_ref,
@@ -155,7 +177,7 @@ class LocalWorker:
             # invisible to that UID when the directory is bind-mounted.
             root = Path(temporary)
             root.chmod(0o755)
-            return safe_extract(self.artifact_store.get(value.removeprefix("artifact://")), root)
+            return self.artifact_store.extract(self.artifact_store.get(value.removeprefix("artifact://")), root)
         if self.require_immutable_artifacts:
             raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
         return Path(value).expanduser().resolve()
@@ -239,12 +261,16 @@ class RemoteWorker:
         if value.startswith("artifact://"):
             identifier = value.removeprefix("artifact://")
             temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="brunost-remote-artifact-"))
-            # The Docker/gVisor sandbox uses UID 65534 and needs to traverse
+            # The Docker/gVisor sandbox evaluator needs to traverse
             # this bind-mounted extraction root.  Keep files read-only but make
             # the directory searchable by the sandbox user.
             root = Path(temporary)
             root.chmod(0o755)
-            return safe_extract(self.client.download_artifact(self.worker_id, identifier), root)
+            return safe_extract(
+                self.client.download_artifact(self.worker_id, identifier),
+                root,
+                **artifact_limits_from_environment(),
+            )
         if self.require_immutable_artifacts:
             raise ValueError("mutable filesystem paths are disabled; submit an artifact reference")
         return self._local_path(value)
@@ -277,7 +303,7 @@ class RemoteWorker:
                 task_path = self._materialize_task(task_payload["path"], task_payload.get("manifest") or {}, stack).resolve()
                 if not submission.is_dir():
                     raise ValueError(f"submission path is not a directory: {submission}")
-                raw = self.sandbox_runner.run(submission, task_path, execution_id)
+                raw = _validated_runner_result(self.sandbox_runner.run(submission, task_path, execution_id))
             result = ExecutionResult(
                 execution_id=execution_id,
                 task_ref=execution_payload["task_ref"],

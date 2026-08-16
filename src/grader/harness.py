@@ -115,6 +115,22 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
     'failed' result with a reason instead of crashing the sandbox.
     """
     try:
+        manifest_path = os.path.join(assets_path, "judge.yaml")
+        if os.path.isfile(manifest_path):
+            with open(manifest_path, encoding="utf-8") as manifest_file:
+                kind = next(
+                    (
+                        line.split(":", 1)[1].strip().strip("\"'").lower()
+                        for line in manifest_file
+                        if line.strip().startswith("kind:")
+                    ),
+                    "",
+                )
+            if kind in {"icpc", "ioi", "interactive"}:
+                from grader.classic import run_classic, run_interactive
+
+                runner = run_interactive if kind == "interactive" else run_classic
+                return runner(submission_path, assets_path)
         module = _load_metrics_module(assets_path)
         if module is None:
             return _failed("Task has no metrics.py scorer in its assets")

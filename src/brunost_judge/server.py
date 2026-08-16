@@ -18,7 +18,7 @@ from brunost_judge.artifacts import (
 from brunost_judge.contracts import TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
-from brunost_judge.task import task_digest, validate_task
+from brunost_judge.task import BUILTIN_KINDS, task_digest, validate_task
 
 
 def create_app(database: str | Path | None = None):
@@ -125,6 +125,7 @@ def create_app(database: str | Path | None = None):
         metrics: dict[str, Any] = Field(default_factory=dict)
         failure_reason: str | None = None
         metadata: dict[str, Any] = Field(default_factory=dict)
+        result_version: int = Field(default=1, ge=1)
         judge_version: str = "local"
         queue: str = "default"
         resource_class: str = "cpu"
@@ -134,6 +135,7 @@ def create_app(database: str | Path | None = None):
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
     app = FastAPI(title="Brunost Judge", version="0.8.0")
+    allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
 
     def _allowed_path(value: str, env_name: str) -> str:
         path = Path(value).expanduser().resolve()
@@ -187,8 +189,13 @@ def create_app(database: str | Path | None = None):
 
     def require_api_token(authorization: str | None = Header(default=None)) -> None:
         expected = os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip()
-        required = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN", "false").lower() == "true"
-        if required and not expected:
+        configured_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN")
+        required = (
+            configured_requirement.lower() == "true"
+            if configured_requirement is not None
+            else not allow_anonymous_api
+        )
+        if not expected and (required or not allow_anonymous_api):
             raise HTTPException(status_code=503, detail="judge API token is not configured")
         if expected and authorization != f"Bearer {expected}":
             raise HTTPException(status_code=401, detail="invalid judge API token")
@@ -197,14 +204,24 @@ def create_app(database: str | Path | None = None):
         """Accept the global admin token or the enrolled worker's scoped token."""
 
         expected = os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip()
-        required = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN", "false").lower() == "true"
+        configured_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN")
+        required = (
+            configured_requirement.lower() == "true"
+            if configured_requirement is not None
+            else not allow_anonymous_api
+        )
         if expected and authorization == f"Bearer {expected}":
             return
         if authorization and authorization.startswith("Bearer "):
             if store.verify_worker_token(worker_id, authorization.removeprefix("Bearer ").strip()):
                 return
             raise HTTPException(status_code=401, detail="invalid worker token")
-        worker_required = os.environ.get("BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN", "false").lower() == "true"
+        configured_worker_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN")
+        worker_required = (
+            configured_worker_requirement.lower() == "true"
+            if configured_worker_requirement is not None
+            else False
+        ) or not allow_anonymous_api
         if expected or required or worker_required:
             raise HTTPException(status_code=401, detail="worker token required")
 
@@ -240,7 +257,12 @@ def create_app(database: str | Path | None = None):
                     raise HTTPException(status_code=400, detail="invalid content-length") from exc
                 if declared_size > artifact_store.max_bytes:
                     raise HTTPException(status_code=413, detail="artifact exceeds configured maximum size")
-            body = await request.body()
+            body_buffer = bytearray()
+            async for chunk in request.stream():
+                body_buffer.extend(chunk)
+                if len(body_buffer) > artifact_store.max_bytes:
+                    raise HTTPException(status_code=413, detail="artifact exceeds configured maximum size")
+            body = bytes(body_buffer)
             return artifact_store.put(body, expected_id=artifact_id)
         except HTTPException:
             raise
@@ -291,8 +313,16 @@ def create_app(database: str | Path | None = None):
             metadata["detected_capabilities"] = sorted(set(request.capabilities))
         from brunost_judge.contracts import WorkerRecord
 
-        capabilities = tuple(sorted(set(payload.get("capabilities") or ()) | set(request.capabilities)))
-        resource_classes = tuple(sorted(set(payload.get("resource_classes") or ("cpu",)) | set(request.resource_classes)))
+        approved_capabilities = set(payload.get("capabilities") or ())
+        detected_capabilities = set(request.capabilities)
+        if not detected_capabilities.issubset(approved_capabilities):
+            raise HTTPException(status_code=422, detail="node capabilities exceed the enrollment token")
+        approved_resource_classes = set(payload.get("resource_classes") or ("cpu",))
+        detected_resource_classes = set(request.resource_classes)
+        if not detected_resource_classes.issubset(approved_resource_classes):
+            raise HTTPException(status_code=422, detail="node resource classes exceed the enrollment token")
+        capabilities = tuple(sorted(approved_capabilities))
+        resource_classes = tuple(sorted(approved_resource_classes))
         worker = WorkerRecord(
             worker_id=worker_id,
             capabilities=capabilities,
@@ -349,9 +379,13 @@ def create_app(database: str | Path | None = None):
                     temporary.cleanup()
         if not validation.valid:
             raise HTTPException(status_code=422, detail=list(validation.errors))
+        manifest_kind = (validation.kind or "").lower()
+        requested_kind = request.kind.lower() if request.kind else manifest_kind
+        if requested_kind != manifest_kind:
+            raise HTTPException(status_code=422, detail="request kind must match judge.yaml kind")
         manifest = {
             **request.metadata,
-            "kind": request.kind or validation.kind,
+            "kind": requested_kind,
             "version": request.version,
             "runtime": request.runtime,
             "evaluator": request.evaluator,
@@ -361,7 +395,7 @@ def create_app(database: str | Path | None = None):
         }
         if artifact_identifier:
             manifest["artifact_id"] = artifact_identifier
-        task = store.register_task(TaskRecord(request.task_ref, task_path, request.kind or validation.kind or "unknown", manifest))
+        task = store.register_task(TaskRecord(request.task_ref, task_path, requested_kind or "unknown", manifest))
         return task.as_dict()
 
     @app.get("/v1/task-definitions", dependencies=[Depends(require_api_token)])
@@ -372,6 +406,14 @@ def create_app(database: str | Path | None = None):
         from brunost_judge.contracts import ExecutionRequest
 
         payload = dict(payload)
+        task = store.get_task(str(payload.get("task_ref") or ""))
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"unknown task_ref: {payload.get('task_ref')}")
+        if task.kind not in BUILTIN_KINDS:
+            raise HTTPException(
+                status_code=501,
+                detail=f"task kind '{task.kind}' requires an installed evaluator runner plugin",
+            )
         submission_path = payload.pop("submission_path", None)
         submission_artifact_id = payload.pop("submission_artifact_id", None)
         if bool(submission_path) == bool(submission_artifact_id):
@@ -552,7 +594,12 @@ def create_app(database: str | Path | None = None):
 
     @app.post("/v1/workers/{worker_id}/finish", dependencies=[Depends(require_worker_token)])
     def finish_worker(worker_id: str, request: WorkerFinishModel) -> dict[str, Any]:
-        from brunost_judge.contracts import ExecutionResult
+        from brunost_judge.contracts import RESULT_SCHEMA_VERSION, ExecutionResult
+
+        if request.result_version != RESULT_SCHEMA_VERSION:
+            raise HTTPException(status_code=422, detail=f"result_version must be {RESULT_SCHEMA_VERSION}")
+        if request.status not in {"completed", "failed", "canceled"}:
+            raise HTTPException(status_code=422, detail="worker results must be terminal")
 
         result = store.finish(
             request.execution_id,
@@ -564,6 +611,7 @@ def create_app(database: str | Path | None = None):
                 metrics=request.metrics,
                 failure_reason=request.failure_reason,
                 metadata=request.metadata,
+                result_version=request.result_version,
                 judge_version=request.judge_version,
                 queue=request.queue,
                 resource_class=request.resource_class,

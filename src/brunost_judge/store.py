@@ -46,18 +46,30 @@ def _now() -> str:
 
 class JudgeStore:
     def __init__(self, database: str | Path = "judge.db") -> None:
-        self.path = str(database)
+        requested_path = str(database)
+        self._sqlite_uri = requested_path == ":memory:"
+        # Every sqlite3.connect(":memory:") call creates a different database.
+        # Use a private shared-cache URI and keep one connection alive so the
+        # store behaves like a real in-memory database across its connections.
+        self.path = (
+            f"file:brunost_judge_{uuid.uuid4().hex}?mode=memory&cache=shared"
+            if self._sqlite_uri
+            else requested_path
+        )
         self._lock = threading.RLock()
+        self._memory_keeper: sqlite3.Connection | None = None
+        if self._sqlite_uri:
+            self._memory_keeper = self._connect()
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False, uri=self._sqlite_uri)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def _initialize(self) -> None:
-        if self.path != ":memory:":
+        if not self._sqlite_uri:
             Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             db.executescript(

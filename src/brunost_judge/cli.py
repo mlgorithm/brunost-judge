@@ -122,13 +122,15 @@ def _parser() -> argparse.ArgumentParser:
     canary = subparsers.add_parser("canary", help="run an end-to-end CPU judge canary")
     canary.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
     canary.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
-    canary.add_argument("--task-ref", default="canary/ioai-cpu-v1")
+    canary.add_argument("--task-ref", default="canary/ioi-sum-v1")
     canary.add_argument("--task-path", type=Path, required=True)
     canary.add_argument("--submission", type=Path, required=True)
     canary.add_argument("--timeout", type=float, default=120.0)
     canary.add_argument("--poll-seconds", type=float, default=1.0)
     canary.add_argument("--queue", default="default")
     canary.add_argument("--resource-class", default="cpu")
+    canary.add_argument("--callback-url", help="optional result callback URL to exercise")
+    canary.add_argument("--callback-token", help="optional bearer token for the callback receiver")
     return parser
 
 
@@ -431,15 +433,26 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         client = JudgeClient(args.url, token=args.token, timeout=30)
         try:
-            task = client.register_task(task_ref=args.task_ref, path=str(args.task_path.resolve()))
+            # The canary must work when the API, worker, and operator do not
+            # share a filesystem. Upload both inputs first, then use only
+            # immutable content-addressed references for the execution.
+            task_artifact = client.upload_artifact(args.task_path)
+            task = client.register_task(
+                task_ref=args.task_ref,
+                artifact_id=str(task_artifact["artifact_id"]),
+                kind=validation.kind,
+            )
+            submission_artifact = client.upload_artifact(args.submission)
             key = f"canary-{uuid.uuid4()}"
             payload = {
                 "task_ref": args.task_ref,
-                "submission_path": str(args.submission.resolve()),
+                "submission_artifact_id": str(submission_artifact["artifact_id"]),
                 "idempotency_key": key,
                 "queue": args.queue,
                 "resource_class": args.resource_class,
                 "metadata": {"canary": True, "task_digest": task.get("manifest", {}).get("digest")},
+                "callback_url": args.callback_url,
+                "callback_token": args.callback_token,
             }
             first = client.submit(**payload)
             second = client.submit(**payload)
@@ -452,7 +465,14 @@ def main(argv: list[str] | None = None) -> int:
                 if current.get("status") in {"completed", "failed", "canceled"}:
                     break
                 time.sleep(max(0.05, args.poll_seconds))
-            print(json.dumps({"task": task, "execution": current}, sort_keys=True, indent=2))
+            checks = {
+                "immutable_task_artifact": bool(task_artifact.get("artifact_id")),
+                "immutable_submission_artifact": bool(submission_artifact.get("artifact_id")),
+                "idempotency": first.get("execution_id") == second.get("execution_id"),
+                "terminal": current.get("status") in {"completed", "failed", "canceled"},
+                "completed": current.get("status") == "completed",
+            }
+            print(json.dumps({"checks": checks, "task": task, "execution": current}, sort_keys=True, indent=2))
             return 0 if current.get("status") == "completed" else 1
         except Exception as exc:  # noqa: BLE001 - canary should report one actionable failure
             print(f"judge canary failed: {type(exc).__name__}: {exc}", file=sys.stderr)

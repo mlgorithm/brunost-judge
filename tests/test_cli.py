@@ -39,3 +39,47 @@ def test_generated_bundle_respects_container_entrypoints(tmp_path: Path):
     assert 'command: ["server"' in control
     assert 'command: ["worker"' in worker
     assert 'command: ["brunost"' not in control + worker
+
+
+def test_canary_uses_immutable_artifacts_and_checks_idempotency(tmp_path: Path, monkeypatch, capsys):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    (task / "public").mkdir()
+    (task / "private").mkdir()
+    (task / "scorer").mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "answer.txt").write_text("ok\n", encoding="utf-8")
+
+    submitted: list[dict] = []
+
+    class FakeClient:
+
+        def __init__(self, *_args, **_kwargs):
+            self.submitted = submitted
+
+        def upload_artifact(self, path):
+            return {"artifact_id": "a" * 64, "path": str(path)}
+
+        def register_task(self, **kwargs):
+            assert "artifact_id" in kwargs
+            assert "path" not in kwargs
+            return {"manifest": {"digest": "b" * 64}}
+
+        def submit(self, **kwargs):
+            assert "submission_artifact_id" in kwargs
+            assert "submission_path" not in kwargs
+            self.submitted.append(kwargs)
+            return {"execution_id": "canary-execution", "result_version": 1}
+
+        def get_execution(self, _execution_id):
+            return {"execution_id": "canary-execution", "status": "completed", "score": 1.0}
+
+    monkeypatch.setattr("brunost_judge.cli.JudgeClient", FakeClient)
+    assert main(["canary", "--task-path", str(task), "--submission", str(submission)]) == 0
+    assert len(submitted) == 2
+    output = capsys.readouterr().out
+    assert '"immutable_task_artifact": true' in output
+    assert '"idempotency": true' in output

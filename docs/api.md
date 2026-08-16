@@ -22,11 +22,25 @@ returns the original evaluation instead of creating duplicate work. Evaluation
 responses expose both `evaluation_id` (canonical) and `execution_id` (legacy
 compatibility).
 
+Result payloads use stable `result_version: 1` semantics: terminal `status`,
+numeric or null `score`, object `metrics`, optional `failure_reason`, and the
+compatibility pair `evaluation_id`/`execution_id`. Workers reject malformed or
+non-finite sandbox results before they are persisted.
+
+`ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` and
+`ioi` tasks use the classic batch runner and return structured compile, test,
+subtask, verdict, time, and output metrics. `interactive` tasks use the
+line-oriented interactor runner. Agent and game execution remain plugin
+extension points and fail closed until a corresponding runner is installed.
+
 ## Authentication
 
 Set `BRUNOST_JUDGE_API_TOKEN` and send `Authorization: Bearer <token>`. The
-health endpoint remains available without a token. Production deployments
-should put the API behind TLS and an organization-level identity gateway.
+control-plane API is closed when no token is configured. For a loopback-only
+development server, anonymous mode must be explicitly enabled with
+`BRUNOST_JUDGE_ALLOW_ANONYMOUS_API=true`; the health endpoint remains available
+without a token. Production deployments should put the API behind TLS and an
+organization-level identity gateway.
 
 Node enrollment is intentionally separate from the global API token. An
 operator creates a short-lived token with `POST /v1/nodes/enrollment-tokens`.
@@ -46,7 +60,8 @@ brunost artifact upload ./submissions/attempt-1 --url https://judge.example
 
 Register a task with `artifact_id` and submit an evaluation with
 `submission_artifact_id`. Artifacts reject symlinks, special files, traversal,
-checksum mismatches, and bundles larger than the configured limit.
+duplicate names, archive member/count/expansion limits, checksum mismatches, and
+bundles larger than the configured limit.
 
 ## Worker lifecycle
 

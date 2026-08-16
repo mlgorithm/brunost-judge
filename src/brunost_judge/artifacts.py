@@ -23,6 +23,18 @@ class ArtifactError(ValueError):
     """Raised when an artifact is invalid or unsafe to extract."""
 
 
+DEFAULT_MAX_ARCHIVE_MEMBERS = 10_000
+DEFAULT_MAX_ARCHIVE_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def _positive_limit(value: int, *, name: str) -> int:
+    value = int(value)
+    if value < 1:
+        raise ArtifactError(f"{name} must be positive")
+    return value
+
+
 def _safe_id(value: str) -> str:
     if not value or len(value) > 128 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for char in value):
         raise ArtifactError("artifact_id contains unsupported characters")
@@ -35,6 +47,11 @@ def artifact_id(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _packable(item: Path, root: Path) -> bool:
+    relative = item.relative_to(root)
+    return not any(part == "__pycache__" or part.endswith(".pyc") for part in relative.parts)
+
+
 def pack_directory(path: str | Path) -> bytes:
     """Create a deterministic gzip tar bundle from a directory."""
 
@@ -44,6 +61,8 @@ def pack_directory(path: str | Path) -> bytes:
     tar_output = io.BytesIO()
     with tarfile.open(fileobj=tar_output, mode="w") as archive:
         for item in sorted(root.rglob("*")):
+            if not _packable(item, root):
+                continue
             if item.is_symlink():
                 raise ArtifactError(f"symlinks are not allowed in artifacts: {item}")
             relative = item.relative_to(root).as_posix()
@@ -64,19 +83,42 @@ def pack_directory(path: str | Path) -> bytes:
     return output.getvalue()
 
 
-def safe_extract(data: bytes, destination: str | Path) -> Path:
-    """Extract a bundle while rejecting traversal, links, and special files."""
+def safe_extract(
+    data: bytes,
+    destination: str | Path,
+    *,
+    max_members: int = DEFAULT_MAX_ARCHIVE_MEMBERS,
+    max_member_bytes: int = DEFAULT_MAX_ARCHIVE_MEMBER_BYTES,
+    max_expanded_bytes: int = DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES,
+) -> Path:
+    """Extract a bundle while rejecting traversal, links, special files, and bombs."""
 
     root = Path(destination).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
         members = archive.getmembers()
+        max_members = _positive_limit(max_members, name="max_members")
+        max_member_bytes = _positive_limit(max_member_bytes, name="max_member_bytes")
+        max_expanded_bytes = _positive_limit(max_expanded_bytes, name="max_expanded_bytes")
+        if len(members) > max_members:
+            raise ArtifactError(f"artifact contains too many members (maximum {max_members})")
+        expanded_bytes = 0
+        names: set[str] = set()
         for member in members:
+            if member.name in names:
+                raise ArtifactError("artifact contains duplicate member names")
+            names.add(member.name)
             target = (root / member.name).resolve()
             if target != root and root not in target.parents:
                 raise ArtifactError("artifact contains a path traversal")
             if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
                 raise ArtifactError("artifact contains an unsupported link or special file")
+            if member.isfile():
+                if member.size > max_member_bytes:
+                    raise ArtifactError(f"artifact member exceeds {max_member_bytes} bytes")
+                expanded_bytes += member.size
+                if expanded_bytes > max_expanded_bytes:
+                    raise ArtifactError(f"artifact expands beyond {max_expanded_bytes} bytes")
         for member in members:
             target = root / member.name
             if member.isdir():
@@ -94,9 +136,20 @@ def safe_extract(data: bytes, destination: str | Path) -> Path:
 class ArtifactStore:
     """Small filesystem backend; object-storage adapters can share this API."""
 
-    def __init__(self, root: str | Path = "artifacts", *, max_bytes: int = 512 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        root: str | Path = "artifacts",
+        *,
+        max_bytes: int = 512 * 1024 * 1024,
+        max_members: int = DEFAULT_MAX_ARCHIVE_MEMBERS,
+        max_member_bytes: int = DEFAULT_MAX_ARCHIVE_MEMBER_BYTES,
+        max_expanded_bytes: int = DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES,
+    ) -> None:
         self.root = Path(root).expanduser().resolve()
-        self.max_bytes = max(1, int(max_bytes))
+        self.max_bytes = _positive_limit(max_bytes, name="max_bytes")
+        self.max_members = _positive_limit(max_members, name="max_members")
+        self.max_member_bytes = _positive_limit(max_member_bytes, name="max_member_bytes")
+        self.max_expanded_bytes = _positive_limit(max_expanded_bytes, name="max_expanded_bytes")
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path(self, artifact: str) -> Path:
@@ -129,10 +182,19 @@ class ArtifactStore:
     def materialize(self, identifier: str) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
         temporary = tempfile.TemporaryDirectory(prefix="brunost-artifact-")
         try:
-            return safe_extract(self.get(identifier), temporary.name), temporary
+            return self.extract(self.get(identifier), temporary.name), temporary
         except Exception:
             temporary.cleanup()
             raise
+
+    def extract(self, data: bytes, destination: str | Path) -> Path:
+        return safe_extract(
+            data,
+            destination,
+            max_members=self.max_members,
+            max_member_bytes=self.max_member_bytes,
+            max_expanded_bytes=self.max_expanded_bytes,
+        )
 
 
 class S3ArtifactStore(ArtifactStore):
@@ -147,6 +209,9 @@ class S3ArtifactStore(ArtifactStore):
         access_key: str | None = None,
         secret_key: str | None = None,
         max_bytes: int = 512 * 1024 * 1024,
+        max_members: int = DEFAULT_MAX_ARCHIVE_MEMBERS,
+        max_member_bytes: int = DEFAULT_MAX_ARCHIVE_MEMBER_BYTES,
+        max_expanded_bytes: int = DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES,
         prefix: str = "brunost/artifacts",
     ) -> None:
         try:
@@ -162,7 +227,10 @@ class S3ArtifactStore(ArtifactStore):
         )
         self.client: Any = session.client("s3", endpoint_url=endpoint_url)
         self.bucket = bucket
-        self.max_bytes = max(1, int(max_bytes))
+        self.max_bytes = _positive_limit(max_bytes, name="max_bytes")
+        self.max_members = _positive_limit(max_members, name="max_members")
+        self.max_member_bytes = _positive_limit(max_member_bytes, name="max_member_bytes")
+        self.max_expanded_bytes = _positive_limit(max_expanded_bytes, name="max_expanded_bytes")
         self.prefix = prefix.strip("/")
 
     def _key(self, identifier: str) -> str:
@@ -188,6 +256,9 @@ class S3ArtifactStore(ArtifactStore):
             raise FileNotFoundError(identifier) from exc
         body = response["Body"]
         try:
+            declared_size = response.get("ContentLength")
+            if declared_size is not None and int(declared_size) > self.max_bytes:
+                raise ArtifactError(f"artifact exceeds {self.max_bytes} bytes")
             data = body.read()
         finally:
             body.close()
@@ -200,6 +271,9 @@ def artifact_store_from_environment() -> ArtifactStore:
     """Build the local or S3 artifact backend selected by deployment config."""
     backend = os.environ.get("BRUNOST_JUDGE_ARTIFACT_BACKEND", "filesystem").strip().lower()
     max_bytes = int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_BYTES", str(512 * 1024 * 1024)))
+    max_members = int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_MEMBERS", str(DEFAULT_MAX_ARCHIVE_MEMBERS)))
+    max_member_bytes = int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_MEMBER_BYTES", str(DEFAULT_MAX_ARCHIVE_MEMBER_BYTES)))
+    max_expanded_bytes = int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_EXPANDED_BYTES", str(DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES)))
     if backend in {"s3", "object", "object-storage"}:
         return S3ArtifactStore(
             os.environ.get("BRUNOST_JUDGE_ARTIFACT_BUCKET", ""),
@@ -208,6 +282,33 @@ def artifact_store_from_environment() -> ArtifactStore:
             access_key=os.environ.get("BRUNOST_JUDGE_ARTIFACT_ACCESS_KEY"),
             secret_key=os.environ.get("BRUNOST_JUDGE_ARTIFACT_SECRET_KEY"),
             max_bytes=max_bytes,
+            max_members=max_members,
+            max_member_bytes=max_member_bytes,
+            max_expanded_bytes=max_expanded_bytes,
             prefix=os.environ.get("BRUNOST_JUDGE_ARTIFACT_PREFIX", "brunost/artifacts"),
         )
-    return ArtifactStore(os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"), max_bytes=max_bytes)
+    return ArtifactStore(
+        os.environ.get("BRUNOST_JUDGE_ARTIFACT_ROOT", "artifacts"),
+        max_bytes=max_bytes,
+        max_members=max_members,
+        max_member_bytes=max_member_bytes,
+        max_expanded_bytes=max_expanded_bytes,
+    )
+
+
+def artifact_limits_from_environment() -> dict[str, int]:
+    """Return extraction limits without constructing a storage backend."""
+    return {
+        "max_members": _positive_limit(
+            int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_MEMBERS", str(DEFAULT_MAX_ARCHIVE_MEMBERS))),
+            name="max_members",
+        ),
+        "max_member_bytes": _positive_limit(
+            int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_MEMBER_BYTES", str(DEFAULT_MAX_ARCHIVE_MEMBER_BYTES))),
+            name="max_member_bytes",
+        ),
+        "max_expanded_bytes": _positive_limit(
+            int(os.environ.get("BRUNOST_JUDGE_ARTIFACT_MAX_EXPANDED_BYTES", str(DEFAULT_MAX_ARCHIVE_EXPANDED_BYTES))),
+            name="max_expanded_bytes",
+        ),
+    }

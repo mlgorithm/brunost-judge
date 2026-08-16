@@ -7,10 +7,11 @@ authoring environments.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
-from brunost_judge.contracts import TERMINAL_STATUSES
+from brunost_judge.contracts import RESULT_SCHEMA_VERSION, TERMINAL_STATUSES
 
 
 def validate_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -24,10 +25,35 @@ def validate_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
     if status not in {*TERMINAL_STATUSES, "queued", "running"}:
         errors.append("status must be queued, running, completed, failed, or canceled")
     score = payload.get("score")
-    if score is not None and not isinstance(score, (int, float)):
+    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
         errors.append("score must be numeric or null")
+    elif score is not None and not math.isfinite(float(score)):
+        errors.append("score must be finite")
     if not isinstance(payload.get("metrics", {}), Mapping):
         errors.append("metrics must be an object")
+    result_version = payload.get("result_version")
+    if result_version is not None and result_version != RESULT_SCHEMA_VERSION:
+        errors.append(f"result_version must be {RESULT_SCHEMA_VERSION}")
+    return tuple(errors)
+
+
+def validate_runner_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Validate the reduced result emitted by an evaluator sandbox."""
+    errors: list[str] = []
+    if payload.get("status") not in {"completed", "failed"}:
+        errors.append("sandbox result status must be completed or failed")
+    score = payload.get("score")
+    if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
+        errors.append("sandbox result score must be numeric or null")
+    elif score is not None and not math.isfinite(float(score)):
+        errors.append("sandbox result score must be finite")
+    if not isinstance(payload.get("metrics", {}), Mapping):
+        errors.append("sandbox result metrics must be an object")
+    if payload.get("status") == "failed" and not isinstance(payload.get("failure_reason"), str):
+        errors.append("failed sandbox results need a failure_reason")
+    result_version = payload.get("result_version")
+    if result_version is not None and result_version != RESULT_SCHEMA_VERSION:
+        errors.append(f"result_version must be {RESULT_SCHEMA_VERSION}")
     return tuple(errors)
 
 

@@ -28,6 +28,11 @@ def test_idempotent_execution_and_local_worker(tmp_path: Path):
     assert result.score == 0.75
 
 
+def test_in_memory_store_is_shared_across_store_connections():
+    store = JudgeStore(":memory:")
+    assert store.list_tasks() == []
+
+
 def test_callback_delivery_is_durable(tmp_path: Path, monkeypatch):
     task = tmp_path / "task"
     task.mkdir()

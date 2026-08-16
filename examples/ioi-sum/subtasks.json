@@ -1,0 +1,1 @@
+{"subtasks": [{"id": "basic", "points": 30, "tests": ["basic/01"]}, {"id": "full", "points": 70, "tests": ["full/01"]}]}

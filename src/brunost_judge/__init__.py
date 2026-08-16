@@ -23,8 +23,10 @@ from brunost_judge.conformance import (
     assert_conformant,
     validate_capability_payload,
     validate_result_payload,
+    validate_runner_result_payload,
 )
 from brunost_judge.contracts import (
+    RESULT_SCHEMA_VERSION,
     AgentDefinition,
     EvaluationRequest,
     ExecutionRequest,
@@ -44,6 +46,7 @@ from brunost_judge.task import task_digest
 from grader.harness import normalize_result, run
 
 __all__ = [
+    "RESULT_SCHEMA_VERSION",
     "AgentDefinition",
     "AgentSeat",
     "ArtifactError",
@@ -76,5 +79,6 @@ __all__ = [
     "task_digest",
     "validate_capability_payload",
     "validate_result_payload",
+    "validate_runner_result_payload",
 ]
 __version__ = "0.8.0"

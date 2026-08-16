@@ -4,9 +4,17 @@
 ARG BASE_IMAGE=python:3.13-slim
 FROM ${BASE_IMAGE}
 
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y bubblewrap gcc g++ rustc \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY src/grader /opt/brunost/grader
+COPY src/brunost_judge/artifacts.py /opt/brunost/artifacts.py
 ENV PYTHONPATH=/opt/brunost
 WORKDIR /workspace
 
-# The worker invokes `python -m grader.evaluate`; task authors provide the
-# metrics dependencies in the selected base image.
+# The worker invokes `python -m grader.evaluate`; task authors provide any
+# additional metrics dependencies in the selected base image. The runner
+# streams private task data into a root-only tmpfs and drops classic contestant
+# processes to dedicated UID 65533; bubblewrap remains available for runtimes that
+# support nested user namespaces.
