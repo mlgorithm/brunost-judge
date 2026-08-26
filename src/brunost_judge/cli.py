@@ -13,10 +13,20 @@ import time
 import uuid
 from pathlib import Path
 
+from brunost_judge.agent_protocol import protocol_spec
+from brunost_judge.agent_runtime import (
+    AgentLimits,
+    AgentRuntime,
+    AgentSpec,
+    resolve_agent_command,
+)
 from brunost_judge.artifacts import artifact_id as digest_artifact
 from brunost_judge.artifacts import pack_directory
+from brunost_judge.auth import write_secret_file
 from brunost_judge.deployment import render_country_bundle
 from brunost_judge.enrollment import new_secret
+from brunost_judge.games import AgentSeat
+from brunost_judge.local_match import run_local_match
 from brunost_judge.sdk import JudgeClient
 from brunost_judge.task import (
     SUPPORTED_KINDS,
@@ -47,6 +57,25 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--submission", required=True, type=Path)
     run_parser.add_argument("--result", type=Path, help="write canonical JSON result to this file")
 
+    agent = subparsers.add_parser("agent", help="inspect and validate agent bundles")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_validate = agent_sub.add_parser("validate", help="validate an agent bundle and entrypoint")
+    agent_validate.add_argument("path", type=Path)
+    agent_validate.add_argument("--smoke", action="store_true", help="launch the agent and verify init/ready")
+    agent_validate.add_argument("--json", action="store_true", dest="as_json", help="print machine-readable output")
+    agent_protocol = agent_sub.add_parser("protocol", help="print the versioned agent protocol summary")
+    agent_protocol.add_argument("--json", action="store_true", dest="as_json", help="print compact JSON")
+
+    match = subparsers.add_parser("match", help="run a local game match")
+    match_sub = match.add_subparsers(dest="match_command", required=True)
+    match_run = match_sub.add_parser("run", help="run a Python game runner with local agent bundles")
+    match_run.add_argument("task", type=Path)
+    match_run.add_argument("--agent", action="append", required=True, metavar="ID=PATH", help="agent bundle (repeatable)")
+    match_run.add_argument("--seed", type=int, default=0)
+    match_run.add_argument("--match-id", default="local-match")
+    match_run.add_argument("--output", type=Path, default=Path("match-output"))
+    match_run.add_argument("--result", type=Path, help="write canonical JSON result to this file")
+
     artifact = subparsers.add_parser("artifact", help="package and upload portable task/submission bundles")
     artifact_sub = artifact.add_subparsers(dest="artifact_command", required=True)
     pack = artifact_sub.add_parser("pack", help="create a content-addressed tar.gz bundle")
@@ -61,6 +90,16 @@ def _parser() -> argparse.ArgumentParser:
     server.add_argument("--host", default="127.0.0.1")
     server.add_argument("--port", default=8787, type=int)
     server.add_argument("--database", type=str)
+
+    auth = subparsers.add_parser("auth", help="manage judge service credentials")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    rotate_admin = auth_sub.add_parser("rotate-admin-token", help="atomically create or replace a private admin token file")
+    rotate_admin.add_argument(
+        "--output",
+        type=Path,
+        default=Path(os.environ.get("BRUNOST_JUDGE_API_TOKEN_FILE", ".brunost/admin-token")),
+    )
+    rotate_admin.add_argument("--force", action="store_true")
 
     worker = subparsers.add_parser("worker", help="run a local execution worker")
     worker.add_argument("--database", type=str)
@@ -122,7 +161,7 @@ def _parser() -> argparse.ArgumentParser:
     canary = subparsers.add_parser("canary", help="run an end-to-end CPU judge canary")
     canary.add_argument("--url", default=os.environ.get("BRUNOST_JUDGE_URL", "http://127.0.0.1:8787"))
     canary.add_argument("--token", default=os.environ.get("BRUNOST_JUDGE_API_TOKEN"))
-    canary.add_argument("--task-ref", default="canary/ioi-sum-v1")
+    canary.add_argument("--task-ref", default="canary/deterministic-sum-v1")
     canary.add_argument("--task-path", type=Path, required=True)
     canary.add_argument("--submission", type=Path, required=True)
     canary.add_argument("--timeout", type=float, default=120.0)
@@ -143,6 +182,53 @@ def _validate(path: Path) -> int:
     for error in result.errors:
         print(f"  - {error}", file=sys.stderr)
     return 2
+
+
+def _validate_agent(path: Path, *, smoke: bool, as_json: bool) -> int:
+    root = path.expanduser().resolve()
+    payload: dict[str, object] = {"path": str(root), "protocol_version": protocol_spec()["protocol_version"]}
+    try:
+        command = resolve_agent_command(AgentSpec("validation", 0, str(root)))
+        payload["command"] = list(command)
+        if smoke:
+            with AgentRuntime(
+                (AgentSpec("validation", 0, str(root)),),
+                limits=AgentLimits(startup_timeout_seconds=2, turn_timeout_seconds=1, total_timeout_seconds=5),
+            ) as runtime:
+                payload["runtime"] = runtime.metrics()
+            payload["smoke"] = True
+        else:
+            payload["smoke"] = False
+    except Exception as exc:  # noqa: BLE001 - CLI reports a concise validation error
+        payload["valid"] = False
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+        if as_json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(f"invalid agent: {root}", file=sys.stderr)
+            print(f"  - {payload['error']}", file=sys.stderr)
+        return 2
+    payload["valid"] = True
+    if as_json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"valid agent: {root}")
+        print(f"  command: {subprocess.list2cmdline(command)}")
+        if smoke:
+            print("  smoke: init/ready passed")
+    return 0
+
+
+def _parse_agents(values: list[str]) -> tuple[AgentSeat, ...]:
+    agents: list[AgentSeat] = []
+    for seat, value in enumerate(values):
+        if "=" not in value:
+            raise ValueError(f"agent must be ID=PATH: {value}")
+        agent_id, path = value.split("=", 1)
+        if not agent_id or not path:
+            raise ValueError(f"agent must be ID=PATH: {value}")
+        agents.append(AgentSeat(agent_id, str(Path(path).expanduser().resolve()), seat))
+    return tuple(agents)
 
 
 def _parse_path_maps(values: list[str]) -> tuple[tuple[str, str], ...]:
@@ -223,6 +309,39 @@ def main(argv: list[str] | None = None) -> int:
             args.result.write_text(encoded + "\n", encoding="utf-8")
         print(encoded)
         return 0 if result.get("status") == "completed" else 1
+    if args.command == "agent" and args.agent_command == "validate":
+        return _validate_agent(args.path, smoke=args.smoke, as_json=args.as_json)
+    if args.command == "agent" and args.agent_command == "protocol":
+        if args.as_json:
+            print(json.dumps(protocol_spec(), separators=(",", ":"), sort_keys=True))
+        else:
+            print(json.dumps(protocol_spec(), indent=2, sort_keys=True))
+        return 0
+    if args.command == "match" and args.match_command == "run":
+        validation = validate_task(args.task)
+        if not validation.valid:
+            return _validate(args.task)
+        if validation.kind != "game":
+            print("match tasks must have kind: game", file=sys.stderr)
+            return 2
+        try:
+            agents = _parse_agents(args.agent)
+            result = run_local_match(
+                args.task,
+                agents,
+                seed=args.seed,
+                match_id=args.match_id,
+                output_path=args.output,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"local match failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        encoded = json.dumps(result, sort_keys=True, indent=2)
+        if args.result:
+            args.result.parent.mkdir(parents=True, exist_ok=True)
+            args.result.write_text(encoded + "\n", encoding="utf-8")
+        print(encoded)
+        return 0 if result.get("status") == "completed" else 1
     if args.command == "artifact" and args.artifact_command == "pack":
         try:
             data = pack_directory(args.path)
@@ -257,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
                 "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>",
                 "BRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>",
                 "BRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>",
-                "BRUNOST_JUDGE_CALLBACK_HOSTS=platform.example",
+                "BRUNOST_JUDGE_CALLBACK_HOSTS=premium.example",
                 "POSTGRES_DB=brunost_judge",
                 "POSTGRES_USER=brunost",
                 f"BRUNOST_JUDGE_API_TOKEN={new_secret()}",
@@ -369,6 +488,18 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["BRUNOST_JUDGE_IMPORT_APP"] = "false"
         uvicorn.run(create_app(args.database), host=args.host, port=args.port)
         return 0
+    if args.command == "auth" and args.auth_command == "rotate-admin-token":
+        destination = args.output.expanduser().resolve()
+        if destination.exists() and not args.force:
+            print(f"file already exists: {destination} (use --force to replace it)", file=sys.stderr)
+            return 2
+        try:
+            write_secret_file(destination, new_secret())
+        except OSError as exc:
+            print(f"could not write admin token: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps({"token_file": str(destination), "rotated": True}, sort_keys=True))
+        return 0
     if args.command == "worker":
         from brunost_judge.store import create_store
         from brunost_judge.worker import LocalWorker, RemoteWorker
@@ -416,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
             config.write_text("version: 1\nname: my-judge\ndatabase: judge.db\nqueues:\n  - default\nresource_classes:\n  - cpu\n", encoding="utf-8")
         env = root / ".env.example"
         if not env.exists():
-            env.write_text("# Required before exposing the API\nBRUNOST_JUDGE_API_TOKEN=replace-me\nBRUNOST_JUDGE_REQUIRE_API_TOKEN=true\n# Required for signed result callbacks\nBRUNOST_JUDGE_CALLBACK_SIGNING_SECRET=replace-with-a-long-random-secret\n", encoding="utf-8")
+            env.write_text("# Required before exposing the API\nBRUNOST_JUDGE_API_TOKEN=replace-me\n# Prefer a mounted secret and set BRUNOST_JUDGE_API_TOKEN_FILE instead.\nBRUNOST_JUDGE_REQUIRE_API_TOKEN=true\n# Required for signed result callbacks\nBRUNOST_JUDGE_CALLBACK_SIGNING_SECRET=replace-with-a-long-random-secret\n# BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE=/run/secrets/brunost-callback-secret\n# BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS=true\n", encoding="utf-8")
         print(f"initialized judge project: {root}")
         return 0
     if args.command == "up":

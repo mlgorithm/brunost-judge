@@ -63,6 +63,12 @@ are bounded by the worker's configured result-artifact size limit.
 
 ## Agent protocol
 
+The complete wire specification is in
+[`docs/agent-protocol.md`](agent-protocol.md). The runtime also exposes
+`runtime.metrics()` and `step(..., simultaneous=True)` for production referees.
+The local `brunost match run` command uses the same runner/plugin contract for
+offline authoring and replay checks.
+
 Trusted game runners can launch one process per seat with the dependency-free
 runtime available in the evaluator image:
 

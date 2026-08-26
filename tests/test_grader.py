@@ -35,6 +35,23 @@ def test_normalize_flat_split():
     assert r["metrics"]["public_detail"] == {"Accuracy": 0.98}
 
 
+def test_normalize_model_uses_private_as_official_score():
+    r = normalize_result(
+        {"public": 0.98, "private": 0.73, "metrics": {"metric": "accuracy"}},
+        official_split="private",
+        require_official=True,
+    )
+    assert r["score"] == pytest.approx(0.73)
+    assert r["metrics"]["public"] == pytest.approx(0.98)
+    assert r["metrics"]["private"] == pytest.approx(0.73)
+
+
+def test_normalize_model_requires_private_score():
+    r = normalize_result({"public": 0.98}, official_split="private", require_official=True)
+    assert r["status"] == "failed"
+    assert "private score" in r["failure_reason"]
+
+
 def test_normalize_ioai_nested():
     r = normalize_result(
         {"score": {"public_a": 0.984, "private_b": 0.98, "public_detail": {"Accuracy": 0.984}}}
@@ -52,28 +69,27 @@ def test_normalize_rejects_garbage():
     assert normalize_result(float("inf"))["status"] == "failed"      # non-finite
 
 
-def test_normalize_preserves_ioi_subtask_breakdown():
-    """The IOI judge's structured metrics.subtasks rows must survive
-    normalization verbatim — the API's per-subtask feedback depends on them."""
-    subtasks = [
+def test_normalize_preserves_structured_test_metrics():
+    """Structured test metrics survive scorer-result normalization."""
+    test_metrics = [
         {
-            "id": 1, "name": "Subtask 1", "points": 30.0, "awarded": 30.0,
+            "id": 1, "name": "Test group 1", "points": 30.0, "awarded": 30.0,
             "points_max": 30.0, "points_earned": 30.0, "verdict": "AC",
             "verdicts": ["s1a:AC"],
             "tests": [{"name": "s1a", "verdict": "AC", "time_ms": 12}],
         },
         {
-            "id": 2, "name": "Subtask 2", "points": 70.0, "awarded": 0.0,
+            "id": 2, "name": "Test group 2", "points": 70.0, "awarded": 0.0,
             "points_max": 70.0, "points_earned": 0.0, "verdict": "TLE",
             "first_failed_test": "s2a",
             "verdicts": ["s2a:TLE"],
             "tests": [{"name": "s2a", "verdict": "TLE", "time_ms": 1999}],
         },
     ]
-    r = normalize_result({"public": 30.0, "private": 30.0, "metrics": {"subtasks": subtasks}})
+    r = normalize_result({"public": 30.0, "private": 30.0, "metrics": {"tests": test_metrics}})
     assert r["status"] == "completed"
     assert r["score"] == pytest.approx(30.0)
-    assert r["metrics"]["subtasks"] == subtasks
+    assert r["metrics"]["tests"] == test_metrics
 
 
 # --- run(): end-to-end on synthetic IOAI-shaped tasks ------------------------------
@@ -168,6 +184,107 @@ def test_run_bad_submission_is_contained(tmp_path):
     r = run(str(sub), str(assets))
     assert r["status"] == "failed"
     assert r["score"] == 0.0
+
+
+def _write_train_predict_task(root, submission_code: str, *, training_ms: int = 5_000, baseline: bool = False) -> None:
+    (root / "public" / "datasets").mkdir(parents=True)
+    (root / "private" / "datasets").mkdir(parents=True)
+    (root / "scorer").mkdir()
+    (root / "public" / "datasets" / "train.csv").write_text("x,label\n1,0\n", encoding="utf-8")
+    (root / "private" / "datasets" / "test.csv").write_text("x\n2\n", encoding="utf-8")
+    (root / "private" / "datasets" / "labels.csv").write_text("label\n1\n", encoding="utf-8")
+    (root / "judge.yaml").write_text(
+        "\n".join([
+            "version: 1",
+            "kind: model",
+            "runner: model",
+            "runtime: python-3.13-ml-v1",
+            "scoring: scorer.metrics:evaluate",
+            "network: disabled",
+            f"time_limit_ms: {training_ms + 5000}",
+            "training_time_limit_ms: " + str(training_ms),
+            "memory_limit_mb: 512",
+            "public_dataset: public/datasets/train.csv",
+            "hidden_dataset: private/datasets/test.csv",
+            "hidden_labels_dataset: private/datasets/labels.csv",
+            "submission_mode: python_code",
+            "submission_language: python",
+            "submission_entrypoint: submission.py",
+            "prediction_output: predictions.csv",
+            "official_split: private",
+            "baseline_enabled: " + ("true" if baseline else "false"),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (root / "scorer" / "metrics.py").write_text(
+        """import os\n\ndef evaluate(submission_path, assets_path):\n    assert os.environ['BRUNOST_ML_PRIVATE_LABELS'].endswith('labels.csv')\n    assert os.path.isfile(os.environ['BRUNOST_ML_PREDICTIONS_PATH'])\n    if os.environ.get('BRUNOST_ML_BASELINE_PREDICTIONS_PATH'):\n        assert os.path.isfile(os.environ['BRUNOST_ML_BASELINE_PREDICTIONS_PATH'])\n    return {'public': 0.25, 'private': 0.75}\n""",
+        encoding="utf-8",
+    )
+    if baseline:
+        (root / "private" / "baseline.py").write_text(
+            "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('baseline\\n1\\n')\n",
+            encoding="utf-8",
+        )
+    submission = root.parent / "submission"
+    submission.mkdir()
+    (submission / "submission.py").write_text(submission_code, encoding="utf-8")
+
+
+def test_run_model_training_submission_uses_private_score_and_allows_many_epochs(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        """import os\nfrom pathlib import Path\nfor _ in range(2000):\n    pass\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n""",
+    )
+    submission = assets.parent / "submission"
+    r = run(str(submission), str(assets))
+    assert r["status"] == "completed", r
+    assert r["score"] == pytest.approx(0.75)
+    assert r["metrics"]["public"] == pytest.approx(0.25)
+    assert r["metrics"]["private"] == pytest.approx(0.75)
+
+
+def test_run_model_training_submission_times_out(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(assets, """import time\ntime.sleep(1)\n""", training_ms=100)
+    submission = assets.parent / "submission"
+    r = run(str(submission), str(assets))
+    assert r["status"] == "failed"
+    assert r["metrics"]["verdict"] == "time_limit_exceeded"
+
+
+def test_run_model_training_submission_can_use_optional_baseline(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n",
+        baseline=True,
+    )
+    submission = assets.parent / "submission"
+    r = run(str(submission), str(assets))
+    assert r["status"] == "completed", r
+    assert r["score"] == pytest.approx(0.75)
+
+
+def test_run_model_training_submission_rejects_output_escape(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n",
+    )
+    manifest = assets / "judge.yaml"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8").replace("prediction_output: predictions.csv", "prediction_output: ../escape.csv"),
+        encoding="utf-8",
+    )
+    submission = assets.parent / "submission"
+    r = run(str(submission), str(assets))
+    assert r["status"] == "failed"
+    assert "prediction output" in r["failure_reason"]
 
 
 def test_grader_has_no_backend_imports():

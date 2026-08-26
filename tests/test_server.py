@@ -17,6 +17,7 @@ def test_api_registers_and_submits(tmp_path: Path):
     submission.mkdir()
 
     client = TestClient(create_app(tmp_path / "judge.db"))
+    assert client.get("/readyz").json()["status"] == "ready"
     response = client.post("/v1/tasks", json={"task_ref": "demo/v1", "path": str(task)})
     assert response.status_code == 201
     response = client.post("/v1/executions", json={"task_ref": "demo/v1", "submission_path": str(submission), "idempotency_key": "one"})
@@ -36,7 +37,7 @@ def test_task_kind_override_must_match_manifest(tmp_path: Path):
     (task / "scorer").mkdir()
     (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
     response = TestClient(create_app(tmp_path / "judge.db")).post(
-        "/v1/tasks", json={"task_ref": "mismatch/v1", "path": str(task), "kind": "ioi"}
+        "/v1/tasks", json={"task_ref": "mismatch/v1", "path": str(task), "kind": "icpc"}
     )
     assert response.status_code == 422
     assert "match" in response.json()["detail"]
@@ -65,7 +66,7 @@ def test_operator_console_is_available(tmp_path: Path):
 
 def test_production_allows_only_explicit_allowlisted_internal_http_callback(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_ENV", "production")
-    monkeypatch.setenv("BRUNOST_JUDGE_CALLBACK_HOSTS", "platform")
+    monkeypatch.setenv("BRUNOST_JUDGE_CALLBACK_HOSTS", "premium")
     monkeypatch.setenv("BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS", "true")
     task = tmp_path / "task"
     task.mkdir()
@@ -83,7 +84,7 @@ def test_production_allows_only_explicit_allowlisted_internal_http_callback(tmp_
             "task_ref": "internal/v1",
             "submission_path": str(submission),
             "idempotency_key": "internal-http",
-            "callback_url": "http://platform:3000/api/judge/callback",
+            "callback_url": "http://premium:3100/api/judge/callback",
         },
     )
     assert allowed.status_code == 202

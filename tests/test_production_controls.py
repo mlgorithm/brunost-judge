@@ -1,9 +1,13 @@
+import time
 from pathlib import Path
 
-from brunost_judge.contracts import ExecutionRequest, TaskRecord
+import pytest
+
+from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
 from brunost_judge.plugins import RunnerContext, RunnerRegistry
 from brunost_judge.security import callback_signature, verify_callback_signature
 from brunost_judge.store import JudgeStore
+from grader.agent_runtime import _launch_command
 
 
 def _store(tmp_path: Path) -> JudgeStore:
@@ -47,6 +51,69 @@ def test_worker_claim_filters_required_capabilities(tmp_path: Path):
     claimed = store.claim_next(worker_id="gpu-1", capabilities=("resource:cpu", "gpu:true"))
     assert claimed is not None
     assert claimed[0].task_ref == "gpu/v1"
+
+
+def test_task_refs_are_immutable_and_only_the_lease_owner_can_finish(tmp_path: Path):
+    store = _store(tmp_path)
+    task_path = tmp_path / "replacement-task"
+    task_path.mkdir()
+
+    store.register_task(TaskRecord("immutable/v1", str(task_path), "ioai", {"version": 1}))
+    assert store.register_task(TaskRecord("immutable/v1", str(task_path), "ioai", {"version": 1})).task_ref == "immutable/v1"
+    with pytest.raises(ValueError, match="immutable"):
+        store.register_task(TaskRecord("immutable/v1", str(task_path), "ioai", {"version": 2}))
+
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "lease-owner"))
+    claimed = store.claim_next(worker_id="worker-a")
+    assert claimed is not None
+    assert store.finish("missing", ExecutionResult("missing", "demo/v1", "completed"), worker_id="worker-b") is None
+    assert store.finish(execution.execution_id, ExecutionResult(execution.execution_id, "demo/v1", "completed", score=0.5), worker_id="worker-b") is None
+    assert store.get_execution(execution.execution_id).status == "running"
+    assert store.finish(execution.execution_id, ExecutionResult(execution.execution_id, "demo/v1", "completed", score=0.5), worker_id="worker-a").score == 0.5
+
+
+def test_expired_canceled_leases_are_not_requeued(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "cancelled-lease"))
+    assert store.claim_next(worker_id="worker-a", lease_seconds=1) is not None
+    store.cancel(execution.execution_id)
+    time.sleep(1.1)
+
+    assert store.claim_next(worker_id="worker-b") is None
+    assert store.get_execution(execution.execution_id).status == "canceled"
+
+
+def test_callback_delivery_has_single_active_owner(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "callback-lease"))
+    store.enqueue_callback(execution.execution_id, "https://callback.example.test/result")
+
+    assert store.claim_callback(execution.execution_id, "worker-a")
+    assert not store.claim_callback(execution.execution_id, "worker-b")
+
+
+def test_production_agent_launch_is_bubblewrapped_and_drops_pythonpath(tmp_path: Path, monkeypatch):
+    root = tmp_path / "agent"
+    root.mkdir()
+    monkeypatch.setenv("BRUNOST_JUDGE_AGENT_USE_BWRAP", "true")
+    monkeypatch.setattr("grader.agent_runtime.shutil.which", lambda name: "/usr/bin/bwrap" if name == "bwrap" else None)
+
+    command, environment = _launch_command(
+        ("/usr/local/bin/python", "-u", "agent.py"),
+        root,
+        {"PYTHONPATH": "/unsafe", "BRUNOST_AGENT_ID": "agent-1", "LANG": "C"},
+    )
+
+    assert command[0] == "/usr/bin/bwrap"
+    assert "/work/agent.py" in command
+    assert "PYTHONPATH" not in command
+    assert environment == {}
 
 
 def test_callback_signature_rejects_stale_payload():

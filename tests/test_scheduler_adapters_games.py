@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from brunost_judge.adapters import KubernetesAdapter, LaunchRequest, SlurmAdapter
@@ -84,3 +85,48 @@ for line in sys.stdin:
 
     assert result.status == "completed"
     assert result.scores == {"red": 0.0, "blue": 1.0}
+    assert result.metrics["agent_runtime"]["turns"] == 1
+
+
+def test_multiple_matches_can_run_concurrently(tmp_path: Path):
+    agent = tmp_path / "parallel-agent"
+    agent.mkdir()
+    (agent / "agent.py").write_text(
+        """import json
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["type"] == "init":
+        print(json.dumps({"type": "ready"}), flush=True)
+    elif message["type"] == "turn":
+        print(json.dumps({"type": "action", "action": message["seat"]}), flush=True)
+    elif message["type"] == "shutdown":
+        break
+""",
+        encoding="utf-8",
+    )
+
+    class Referee:
+        def run(self, request, *, rng, agents):
+            actions = agents.step({"round": 1}, simultaneous=True)
+            return MatchResult(request.match_id, "completed", {"red": float(actions[0]), "blue": float(actions[1])})
+
+    def run_match(index: int) -> MatchResult:
+        return AgentGameRunner().run(
+            MatchRequest(
+                "game-1",
+                f"parallel-{index}",
+                (AgentSeat("red", str(agent), 0), AgentSeat("blue", str(agent), 1)),
+                seed=index,
+            ),
+            Referee(),
+            expected_seats=2,
+            limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=3),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(run_match, range(8)))
+
+    assert all(result.status == "completed" for result in results)
+    assert all(result.metrics["agent_runtime"]["turns"] == 1 for result in results)

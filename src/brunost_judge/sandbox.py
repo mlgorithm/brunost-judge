@@ -249,7 +249,7 @@ class DockerSandboxRunner:
 
 
 def sandbox_from_environment() -> SandboxRunner:
-    production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+    production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
     configured_mode = os.environ.get("BRUNOST_JUDGE_SANDBOX_MODE", "").strip().lower()
     if production and not configured_mode:
         raise RuntimeError("production requires explicit BRUNOST_JUDGE_SANDBOX_MODE=docker")

@@ -11,16 +11,24 @@ import json
 import math
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
-PROTOCOL_VERSION = 1
-DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024
+from grader.agent_protocol import (
+    DEFAULT_MAX_MESSAGE_BYTES,
+    PROTOCOL_VERSION,
+    ProtocolValidationError,
+    decode_message,
+    encode_message,
+)
 
 
 class AgentRuntimeError(RuntimeError):
@@ -44,6 +52,34 @@ class AgentCrashed(AgentRuntimeError):
 
 
 @dataclass(frozen=True)
+class AgentSeatMetrics:
+    """Timing and request counters for one isolated seat process."""
+
+    agent_id: str
+    seat: int
+    requests: int
+    turns: int
+    startup_seconds: float
+    last_request_seconds: float
+    total_seconds: float
+    stderr: str
+    stderr_truncated: bool
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "seat": self.seat,
+            "requests": self.requests,
+            "turns": self.turns,
+            "startup_seconds": round(self.startup_seconds, 6),
+            "last_request_seconds": round(self.last_request_seconds, 6),
+            "total_seconds": round(self.total_seconds, 6),
+            "stderr": self.stderr[:2000],
+            "stderr_truncated": self.stderr_truncated or len(self.stderr) > 2000,
+        }
+
+
+@dataclass(frozen=True)
 class AgentLimits:
     """Bounds applied to each agent process and protocol exchange."""
 
@@ -55,12 +91,13 @@ class AgentLimits:
     memory_bytes: int = 512 * 1024 * 1024
     file_bytes: int = 16 * 1024 * 1024
     open_files: int = 128
+    stderr_bytes: int = 16 * 1024
 
     def __post_init__(self) -> None:
         for name in ("startup_timeout_seconds", "turn_timeout_seconds", "total_timeout_seconds"):
             if not math.isfinite(float(getattr(self, name))) or float(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
-        for name in ("max_message_bytes", "max_turns", "memory_bytes", "file_bytes", "open_files"):
+        for name in ("max_message_bytes", "max_turns", "memory_bytes", "file_bytes", "open_files", "stderr_bytes"):
             if int(getattr(self, name)) < 1:
                 raise ValueError(f"{name} must be positive")
 
@@ -144,6 +181,77 @@ def resolve_agent_command(spec: AgentSpec) -> tuple[str, ...]:
     raise AgentLaunchError(f"agent {spec.agent_id!r} has no agent.yaml command or agent.py entrypoint")
 
 
+def _agent_sandbox_enabled() -> bool:
+    configured = os.environ.get("BRUNOST_JUDGE_AGENT_USE_BWRAP")
+    if configured is not None:
+        return configured.lower() == "true"
+    return os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
+
+
+def _launch_command(
+    command: tuple[str, ...],
+    root: Path,
+    environment: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    """Launch one seat in a private read-only mount namespace when enabled."""
+
+    if not _agent_sandbox_enabled():
+        return list(command), environment
+    bwrap = shutil.which("bwrap")
+    if not bwrap:
+        raise AgentLaunchError("bubblewrap is required for production agent isolation")
+
+    resolved_root = root.resolve()
+    mapped: list[str] = []
+    for argument in command:
+        try:
+            argument_path = Path(argument).expanduser()
+            candidate = (resolved_root / argument_path).resolve() if not argument_path.is_absolute() else argument_path.resolve()
+            relative = candidate.relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            mapped.append(argument)
+        else:
+            mapped.append(f"/work/{relative.as_posix()}")
+
+    wrapped = [
+        bwrap,
+        "--die-with-parent",
+        "--unshare-all",
+        "--new-session",
+        "--clearenv",
+        "--dir",
+        "/work",
+        "--ro-bind",
+        str(resolved_root),
+        "/work",
+        "--chdir",
+        "/work",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--uid",
+        "65533",
+        "--gid",
+        "65533",
+    ]
+    for system_root in ("/bin", "/etc", "/lib", "/lib64", "/usr", "/usr/local"):
+        if Path(system_root).exists():
+            wrapped.extend(("--ro-bind", system_root, system_root))
+    safe_environment = {
+        **{key: value for key, value in environment.items() if key != "PYTHONPATH"},
+        "HOME": "/tmp",
+        "LANG": environment.get("LANG", "C"),
+        "LC_ALL": environment.get("LC_ALL", "C"),
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    }
+    for key, value in safe_environment.items():
+        wrapped.extend(("--setenv", key, value))
+    return [*wrapped, *mapped], {}
+
+
 def _set_resource_limits(limits: AgentLimits) -> None:
     if os.name != "posix":
         return
@@ -172,16 +280,41 @@ class _AgentProcess:
         self.process: subprocess.Popen[bytes] | None = None
         self._stdout_buffer = bytearray()
         self._deadline = 0.0
+        self._started_at = 0.0
+        self._startup_seconds = 0.0
+        self._last_request_seconds = 0.0
+        self._requests = 0
+        self._turns = 0
+        self._stderr_buffer = bytearray()
+        self._stderr_truncated = False
+        self._stderr_thread: threading.Thread | None = None
 
     def start(self) -> None:
         command = resolve_agent_command(self.spec)
-        environment = os.environ.copy()
+        allowed_environment = {
+            "PATH",
+            "LANG",
+            "LC_ALL",
+            "TZ",
+            "SYSTEMROOT",
+            "WINDIR",
+            "PATHEXT",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+        }
+        environment = {key: value for key, value in os.environ.items() if key in allowed_environment}
         environment.update({
             "BRUNOST_AGENT_PROTOCOL": str(PROTOCOL_VERSION),
             "BRUNOST_AGENT_ID": self.spec.agent_id,
             "BRUNOST_AGENT_SEAT": str(self.spec.seat),
             "BRUNOST_AGENT_SEED": str(self.spec.seed),
         })
+        launch_command, launch_environment = _launch_command(
+            command,
+            Path(self.spec.artifact_path).expanduser().resolve(),
+            environment,
+        )
         launch_options: dict[str, Any] = {}
         if os.name == "posix":
             launch_options.update(
@@ -190,28 +323,41 @@ class _AgentProcess:
             )
         try:
             self.process = subprocess.Popen(
-                list(command),
+                launch_command,
                 cwd=Path(self.spec.artifact_path).expanduser().resolve(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=environment,
+                stderr=subprocess.PIPE,
+                env=launch_environment or environment,
                 **launch_options,
             )
         except (OSError, ValueError) as exc:
             raise AgentLaunchError(f"could not launch agent {self.spec.agent_id!r}: {exc}") from exc
-        self._deadline = time.monotonic() + self.limits.total_timeout_seconds
-        response = self.request(
-            {
-                "type": "init",
-                "protocol_version": PROTOCOL_VERSION,
-                "agent_id": self.spec.agent_id,
-                "seat": self.spec.seat,
-                "seed": self.spec.seed,
-                "metadata": self.spec.metadata,
-            },
-            timeout=self.limits.startup_timeout_seconds,
-        )
+        if self.process.stderr is not None:
+            self._stderr_thread = threading.Thread(
+                target=self._collect_stderr,
+                args=(self.process.stderr,),
+                name=f"brunost-agent-stderr-{self.spec.seat}",
+                daemon=True,
+            )
+            self._stderr_thread.start()
+        self._started_at = time.monotonic()
+        self._deadline = self._started_at + self.limits.total_timeout_seconds
+        startup_started = time.monotonic()
+        try:
+            response = self.request(
+                {
+                    "type": "init",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "agent_id": self.spec.agent_id,
+                    "seat": self.spec.seat,
+                    "seed": self.spec.seed,
+                    "metadata": self.spec.metadata,
+                },
+                timeout=self.limits.startup_timeout_seconds,
+            )
+        finally:
+            self._startup_seconds = time.monotonic() - startup_started
         if response.get("type") != "ready":
             raise AgentProtocolError(f"agent {self.spec.agent_id!r} did not send ready")
 
@@ -219,18 +365,23 @@ class _AgentProcess:
         process = self.process
         if process is None or process.stdin is None or process.stdout is None:
             raise AgentRuntimeError(f"agent {self.spec.agent_id!r} is not running")
-        encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=False).encode("utf-8") + b"\n"
-        if len(encoded) > self.limits.max_message_bytes:
-            raise AgentProtocolError(f"message to agent {self.spec.agent_id!r} exceeds size limit")
+        try:
+            encoded = encode_message(message, max_bytes=self.limits.max_message_bytes)
+        except ProtocolValidationError as exc:
+            raise AgentProtocolError(f"message to agent {self.spec.agent_id!r}: {exc}") from exc
         remaining_total = self._deadline - time.monotonic()
         if remaining_total <= 0:
             raise AgentTimeout(f"agent {self.spec.agent_id!r} exceeded total runtime")
         wait = min(timeout or self.limits.turn_timeout_seconds, remaining_total)
+        request_started = time.monotonic()
         try:
             process.stdin.write(encoded)
             process.stdin.flush()
         except (BrokenPipeError, OSError) as exc:
             raise AgentCrashed(f"agent {self.spec.agent_id!r} closed stdin") from exc
+        finally:
+            self._requests += 1
+            self._last_request_seconds = time.monotonic() - request_started
         return self._read_message(wait)
 
     def _read_message(self, timeout: float) -> dict[str, Any]:
@@ -244,15 +395,10 @@ class _AgentProcess:
             if newline >= 0:
                 raw = bytes(self._stdout_buffer[:newline])
                 del self._stdout_buffer[: newline + 1]
-                if len(raw) > self.limits.max_message_bytes:
-                    raise AgentProtocolError(f"message from agent {self.spec.agent_id!r} exceeds size limit")
                 try:
-                    payload = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise AgentProtocolError(f"agent {self.spec.agent_id!r} emitted invalid JSONL") from exc
-                if not isinstance(payload, dict):
-                    raise AgentProtocolError(f"agent {self.spec.agent_id!r} message must be an object")
-                return payload
+                    return decode_message(raw, max_bytes=self.limits.max_message_bytes)
+                except ProtocolValidationError as exc:
+                    raise AgentProtocolError(f"agent {self.spec.agent_id!r}: {exc}") from exc
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise AgentTimeout(f"agent {self.spec.agent_id!r} exceeded response timeout")
@@ -306,9 +452,48 @@ class _AgentProcess:
                         process.kill()
                     process.wait(timeout=0.5)
         finally:
+            if self._started_at:
+                self._total_seconds = time.monotonic() - self._started_at
+            if self._stderr_thread is not None:
+                self._stderr_thread.join(timeout=0.5)
             for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
-                    stream.close()
+                    try:
+                        stream.close()
+                    except (BrokenPipeError, OSError):
+                        # A crashed agent may already have closed its pipe.  Cleanup
+                        # must not mask the original AgentCrashed/timeout error.
+                        pass
+
+    def _collect_stderr(self, stream) -> None:  # type: ignore[no-untyped-def]
+        while True:
+            chunk = stream.read(4096)
+            if not chunk:
+                return
+            remaining = self.limits.stderr_bytes - len(self._stderr_buffer)
+            if remaining > 0:
+                self._stderr_buffer.extend(chunk[:remaining])
+            if len(chunk) > max(remaining, 0):
+                self._stderr_truncated = True
+
+    def record_turn(self) -> None:
+        self._turns += 1
+
+    def metrics(self) -> AgentSeatMetrics:
+        total_seconds = getattr(self, "_total_seconds", 0.0)
+        if self._started_at and not total_seconds:
+            total_seconds = time.monotonic() - self._started_at
+        return AgentSeatMetrics(
+            agent_id=self.spec.agent_id,
+            seat=self.spec.seat,
+            requests=self._requests,
+            turns=self._turns,
+            startup_seconds=self._startup_seconds,
+            last_request_seconds=self._last_request_seconds,
+            total_seconds=total_seconds,
+            stderr=bytes(self._stderr_buffer).decode("utf-8", errors="replace"),
+            stderr_truncated=self._stderr_truncated,
+        )
 
 
 class AgentRuntime:
@@ -324,8 +509,11 @@ class AgentRuntime:
         self.limits = limits or AgentLimits()
         self.seed = seed
         self._processes: dict[int, _AgentProcess] = {}
+        self._closed_metrics: dict[int, AgentSeatMetrics] = {}
         self._turn = 0
         self._started = False
+        self._started_at = 0.0
+        self._total_seconds = 0.0
 
     @classmethod
     def from_context(cls, context: dict[str, Any], *, limits: AgentLimits | None = None) -> AgentRuntime:
@@ -364,6 +552,7 @@ class AgentRuntime:
     def start(self) -> None:
         if self._started:
             return
+        self._started_at = time.monotonic()
         try:
             for spec in self.specs:
                 process = _AgentProcess(spec, self.limits)
@@ -379,8 +568,13 @@ class AgentRuntime:
             raise AgentRuntimeError(f"unknown or inactive agent seat: {seat}")
         return self._processes[seat].request(message, timeout=timeout)
 
-    def step(self, state: Any, *, turn: int | None = None) -> dict[int, Any]:
-        """Send one turn to every seat in order and return their actions."""
+    def step(self, state: Any, *, turn: int | None = None, simultaneous: bool = False) -> dict[int, Any]:
+        """Send one turn to every seat and return actions in seat order.
+
+        Sequential mode preserves referee seat order. Simultaneous mode sends
+        the same turn to all seats concurrently so one agent cannot observe
+        another agent's response latency.
+        """
 
         if not self._started:
             raise AgentRuntimeError("agent runtime is not started")
@@ -388,29 +582,56 @@ class AgentRuntime:
         if next_turn < 1 or next_turn > self.limits.max_turns:
             raise AgentTimeout("match exceeded maximum turns")
         self._turn = next_turn
+        messages = {
+            spec.seat: {
+                "type": "turn",
+                "turn": next_turn,
+                "state": state,
+                "seed": self.seed,
+                "agent_id": spec.agent_id,
+                "seat": spec.seat,
+            }
+            for spec in self.specs
+        }
+        if simultaneous:
+            with ThreadPoolExecutor(max_workers=len(self.specs), thread_name_prefix="brunost-agent") as pool:
+                futures = {seat: pool.submit(self.request, seat, message) for seat, message in messages.items()}
+                responses = {seat: futures[seat].result() for seat in sorted(futures)}
+        else:
+            responses = {seat: self.request(seat, messages[seat]) for seat in sorted(messages)}
         actions: dict[int, Any] = {}
         for spec in self.specs:
-            response = self.request(
-                spec.seat,
-                {
-                    "type": "turn",
-                    "turn": next_turn,
-                    "state": state,
-                    "seed": self.seed,
-                    "agent_id": spec.agent_id,
-                    "seat": spec.seat,
-                },
-            )
+            response = responses[spec.seat]
             if response.get("type") != "action" or "action" not in response:
                 raise AgentProtocolError(f"agent {spec.agent_id!r} seat {spec.seat} did not return an action")
             actions[spec.seat] = response["action"]
+            self._processes[spec.seat].record_turn()
         return actions
 
     def close(self) -> None:
         for process in reversed(tuple(self._processes.values())):
             process.close()
+            self._closed_metrics[process.spec.seat] = process.metrics()
         self._processes.clear()
         self._started = False
+        if self._started_at:
+            self._total_seconds = time.monotonic() - self._started_at
+
+    def metrics(self) -> dict[str, Any]:
+        """Return bounded runtime telemetry suitable for match metrics."""
+
+        seats = dict(self._closed_metrics)
+        seats.update({seat: process.metrics() for seat, process in self._processes.items()})
+        elapsed = self._total_seconds
+        if self._started and self._started_at:
+            elapsed = time.monotonic() - self._started_at
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "seed": self.seed,
+            "turns": self._turn,
+            "elapsed_seconds": round(elapsed, 6),
+            "seats": {str(seat): metrics.as_dict() for seat, metrics in sorted(seats.items())},
+        }
 
 
 __all__ = [
@@ -421,6 +642,7 @@ __all__ = [
     "AgentProtocolError",
     "AgentRuntime",
     "AgentRuntimeError",
+    "AgentSeatMetrics",
     "AgentSpec",
     "AgentTimeout",
     "resolve_agent_command",

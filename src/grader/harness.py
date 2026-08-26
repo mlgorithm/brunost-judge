@@ -9,6 +9,12 @@ from __future__ import annotations
 import importlib.util
 import math
 import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -25,11 +31,17 @@ def _finite_float(value: Any) -> float | None:
     return out if math.isfinite(out) else None
 
 
-def normalize_result(raw: Any) -> dict[str, Any]:
+def normalize_result(
+    raw: Any,
+    *,
+    official_split: str | None = None,
+    require_official: bool = False,
+) -> dict[str, Any]:
     """Map whatever a task scorer returned into the canonical result contract.
 
-    Returns {"status", "score", "metrics"[, "failure_reason"]}. `score` is the PUBLIC
-    value (safe to show live); the private value lives only in metrics["private"].
+    Returns {"status", "score", "metrics"[, "failure_reason"]}. Legacy scorers
+    default to their public score. Model tasks explicitly select their official
+    split, which is private for contest rankings.
     Accepts: a number; {"public","private","*_detail"}; or the IOAI
     {"score": {"public_a","private_b","*_detail"}} shape.
     """
@@ -40,7 +52,10 @@ def normalize_result(raw: Any) -> dict[str, Any]:
     if isinstance(raw, bool):  # bool is an int subclass — reject explicitly
         return _failed("Scorer returned a boolean, not a score")
     if isinstance(raw, (int, float)):
-        public = _finite_float(raw)
+        if official_split == "private":
+            private = _finite_float(raw)
+        else:
+            public = _finite_float(raw)
     elif isinstance(raw, dict):
         if isinstance(raw.get("metrics"), dict):
             metrics.update(raw["metrics"])
@@ -52,7 +67,10 @@ def normalize_result(raw: Any) -> dict[str, Any]:
                 if isinstance(score_field.get(key), dict):
                     metrics[key] = score_field[key]
         elif score_field is not None:
-            public = _finite_float(score_field)
+            if official_split == "private":
+                private = _finite_float(score_field)
+            else:
+                public = _finite_float(score_field)
         # flat top-level keys win if present
         if raw.get("public") is not None:
             public = _finite_float(raw["public"])
@@ -69,7 +87,9 @@ def normalize_result(raw: Any) -> dict[str, Any]:
     if private is not None:
         metrics["private"] = private
 
-    score = public if public is not None else private
+    if require_official and official_split == "private" and private is None:
+        return _failed("Scorer did not return the required private score", metrics=metrics)
+    score = private if official_split == "private" else (public if public is not None else private)
     if score is None:
         return _failed("Scorer returned no usable numeric score", metrics=metrics)
     return {"status": "completed", "score": score, "metrics": metrics}
@@ -124,6 +144,251 @@ def _task_kind(assets_path: str) -> str:
         )
 
 
+def _manifest_field(assets_path: str, name: str) -> str | None:
+    manifest_path = Path(assets_path) / "judge.yaml"
+    if not manifest_path.is_file():
+        return None
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if ":" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() == name.lower():
+            return value.strip().strip("\"'")
+    return None
+
+
+def _task_file(assets_path: str, relative: str, label: str) -> Path:
+    root = Path(assets_path).resolve()
+    path = (root / relative).resolve()
+    if path != root and root not in path.parents:
+        raise ValueError(f"{label} escapes the task bundle")
+    if not path.is_file():
+        raise FileNotFoundError(f"model task is missing {label}: {relative}")
+    return path
+
+
+def _submission_file(root: Path, relative: str, label: str) -> Path:
+    root = root.resolve()
+    path = (root / relative).resolve()
+    if path == root or root not in path.parents:
+        raise ValueError(f"{label} must stay inside the submission bundle")
+    return path
+
+
+def _submission_preexec(memory_mb: int, timeout_ms: int, *, drop_privileges: bool = True):
+    """Apply per-submission resource limits before Python starts."""
+
+    if os.name != "posix":
+        return None
+
+    def limit() -> None:
+        try:
+            import resource
+
+            memory_bytes = max(64, int(memory_mb)) * 1024 * 1024
+            if hasattr(resource, "RLIMIT_AS"):
+                _, current_hard = resource.getrlimit(resource.RLIMIT_AS)
+                hard = memory_bytes if current_hard == resource.RLIM_INFINITY else min(current_hard, memory_bytes)
+                resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+            if hasattr(resource, "RLIMIT_CPU"):
+                cpu_seconds = max(1, (int(timeout_ms) + 999) // 1000 + 1)
+                _, current_hard = resource.getrlimit(resource.RLIMIT_CPU)
+                hard = cpu_seconds if current_hard == resource.RLIM_INFINITY else min(current_hard, cpu_seconds)
+                resource.setrlimit(resource.RLIMIT_CPU, (hard, hard))
+        except (ImportError, OSError, ValueError):
+            # The outer Judge sandbox still enforces its own limits. Some local
+            # development platforms do not permit every rlimit operation.
+            pass
+        if drop_privileges and os.geteuid() == 0:
+            # The evaluator needs root to read the root-only task bundle,
+            # but the participant must not inherit that privilege.
+            os.setgroups([])
+            os.setgid(65533)
+            os.setuid(65533)
+
+    return limit
+
+
+def _run_submission_process(
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    *,
+    timeout_ms: int,
+    memory_mb: int,
+    drop_privileges: bool = True,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+            preexec_fn=_submission_preexec(memory_mb, timeout_ms, drop_privileges=drop_privileges),  # noqa: PLW1509
+        )
+    except OSError as exc:
+        return _failed(f"could not start training process: {exc}")
+    try:
+        _, stderr = process.communicate(timeout=max(0.1, timeout_ms / 1000))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.wait()
+        return _failed(
+            f"training process exceeded its {timeout_ms} ms limit",
+            metrics={"verdict": "time_limit_exceeded", "training_time_ms": int((time.monotonic() - started) * 1000)},
+        )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if process.returncode != 0:
+        detail = (stderr or b"").decode("utf-8", errors="replace").strip()
+        reason = "training process exited unsuccessfully"
+        if detail:
+            reason += f": {detail[-1000:]}"
+        return _failed(reason, metrics={"verdict": "runtime_error", "training_time_ms": elapsed_ms})
+    return {"status": "completed", "score": None, "metrics": {"training_time_ms": elapsed_ms}}
+
+
+def _run_scorer(
+    submission_path: str,
+    assets_path: str,
+    *,
+    official_split: str | None = None,
+    require_official: bool = False,
+) -> dict[str, Any]:
+    module = _load_metrics_module(assets_path)
+    if module is None:
+        return _failed("Task has no metrics.py scorer in its assets")
+    evaluate = getattr(module, "evaluate", None)
+    if not callable(evaluate):
+        return _failed("Task metrics.py must define evaluate(submission_path, assets_path)")
+    raw = evaluate(submission_path, assets_path)
+    return normalize_result(raw, official_split=official_split, require_official=require_official)
+
+
+def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, Any]:
+    """Run a Python train/predict submission without exposing private labels."""
+
+    submission_root = Path(submission_path).resolve()
+    entrypoint = _manifest_field(assets_path, "submission_entrypoint") or "submission.py"
+    prediction_output = _manifest_field(assets_path, "prediction_output") or "predictions.csv"
+    public_dataset = _manifest_field(assets_path, "public_dataset")
+    hidden_dataset = _manifest_field(assets_path, "hidden_dataset")
+    hidden_labels = _manifest_field(assets_path, "hidden_labels_dataset")
+    if not public_dataset or not hidden_dataset or not hidden_labels:
+        return _failed("python_code model tasks need public, hidden, and hidden-label datasets")
+    try:
+        entrypoint_path = _submission_file(submission_root, entrypoint, "submission entrypoint")
+        if not entrypoint_path.is_file():
+            return _failed(f"submission is missing {entrypoint}")
+        public_path = _task_file(assets_path, public_dataset, "public dataset")
+        hidden_path = _task_file(assets_path, hidden_dataset, "hidden dataset")
+        labels_path = _task_file(assets_path, hidden_labels, "hidden labels dataset")
+        time_ms = int(_manifest_field(assets_path, "training_time_limit_ms") or _manifest_field(assets_path, "time_limit_ms") or "120000")
+        memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or "2048")
+    except (FileNotFoundError, ValueError) as exc:
+        return _failed(str(exc))
+
+    with tempfile.TemporaryDirectory(prefix="brunost-model-run-") as temporary:
+        root = Path(temporary)
+        root.chmod(0o755)
+        public_input = root / "input" / "public" / public_path.name
+        hidden_input = root / "input" / "private" / hidden_path.name
+        public_input.parent.mkdir(parents=True)
+        hidden_input.parent.mkdir(parents=True)
+        public_input.parent.chmod(0o755)
+        hidden_input.parent.chmod(0o755)
+        shutil.copyfile(public_path, public_input)
+        shutil.copyfile(hidden_path, hidden_input)
+        public_input.chmod(0o644)
+        hidden_input.chmod(0o644)
+        output_path = _submission_file(root / "output", prediction_output, "prediction output")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.chmod(0o777)
+
+        base_env = os.environ.copy()
+        base_env.update({
+            "BRUNOST_ML_PUBLIC_DATASET": str(public_input),
+            "BRUNOST_ML_PRIVATE_DATASET": str(hidden_input),
+            "BRUNOST_ML_OUTPUT_PATH": str(output_path),
+            "BRUNOST_ML_SEED": _manifest_field(assets_path, "seed") or "42",
+            "PYTHONHASHSEED": _manifest_field(assets_path, "seed") or "42",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+
+        baseline_enabled = (_manifest_field(assets_path, "baseline_enabled") or "false").lower() in {"1", "true", "yes", "on"}
+        baseline_output: Path | None = None
+        if baseline_enabled:
+            baseline_entrypoint = _manifest_field(assets_path, "baseline_entrypoint") or "private/baseline.py"
+            try:
+                baseline_path = _task_file(assets_path, baseline_entrypoint, "baseline solution")
+            except (FileNotFoundError, ValueError) as exc:
+                return _failed(str(exc))
+            baseline_output = _submission_file(root / "baseline", prediction_output, "prediction output")
+            baseline_output.parent.mkdir(parents=True, exist_ok=True)
+            baseline_output.parent.chmod(0o777)
+            baseline_env = {**base_env, "BRUNOST_ML_OUTPUT_PATH": str(baseline_output), "BRUNOST_ML_BASELINE": "1"}
+            baseline_result = _run_submission_process(
+                [sys.executable, str(baseline_path)],
+                baseline_path.parent,
+                baseline_env,
+                timeout_ms=time_ms,
+                memory_mb=memory_mb,
+                drop_privileges=False,
+            )
+            if baseline_result.get("status") != "completed" or not baseline_output.is_file():
+                return _failed("baseline solution did not produce a valid prediction file")
+
+        participant_env = {**base_env, "BRUNOST_ML_BASELINE": "0"}
+        participant_result = _run_submission_process(
+            [sys.executable, str(entrypoint_path)],
+            submission_root,
+            participant_env,
+            timeout_ms=time_ms,
+            memory_mb=memory_mb,
+        )
+        if participant_result.get("status") != "completed":
+            return participant_result
+        if not output_path.is_file():
+            return _failed(f"submission did not create {prediction_output}")
+
+        scored_submission = root / "scored-submission"
+        shutil.copytree(submission_root, scored_submission)
+        scored_prediction = _submission_file(scored_submission, prediction_output, "prediction output")
+        scored_prediction.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(output_path, scored_prediction)
+        scorer_values = {
+            "BRUNOST_ML_PREDICTIONS_PATH": str(scored_prediction),
+            "BRUNOST_ML_PRIVATE_LABELS": str(labels_path),
+            "BRUNOST_ML_PUBLIC_DATASET": str(public_path),
+            "BRUNOST_ML_PRIVATE_DATASET": str(hidden_path),
+        }
+        if baseline_output is not None:
+            scorer_values["BRUNOST_ML_BASELINE_PREDICTIONS_PATH"] = str(baseline_output)
+        scorer_keys = (*scorer_values, "BRUNOST_ML_BASELINE_PREDICTIONS_PATH")
+        previous_env = {key: os.environ.get(key) for key in scorer_keys}
+        os.environ.update(scorer_values)
+        if baseline_output is None:
+            os.environ.pop("BRUNOST_ML_BASELINE_PREDICTIONS_PATH", None)
+        try:
+            result = _run_scorer(str(scored_submission), assets_path, official_split="private", require_official=True)
+        finally:
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        result.setdefault("metrics", {})
+        if participant_result.get("metrics", {}).get("training_time_ms") is not None:
+            result["metrics"]["training_time_ms"] = participant_result["metrics"]["training_time_ms"]
+        return result
+
+
 def _run_plugin(submission_path: str, assets_path: str) -> dict[str, Any]:
     from grader.plugins import RunnerContext, default_registry, read_context_manifest
 
@@ -168,21 +433,21 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
     """
     try:
         kind = _task_kind(assets_path)
-        if kind in {"icpc", "ioi", "interactive"}:
+        if kind in {"icpc", "interactive"}:
             from grader.classic import run_classic, run_interactive
 
             runner = run_interactive if kind == "interactive" else run_classic
             return runner(submission_path, assets_path)
         if kind in {"agent", "game"}:
             return _run_plugin(submission_path, assets_path)
-        module = _load_metrics_module(assets_path)
-        if module is None:
-            return _failed("Task has no metrics.py scorer in its assets")
-        evaluate = getattr(module, "evaluate", None)
-        if not callable(evaluate):
-            return _failed("Task metrics.py must define evaluate(submission_path, assets_path)")
-        raw = evaluate(submission_path, assets_path)
-        return normalize_result(raw)
+        if kind == "model":
+            submission_mode = (_manifest_field(assets_path, "submission_mode") or "scorer").lower()
+            if submission_mode == "python_code":
+                return _run_model_submission(submission_path, assets_path)
+            # Legacy model packages predate the train/predict lifecycle and
+            # keep the original public-score scorer behavior.
+            return _run_scorer(submission_path, assets_path)
+        return _run_scorer(submission_path, assets_path)
     except Exception as exc:  # noqa: BLE001 — the harness must contain all scorer errors
         detail = f"{type(exc).__name__}: {exc}"
         tb = traceback.format_exc(limit=3)

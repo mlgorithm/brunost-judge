@@ -8,6 +8,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from brunost_judge.auth import configured_secret
 from brunost_judge.security import verify_callback_signature
 
 
@@ -18,7 +19,7 @@ class JudgeAPIError(RuntimeError):
 class JudgeClient:
     def __init__(self, base_url: str = "http://127.0.0.1:8787", token: str | None = None, timeout: float = 30) -> None:
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        self.token = token if token is not None else configured_secret("BRUNOST_JUDGE_API_TOKEN")
         self.timeout = timeout
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -55,6 +56,27 @@ class JudgeClient:
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/healthz")
+
+    def create_service_credential(
+        self,
+        *,
+        name: str,
+        scopes: list[str] | None = None,
+        ttl_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"name": name, "scopes": scopes or ["judge:read", "judge:write"]}
+        if ttl_seconds is not None:
+            payload["ttl_seconds"] = ttl_seconds
+        return self._request("POST", "/v1/auth/service-credentials", payload)
+
+    def revoke_service_credential(self, credential_id: str) -> dict[str, Any]:
+        return self._request("POST", f"/v1/auth/service-credentials/{credential_id}/revoke")
+
+    def rotate_admin_token(self) -> dict[str, Any]:
+        return self._request("POST", "/v1/auth/admin-token/rotate")
+
+    def audit_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return self._request("GET", f"/v1/audit?limit={max(1, min(1000, int(limit)))}")  # type: ignore[return-value]
 
     def register_task(self, *, task_ref: str, path: str | None = None, artifact_id: str | None = None, kind: str | None = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"task_ref": task_ref}

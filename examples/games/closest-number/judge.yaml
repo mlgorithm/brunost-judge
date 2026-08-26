@@ -1,0 +1,6 @@
+version: 1
+kind: game
+runner: python
+runtime: python-3.13
+network: disabled
+seats: 2

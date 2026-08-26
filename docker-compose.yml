@@ -26,6 +26,11 @@ services:
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
     ports:
       - "8787:8787"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     volumes:
       - ./examples:/tasks:ro
       - ./local-submissions:/submissions

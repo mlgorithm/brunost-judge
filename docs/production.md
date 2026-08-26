@@ -23,6 +23,12 @@ Before an official contest, operators must provide:
   `X-Brunost-Judge-Timestamp` / `X-Brunost-Judge-Signature` headers. Production
   requires HTTPS callback URLs, an explicit `BRUNOST_JUDGE_CALLBACK_HOSTS`
   allowlist, and durable receiver-side deduplication of the signed event ID.
+  Mount the signing secret with
+  `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE=/run/secrets/brunost-callback-secret`
+  when possible, and set `BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS=true` to make
+  callback requests fail closed if the secret is unavailable. Callback bearer
+  tokens are defense in depth; if they are used, protect the database with
+  encryption at rest because retries must retain the token to send it again.
   An isolated service mesh may set
   `BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=true` for an allowlisted
   internal hostname only; public callbacks remain HTTPS-only;
@@ -66,7 +72,8 @@ and digests so local caches cannot change the task identity.
 ## Deployment sequence
 
 1. Create random values for the API token, callback signing secret, and database
-   password; never use Compose development defaults.
+   password; never use Compose development defaults. Prefer mounted secret
+   files (`*_FILE`) for the API and callback secrets.
 2. Start the control plane and database, then register immutable task packages.
 3. Start one CPU worker with `--queue default --resource-class cpu` and run the
    smoke test in `docs/rollout.md`.
@@ -97,7 +104,7 @@ workers; workers should use the credential returned by `brunost node join`.
 - `scripts/canary.sh` uploads immutable task/submission artifacts, registers the
   CPU task by digest, submits twice with one idempotency key, and waits for a
   terminal result. Set `BRUNOST_JUDGE_CANARY_CALLBACK_URL` to exercise the
-  platform callback receiver as part of the run.
+  Premium callback receiver as part of the run.
 - `scripts/backup_postgres.sh` writes an atomic custom-format dump and checksum;
   copy the resulting directory to a different failure domain.
 - `scripts/restore_drill.sh` restores that dump into a throwaway PostgreSQL
@@ -110,6 +117,10 @@ The HTTP-level artifact, enrollment, callback-signature, idempotency, and lease
 reclaim path is also exercised by `tests/test_distributed_canary.py` before a
 release is promoted.
 
-The platform integration should switch traffic using its existing gateway and
-outbox, not by sharing judge tables. Keep the current in-repo worker available
-until the canary has passed and a rollback window has closed.
+Premium should switch traffic using its existing gateway and outbox, not by
+sharing Judge tables. Configure `BRUNOST_JUDGE_CALLBACK_HOSTS` with the
+hostname in Premium's `BRUNOST_JUDGE_CALLBACK_URL`, and use the same callback
+signing secret on both services. The open-source `brunost-deploy` repository
+automates this Judge control-plane/worker deployment boundary; it does not
+deploy Premium. Keep the current in-repo worker available until the canary has
+passed and a rollback window has closed.

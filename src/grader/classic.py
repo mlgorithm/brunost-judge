@@ -1,10 +1,10 @@
-"""Classic batch judge for ICPC/IOI-style task packages.
+"""Classic batch judge for deterministic code task packages.
 
 The runner is deliberately dependency-free. A task package contains:
 
 * ``judge.yaml`` with flat runner settings;
-* ``tests/**/*.in`` and matching ``.ans`` (or ``.out``) answer files;
-* an optional ``subtasks.json`` assigning tests to point-bearing subtasks; and
+* ``tests/**/*.in`` and matching ``.ans`` (or ``.out``) answer files, or a
+  private reference solution that generates those answers inside the sandbox;
 * an optional ``checker.py`` exposing ``check(input, answer, output)``.
 
 This module runs inside the evaluator sandbox. The process-mode runner is only
@@ -23,7 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,21 +49,17 @@ class ClassicConfig:
     time_limit_ms: int
     memory_limit_mb: int
     output_limit_bytes: int
+    answer_source: str
+    scoring_mode: str
+    reference_language: str
+    reference_entrypoint: str | None
 
 
 @dataclass(frozen=True)
 class TestCase:
     test_id: str
     input_path: Path
-    answer_path: Path
-    subtask_id: str
-
-
-@dataclass(frozen=True)
-class Subtask:
-    subtask_id: str
-    points: float
-    tests: tuple[TestCase, ...]
+    answer_path: Path | None
 
 
 @dataclass(frozen=True)
@@ -89,7 +85,9 @@ def _completed(
     verdict: str,
     language: str,
     tests: list[dict[str, Any]],
-    subtasks: list[dict[str, Any]],
+    scoring_mode: str,
+    passed_tests: int,
+    total_tests: int,
     compile_stderr: str = "",
 ) -> dict[str, Any]:
     metrics: dict[str, Any] = {
@@ -97,9 +95,9 @@ def _completed(
         "language": language,
         "verdict": verdict,
         "tests": tests,
-        "subtasks": subtasks,
-        "points": sum(float(item.get("awarded", 0.0)) for item in subtasks),
-        "points_max": sum(float(item.get("points", 0.0)) for item in subtasks),
+        "scoring_mode": scoring_mode,
+        "passed_tests": passed_tests,
+        "total_tests": total_tests,
     }
     if compile_stderr:
         metrics["compile_stderr"] = compile_stderr[:MAX_DIAGNOSTIC_CHARS]
@@ -139,25 +137,20 @@ def _positive_int(value: str | None, default: int, name: str) -> int:
 def _config(task: Path) -> ClassicConfig:
     values = _manifest(task)
     kind = values.get("kind", "").lower()
-    if kind not in {"icpc", "ioi", "interactive"}:
+    if kind not in {"icpc", "interactive"}:
         raise ClassicJudgeError(f"classic runner does not support task kind {kind!r}")
     if values.get("version") != "1":
         raise ClassicJudgeError("classic tasks must declare version: 1")
     if values.get("runner", "classic").lower() != "classic":
         raise ClassicJudgeError("classic task must declare runner: classic")
-    language = values.get("language", "").lower()
-    if language in {"gnu++17", "c++17", "g++"}:
-        language = "cpp"
-    else:
-        language = language.replace("gnu++", "cpp")
-    if language not in {"python", "py", "cpp", "c++", "c", "rust", "rs"}:
-        raise ClassicJudgeError("language must be python, c, cpp, or rust")
-    if language == "py":
-        language = "python"
-    if language == "c++":
-        language = "cpp"
-    if language == "rs":
-        language = "rust"
+    language = _normalize_language(values.get("language", ""), "language")
+    answer_source = values.get("answer_source", "answer_key").lower()
+    if answer_source not in {"answer_key", "reference"}:
+        raise ClassicJudgeError("answer_source must be answer_key or reference")
+    scoring_mode = values.get("scoring_mode", "all_or_nothing").lower()
+    if scoring_mode not in {"all_or_nothing", "percentage"}:
+        raise ClassicJudgeError("scoring_mode must be all_or_nothing or percentage")
+    reference_language = _normalize_language(values.get("reference_language", language), "reference_language")
     return ClassicConfig(
         kind=kind,
         language=language,
@@ -168,7 +161,29 @@ def _config(task: Path) -> ClassicConfig:
         output_limit_bytes=_positive_int(
             values.get("output_limit_bytes"), DEFAULT_OUTPUT_LIMIT_BYTES, "output_limit_bytes"
         ),
+        answer_source=answer_source,
+        scoring_mode=scoring_mode,
+        reference_language=reference_language,
+        reference_entrypoint=values.get("reference_entrypoint")
+        or ("private/reference.py" if answer_source == "reference" else None),
     )
+
+
+def _normalize_language(value: str, label: str) -> str:
+    language = value.lower()
+    if language in {"gnu++17", "c++17", "g++"}:
+        language = "cpp"
+    else:
+        language = language.replace("gnu++", "cpp")
+    if language not in {"python", "py", "cpp", "c++", "c", "rust", "rs"}:
+        raise ClassicJudgeError(f"{label} must be python, c, cpp, or rust")
+    if language == "py":
+        language = "python"
+    if language == "c++":
+        language = "cpp"
+    if language == "rs":
+        language = "rust"
+    return language
 
 
 def _safe_relative(root: Path, value: str) -> Path:
@@ -199,7 +214,7 @@ def _source_path(submission: Path, config: ClassicConfig) -> Path:
     return candidates[0]
 
 
-def _test_cases(task: Path) -> tuple[TestCase, ...]:
+def _test_cases(task: Path, answer_source: str = "answer_key") -> tuple[TestCase, ...]:
     tests_root = task / "tests"
     if not tests_root.is_dir():
         raise ClassicJudgeError("classic task is missing tests/")
@@ -210,60 +225,12 @@ def _test_cases(task: Path) -> tuple[TestCase, ...]:
         answer_path = input_path.with_suffix(".ans")
         if not answer_path.is_file():
             answer_path = input_path.with_suffix(".out")
-        if not answer_path.is_file():
+        if not answer_path.is_file() and answer_source != "reference":
             raise ClassicJudgeError(f"test {test_id} is missing .ans or .out")
-        subtask_id = relative.parts[0] if len(relative.parts) > 1 else "default"
-        cases.append(TestCase(test_id, input_path, answer_path, subtask_id))
+        cases.append(TestCase(test_id, input_path, answer_path if answer_path.is_file() else None))
     if not cases:
         raise ClassicJudgeError("classic task has no tests/*.in files")
     return tuple(cases)
-
-
-def _subtasks(task: Path, cases: tuple[TestCase, ...]) -> tuple[Subtask, ...]:
-    config_path = task / "subtasks.json"
-    if not config_path.is_file():
-        return (Subtask("default", 100.0, cases),)
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ClassicJudgeError(f"invalid subtasks.json: {exc}") from exc
-    rows = payload.get("subtasks") if isinstance(payload, dict) else None
-    if not isinstance(rows, list) or not rows:
-        raise ClassicJudgeError("subtasks.json must contain a non-empty subtasks list")
-    by_id = {case.test_id: case for case in cases}
-    assigned: set[str] = set()
-    subtasks: list[Subtask] = []
-    total_points = 0.0
-    for row in rows:
-        if not isinstance(row, dict) or not row.get("id") or not isinstance(row.get("tests"), list):
-            raise ClassicJudgeError("each subtask needs id, points, and tests")
-        subtask_id = str(row["id"])
-        try:
-            points = float(row["points"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ClassicJudgeError(f"subtask {subtask_id} has invalid points") from exc
-        if not math.isfinite(points) or points <= 0:
-            raise ClassicJudgeError(f"subtask {subtask_id} points must be positive")
-        selected: list[TestCase] = []
-        for raw_id in row["tests"]:
-            test_id = str(raw_id)
-            case = by_id.get(test_id)
-            if case is None:
-                raise ClassicJudgeError(f"subtask {subtask_id} references unknown test {test_id}")
-            if test_id in assigned:
-                raise ClassicJudgeError(f"test {test_id} belongs to more than one subtask")
-            assigned.add(test_id)
-            selected.append(case)
-        if not selected:
-            raise ClassicJudgeError(f"subtask {subtask_id} has no tests")
-        total_points += points
-        subtasks.append(Subtask(subtask_id, points, tuple(selected)))
-    if assigned != set(by_id):
-        missing = sorted(set(by_id) - assigned)
-        raise ClassicJudgeError(f"subtasks.json does not assign tests: {', '.join(missing)}")
-    if total_points <= 0:
-        raise ClassicJudgeError("subtask points must sum to a positive value")
-    return tuple(subtasks)
 
 
 def _limit_child(memory_mb: int, time_limit_ms: int, output_limit_bytes: int | None) -> None:
@@ -360,6 +327,9 @@ def _sandbox_command(command: list[str], cwd: Path) -> list[str]:
             "HOME",
             "/tmp",
             "--setenv",
+            "TMPDIR",
+            "/tmp",
+            "--setenv",
             "LANG",
             "C",
             "--setenv",
@@ -393,6 +363,7 @@ def _run_process(
             environment = {
                 "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                 "HOME": "/tmp",
+                "TMPDIR": str(cwd),
                 "LANG": "C",
                 **({"PYTHONPATH": os.environ["PYTHONPATH"]} if os.environ.get("PYTHONPATH") else {}),
                 **(extra_env or {}),
@@ -519,7 +490,67 @@ def _load_checker(task: Path):
     return check
 
 
+def _reference_answers(
+    task: Path,
+    config: ClassicConfig,
+    cases: tuple[TestCase, ...],
+    build_dir: Path,
+) -> tuple[TestCase, ...]:
+    """Run a trusted task reference inside the evaluator sandbox.
+
+    Premium publishes the reference source as part of the immutable task
+    package. The reference is never exposed to contestants; it is compiled and
+    run by the evaluator process, which already owns the network/container and
+    resource limits. This keeps author code out of the Premium web process.
+    """
+
+    if config.answer_source != "reference":
+        return cases
+    if not config.reference_entrypoint:
+        raise ClassicJudgeError("reference task is missing reference_entrypoint")
+    source = _safe_relative(task, config.reference_entrypoint)
+    if not source.is_file():
+        raise ClassicJudgeError(f"reference entrypoint does not exist: {config.reference_entrypoint}")
+    reference_dir = build_dir / "reference"
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    reference_config = replace(
+        config,
+        language=config.reference_language,
+        entrypoint=None,
+        answer_source="answer_key",
+        reference_language=config.reference_language,
+        reference_entrypoint=None,
+    )
+    try:
+        command, _ = _compile(source, reference_config, reference_dir)
+    except _CompileFailure as exc:
+        raise ClassicJudgeError(f"reference solution has a compile error: {exc.message}") from exc
+    resolved: list[TestCase] = []
+    drop_privileges = os.environ.get("BRUNOST_JUDGE_CLASSIC_DROP_PRIVILEGES", "false").lower() == "true"
+    for index, case in enumerate(cases):
+        answer_path = reference_dir / f"answer-{index}.txt"
+        outcome = _run_process(
+            command,
+            cwd=reference_dir,
+            stdin_path=case.input_path,
+            stdout_path=answer_path,
+            timeout_ms=config.time_limit_ms,
+            memory_mb=config.memory_limit_mb,
+            output_limit_bytes=config.output_limit_bytes,
+            drop_privileges=drop_privileges,
+        )
+        if outcome.verdict != "OK":
+            detail = f"reference solution failed on {case.test_id}: {outcome.verdict}"
+            if outcome.stderr:
+                detail += f" ({outcome.stderr[:500]})"
+            raise ClassicJudgeError(detail)
+        resolved.append(replace(case, answer_path=answer_path))
+    return tuple(resolved)
+
+
 def _check_output(checker, case: TestCase, output_path: Path) -> tuple[bool, str]:
+    if case.answer_path is None:
+        raise ClassicJudgeError(f"test {case.test_id} has no answer output")
     if checker is None:
         accepted = output_path.read_bytes().split() == case.answer_path.read_bytes().split()
         return accepted, "" if accepted else "wrong answer"
@@ -544,31 +575,28 @@ def run_classic(submission_path: str, assets_path: str) -> dict[str, Any]:
         if not submission.is_dir() or not task.is_dir():
             raise ClassicJudgeError("submission and task must be directories")
         config = _config(task)
-        cases = _test_cases(task)
-        subtasks = _subtasks(task, cases)
+        cases = _test_cases(task, config.answer_source)
         checker = _load_checker(task)
         source = _source_path(submission, config)
-        with tempfile.TemporaryDirectory(prefix="brunost-classic-") as temporary:
+        # Keep generated reference answers outside the contestant build root.
+        # The production bubblewrap command only mounts the build root, so a
+        # separate temporary root prevents submissions from reading answers.
+        with tempfile.TemporaryDirectory(prefix="brunost-classic-") as temporary, tempfile.TemporaryDirectory(
+            prefix="brunost-reference-"
+        ) as reference_temporary:
             build_dir = Path(temporary)
+            cases = _reference_answers(task, config, cases, Path(reference_temporary))
             try:
                 command, compile_stderr = _compile(source, config, build_dir)
             except _CompileFailure as exc:
-                compile_metrics = [
-                    {
-                        "id": subtask.subtask_id,
-                        "points": subtask.points,
-                        "awarded": 0.0,
-                        "verdict": "CE",
-                        "tests": [],
-                    }
-                    for subtask in subtasks
-                ]
                 return _completed(
                     score=0.0,
                     verdict="CE",
                     language=config.language,
                     tests=[],
-                    subtasks=compile_metrics,
+                    scoring_mode=config.scoring_mode,
+                    passed_tests=0,
+                    total_tests=len(cases),
                     compile_stderr=exc.message,
                 )
             test_metrics: dict[str, dict[str, Any]] = {}
@@ -596,41 +624,28 @@ def run_classic(submission_path: str, assets_path: str) -> dict[str, Any]:
                     message = checker_message or message
                 test_metrics[case.test_id] = {
                     "id": case.test_id,
-                    "subtask": case.subtask_id,
                     "verdict": verdict,
                     "time_ms": round(outcome.elapsed_ms, 3),
                     "output_bytes": outcome.output_bytes,
                     **({"message": message[:1000]} if message else {}),
                 }
-            subtask_metrics: list[dict[str, Any]] = []
-            awarded_total = 0.0
-            points_total = 0.0
-            for subtask in subtasks:
-                rows = [test_metrics[case.test_id] for case in subtask.tests]
-                passed = all(row["verdict"] == "OK" for row in rows)
-                awarded = subtask.points if passed else 0.0
-                awarded_total += awarded
-                points_total += subtask.points
-                subtask_metrics.append(
-                    {
-                        "id": subtask.subtask_id,
-                        "points": subtask.points,
-                        "awarded": awarded,
-                        "verdict": "AC" if passed else next(row["verdict"] for row in rows if row["verdict"] != "OK"),
-                        "tests": [row["id"] for row in rows],
-                    }
-                )
-            overall = "AC" if awarded_total == points_total else "WA"
+            rows = list(test_metrics.values())
+            passed_tests = sum(row["verdict"] == "OK" for row in rows)
+            total_tests = len(rows)
+            score = (1.0 if passed_tests == total_tests else 0.0) if config.scoring_mode == "all_or_nothing" else (passed_tests / total_tests)
+            overall = "AC" if passed_tests == total_tests else "WA"
             for row in test_metrics.values():
                 if row["verdict"] in {"TLE", "OLE", "RE"}:
                     overall = row["verdict"]
                     break
             return _completed(
-                score=awarded_total / points_total if points_total else 0.0,
+                score=score,
                 verdict=overall,
                 language=config.language,
-                tests=list(test_metrics.values()),
-                subtasks=subtask_metrics,
+                tests=rows,
+                scoring_mode=config.scoring_mode,
+                passed_tests=passed_tests,
+                total_tests=total_tests,
                 compile_stderr=compile_stderr,
             )
     except ClassicJudgeError as exc:

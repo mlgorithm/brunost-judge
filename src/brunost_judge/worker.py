@@ -26,6 +26,7 @@ from brunost_judge.artifacts import (
     artifact_store_from_environment,
     safe_extract,
 )
+from brunost_judge.auth import configured_secret
 from brunost_judge.conformance import validate_runner_result_payload
 from brunost_judge.contracts import ExecutionResult, WorkerRecord
 from brunost_judge.sandbox import SandboxRunner, sandbox_from_environment
@@ -35,6 +36,14 @@ from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _callback_secret_from_environment() -> str | None:
+    secret = configured_secret("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+    required = os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true"
+    if required and not secret:
+        raise RuntimeError("signed callbacks are required but no callback signing secret is configured")
+    return secret
 
 
 def _needs_plugin_runner(task_kind: str, metadata: dict) -> bool:
@@ -158,7 +167,7 @@ _CALLBACK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.0"}
+    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.3"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:
@@ -195,12 +204,12 @@ class LocalWorker:
         self.queues = queues
         self.resource_classes = resource_classes
         self.lease_seconds = lease_seconds
-        self.callback_signing_secret = callback_signing_secret or os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+        self.callback_signing_secret = callback_signing_secret or _callback_secret_from_environment()
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.artifact_store = artifact_store_from_environment()
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
-            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         )
         advertised_capabilities = capabilities or tuple(
             value.strip() for value in os.environ.get("BRUNOST_JUDGE_CAPABILITIES", "runtime:local,resource:cpu").split(",") if value.strip()
@@ -288,7 +297,7 @@ class LocalWorker:
                 seed=execution.seed,
                 event_id=execution.event_id,
             )
-        finished = self.store.finish(execution.execution_id, result)
+        finished = self.store.finish(execution.execution_id, result, worker_id=self.worker_id)
         callback_url = context.get("callback_url")
         if callback_url:
             self.store.enqueue_callback(execution.execution_id, callback_url, context.get("callback_token"))
@@ -323,6 +332,8 @@ class LocalWorker:
     def deliver_callbacks(self) -> int:
         delivered = 0
         for row in self.store.pending_callbacks():
+            if not self.store.claim_callback(row["execution_id"], self.worker_id):
+                continue
             execution = self.store.get_execution(row["execution_id"])
             if execution is None:
                 continue
@@ -366,10 +377,11 @@ class RemoteWorker:
         self.poll_seconds = poll_seconds
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.path_map = path_map
+        self.callback_signing_secret = _callback_secret_from_environment()
         self._pending_callbacks: list[tuple[str, str | None, dict, str | None]] = []
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
-            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+            or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         )
 
     def _local_path(self, value: str) -> Path:
@@ -497,7 +509,7 @@ class RemoteWorker:
         return result
 
     def _send_callback(self, callback_url: str, callback_token: str | None, payload: dict) -> None:
-        signing_secret = os.environ.get("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+        signing_secret = getattr(self, "callback_signing_secret", None)
         try:
             _notify(callback_url, callback_token, payload, signing_secret)
         except Exception as exc:  # noqa: BLE001 - retain the result and retry without crashing the worker

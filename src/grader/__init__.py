@@ -11,6 +11,7 @@ from grader.agent_runtime import (
     AgentProtocolError,
     AgentRuntime,
     AgentRuntimeError,
+    AgentSeatMetrics,
     AgentSpec,
     AgentTimeout,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "AgentProtocolError",
     "AgentRuntime",
     "AgentRuntimeError",
+    "AgentSeatMetrics",
     "AgentSpec",
     "AgentTimeout",
     "RunnerContext",

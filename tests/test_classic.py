@@ -1,4 +1,3 @@
-import json
 import shutil
 
 import pytest
@@ -18,24 +17,13 @@ def _task(root):
     (task / "tests" / "basic").mkdir(parents=True)
     (task / "tests" / "full").mkdir()
     (task / "judge.yaml").write_text(
-        "version: 1\nkind: ioi\nrunner: classic\nlanguage: python\ntime_limit_ms: 1000\n",
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\ntime_limit_ms: 1000\nscoring_mode: percentage\n",
         encoding="utf-8",
     )
     (task / "tests" / "basic" / "one.in").write_text("2\n", encoding="utf-8")
     (task / "tests" / "basic" / "one.ans").write_text("4\n", encoding="utf-8")
     (task / "tests" / "full" / "one.in").write_text("5\n", encoding="utf-8")
     (task / "tests" / "full" / "one.ans").write_text("10\n", encoding="utf-8")
-    (task / "subtasks.json").write_text(
-        json.dumps(
-            {
-                "subtasks": [
-                    {"id": "basic", "points": 30, "tests": ["basic/one"]},
-                    {"id": "full", "points": 70, "tests": ["full/one"]},
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
     return task
 
 
@@ -62,7 +50,25 @@ def _interactive_task(root):
     return task
 
 
-def test_classic_python_runner_dispatches_and_awards_subtasks(tmp_path):
+def _reference_task(root):
+    task = root / "reference-task"
+    (task / "public").mkdir(parents=True)
+    (task / "private").mkdir()
+    (task / "tests").mkdir()
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "time_limit_ms: 1000\nanswer_source: reference\n"
+        "reference_language: python\nreference_entrypoint: private/reference.py\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "one.in").write_text("5\n", encoding="utf-8")
+    (task / "private" / "reference.py").write_text(
+        "import sys\nprint(int(sys.stdin.read()) * 2)\n", encoding="utf-8"
+    )
+    return task
+
+
+def test_classic_python_runner_dispatches_and_awards_percentage_score(tmp_path):
     task = _task(tmp_path)
     submission = tmp_path / "submission"
     submission.mkdir()
@@ -76,10 +82,42 @@ def test_classic_python_runner_dispatches_and_awards_subtasks(tmp_path):
     assert result["score"] == pytest.approx(1.0)
     assert result["metrics"]["runner"] == "classic"
     assert result["metrics"]["verdict"] == "AC"
-    assert [item["awarded"] for item in result["metrics"]["subtasks"]] == [30, 70]
+    assert result["metrics"]["scoring_mode"] == "percentage"
+    assert result["metrics"]["passed_tests"] == 2
+    assert result["metrics"]["total_tests"] == 2
 
 
-def test_classic_runner_preserves_partial_ioi_score(tmp_path):
+def test_classic_reference_runner_generates_answers_inside_the_judge(tmp_path):
+    task = _reference_task(tmp_path)
+    validation = validate_task(task)
+    assert validation.valid, validation.errors
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "solution.py").write_text(
+        "import sys\nprint(int(sys.stdin.read()) * 2)\n", encoding="utf-8"
+    )
+
+    result = run_classic(str(submission), str(task))
+
+    assert result["status"] == "completed", result
+    assert result["score"] == pytest.approx(1.0)
+    assert result["metrics"]["verdict"] == "AC"
+
+
+def test_classic_reference_runner_rejects_wrong_submission_without_answer_files(tmp_path):
+    task = _reference_task(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "solution.py").write_text("print(0)\n", encoding="utf-8")
+
+    result = run_classic(str(submission), str(task))
+
+    assert result["status"] == "completed", result
+    assert result["score"] == pytest.approx(0.0)
+    assert result["metrics"]["verdict"] == "WA"
+
+
+def test_classic_runner_awards_percentage_for_solved_tests(tmp_path):
     task = _task(tmp_path)
     submission = tmp_path / "submission"
     submission.mkdir()
@@ -91,10 +129,26 @@ def test_classic_runner_preserves_partial_ioi_score(tmp_path):
     result = run_classic(str(submission), str(task))
 
     assert result["status"] == "completed"
-    assert result["score"] == pytest.approx(0.3)
+    assert result["score"] == pytest.approx(0.5)
     assert result["metrics"]["verdict"] == "WA"
-    assert result["metrics"]["subtasks"][0]["verdict"] == "AC"
-    assert result["metrics"]["subtasks"][1]["verdict"] == "WA"
+    assert result["metrics"]["passed_tests"] == 1
+
+
+def test_classic_runner_keeps_whole_task_scoring(tmp_path):
+    task = _task(tmp_path)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\nscoring_mode: all_or_nothing\n",
+        encoding="utf-8",
+    )
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "solution.py").write_text("print(4)\n", encoding="utf-8")
+
+    result = run_classic(str(submission), str(task))
+
+    assert result["status"] == "completed"
+    assert result["score"] == pytest.approx(0.0)
+    assert result["metrics"]["scoring_mode"] == "all_or_nothing"
 
 
 def test_classic_runner_uses_custom_checker(tmp_path):
@@ -124,7 +178,7 @@ def test_local_worker_executes_registered_classic_task(tmp_path):
         "import sys\nprint(int(sys.stdin.read()) * 2)\n", encoding="utf-8"
     )
     store = JudgeStore(tmp_path / "judge.db")
-    store.register_task(TaskRecord("classic/v1", str(task), "ioi"))
+    store.register_task(TaskRecord("classic/v1", str(task), "icpc"))
     store.submit(ExecutionRequest("classic/v1", str(submission), "classic-attempt"))
 
     result = LocalWorker(store).process_one()
@@ -137,7 +191,7 @@ def test_local_worker_executes_registered_classic_task(tmp_path):
 def test_classic_runner_reports_time_limit(tmp_path):
     task = _task(tmp_path)
     (task / "judge.yaml").write_text(
-        "version: 1\nkind: ioi\nrunner: classic\nlanguage: python\ntime_limit_ms: 100\n",
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\ntime_limit_ms: 100\n",
         encoding="utf-8",
     )
     submission = tmp_path / "submission"
@@ -235,7 +289,7 @@ def test_classic_task_validation_requires_test_answers(tmp_path):
 def test_classic_task_validation_requires_supported_manifest_version(tmp_path):
     task = _task(tmp_path)
     (task / "judge.yaml").write_text(
-        "version: 2\nkind: ioi\nrunner: classic\nlanguage: python\n",
+        "version: 2\nkind: icpc\nrunner: classic\nlanguage: python\n",
         encoding="utf-8",
     )
 

@@ -101,12 +101,12 @@ for line in sys.stdin:
     if json.loads(line)[\"type\"] == \"init\":
         print(json.dumps({\"type\": \"ready\"}), flush=True)
     elif json.loads(line)[\"type\"] == \"turn\":
-        print(\"x\" * 100, flush=True)
+        print(\"x\" * 300, flush=True)
 """,
     )
     with pytest.raises(AgentProtocolError, match="exceeds size limit"), AgentRuntime(
         (AgentSpec("oversized", 0, str(oversized)),),
-        limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=2, max_message_bytes=32),
+        limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=2, max_message_bytes=256),
     ) as runtime:
         runtime.step({})
 
@@ -119,3 +119,71 @@ def test_runtime_uses_explicit_python_command(tmp_path: Path):
     )
     with runtime:
         assert runtime.step({})[0]["turn"] == 1
+        assert runtime.metrics()["seats"]["0"]["turns"] == 1
+
+
+def test_runtime_supports_simultaneous_turns(tmp_path: Path):
+    artifact = _agent(
+        tmp_path / "simultaneous",
+        """import json
+import os
+import sys
+import time
+from pathlib import Path
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["type"] == "init":
+        print(json.dumps({"type": "ready"}), flush=True)
+    elif message["type"] == "turn":
+        marker = Path(f"/tmp/brunost-agent-sync-{message['seat']}")
+        marker.write_text("started")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if all(Path(f"/tmp/brunost-agent-sync-{seat}").exists() for seat in (0, 1)):
+                break
+            time.sleep(0.01)
+        print(json.dumps({"type": "action", "action": message["seat"]}), flush=True)
+    elif message["type"] == "shutdown":
+        break
+""",
+    )
+    for seat in (0, 1):
+        Path(f"/tmp/brunost-agent-sync-{seat}").unlink(missing_ok=True)
+    runtime = AgentRuntime(
+        (AgentSpec("red", 0, str(artifact)), AgentSpec("blue", 1, str(artifact))),
+        limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=3),
+    )
+    with runtime:
+        assert runtime.step({}, simultaneous=True) == {0: 0, 1: 1}
+
+
+def test_runtime_sanitizes_environment_and_bounds_stderr(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_AGENT_TEST_SECRET", "must-not-leak")
+    artifact = _agent(
+        tmp_path / "diagnostic-agent",
+        """import json
+import os
+import sys
+
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["type"] == "init":
+        print(json.dumps({"type": "ready"}), flush=True)
+    elif message["type"] == "turn":
+        sys.stderr.write("diagnostic " + "x" * 1000)
+        sys.stderr.flush()
+        print(json.dumps({"type": "action", "action": os.environ.get("BRUNOST_AGENT_TEST_SECRET", "missing")}), flush=True)
+    elif message["type"] == "shutdown":
+        break
+""",
+    )
+    runtime = AgentRuntime(
+        (AgentSpec("diagnostic", 0, str(artifact)),),
+        limits=AgentLimits(startup_timeout_seconds=1, turn_timeout_seconds=1, total_timeout_seconds=3, stderr_bytes=64),
+    )
+    with runtime:
+        assert runtime.step({})[0] == "missing"
+    telemetry = runtime.metrics()["seats"]["0"]
+    assert telemetry["stderr_truncated"] is True
+    assert len(telemetry["stderr"]) <= 64

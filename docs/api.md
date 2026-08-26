@@ -16,6 +16,7 @@ machine-readable schema at `/openapi.json` and interactive documentation at
 | Nodes | `/v1/nodes/enrollment-tokens`, `/v1/nodes/enroll` | Judge operator/node |
 | Artifacts | `/v1/artifacts/{artifact_id}`, worker download endpoint | Judge/operator/worker |
 | Callbacks | Signed callback URLs on evaluation requests | Integrating platform |
+| Authentication/audit | `/v1/auth/*`, `/v1/audit` | Judge operator/service integration |
 
 All mutating evaluation requests require an idempotency key. A repeated key
 returns the original evaluation instead of creating duplicate work. Evaluation
@@ -33,9 +34,9 @@ Set `timeout_seconds` on an evaluation for a per-run wall-clock limit. A
 running worker checks cancellation at the sandbox boundary and records a
 finished-after-cancel run as `canceled`.
 
-`ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` and
-`ioi` tasks use the classic batch runner and return structured compile, test,
-subtask, verdict, time, and output metrics. `interactive` tasks use the
+`ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` tasks
+use the classic batch runner and return structured compile, test, scoring,
+verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
 runner-plugin contract; registered participant artifacts are staged into the
 evaluator sandbox and game scores/replays are retained in result metrics.
@@ -47,11 +48,40 @@ contract and resource limits.
 ## Authentication
 
 Set `BRUNOST_JUDGE_API_TOKEN` and send `Authorization: Bearer <token>`. The
-control-plane API is closed when no token is configured. For a loopback-only
-development server, anonymous mode must be explicitly enabled with
-`BRUNOST_JUDGE_ALLOW_ANONYMOUS_API=true`; the health endpoint remains available
-without a token. Production deployments should put the API behind TLS and an
-organization-level identity gateway.
+control-plane API is closed when no token is configured. Secrets can instead be
+mounted by a container/orchestrator and loaded with
+`BRUNOST_JUDGE_API_TOKEN_FILE=/run/secrets/brunost-admin-token`; when both forms
+are present they must match. The health endpoint remains available without a
+token. For a loopback-only development server, anonymous mode must be explicitly
+enabled with `BRUNOST_JUDGE_ALLOW_ANONYMOUS_API=true`.
+
+The Premium platform should use a scoped service credential rather than the
+global admin token. An operator creates one with
+`POST /v1/auth/service-credentials`; the raw token is returned once and only a
+hash is stored. The default Premium scopes are `judge:read` and `judge:write`.
+`judge:admin` is reserved for operator automation. Revoke a credential with
+`POST /v1/auth/service-credentials/{credential_id}/revoke`. End-user login,
+sessions, organizations, and contest roles remain Premium responsibilities;
+the judge only authenticates service and worker credentials.
+
+Admin tokens can be rotated without restarting the API when
+`BRUNOST_JUDGE_API_TOKEN_FILE` is configured:
+
+```bash
+brunost auth rotate-admin-token --output /run/secrets/brunost-admin-token --force
+```
+
+The HTTP endpoint `POST /v1/auth/admin-token/rotate` performs the same atomic
+file replacement and returns the new token once. Do not configure the legacy
+`BRUNOST_JUDGE_API_TOKEN` environment value at the same time as this endpoint;
+an immutable environment value would otherwise override the rotated file.
+
+Mutating requests and authentication operations are written to `GET /v1/audit`
+without request bodies or raw credentials. The built-in limiter is process
+local: `BRUNOST_JUDGE_RATE_LIMIT_PER_MINUTE` defaults to 300 and
+`BRUNOST_JUDGE_AUTH_RATE_LIMIT_PER_MINUTE` defaults to 30. Multi-replica
+deployments should enforce the same limits at a shared ingress or Redis-backed
+limiter.
 
 Node enrollment is intentionally separate from the global API token. An
 operator creates a short-lived token with `POST /v1/nodes/enrollment-tokens`.

@@ -114,7 +114,9 @@ class JudgeStore:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at TEXT NOT NULL,
                     delivered_at TEXT,
-                    last_error TEXT
+                    last_error TEXT,
+                    lease_owner TEXT,
+                    lease_expires_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS definitions (
                     definition_type TEXT NOT NULL,
@@ -151,6 +153,28 @@ class JudgeStore:
                     created_at TEXT NOT NULL,
                     revoked_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS service_credentials (
+                    credential_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    scopes_json TEXT NOT NULL,
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL,
+                    revoked_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS ix_service_credentials_active
+                    ON service_credentials(revoked_at, expires_at);
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    event_id TEXT PRIMARY KEY,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_audit_events_created_at
+                    ON audit_events(created_at DESC);
                 """
             )
             # Keep existing reference deployments upgradeable without a manual
@@ -170,15 +194,24 @@ class JudgeStore:
                 if name not in columns:
                     db.execute(f"ALTER TABLE executions ADD COLUMN {name} {definition}")
             db.execute("CREATE INDEX IF NOT EXISTS ix_executions_lease ON executions(status, lease_expires_at)")
+            callback_columns = {row[1] for row in db.execute("PRAGMA table_info(callback_deliveries)")}
+            if "lease_owner" not in callback_columns:
+                db.execute("ALTER TABLE callback_deliveries ADD COLUMN lease_owner TEXT")
+            if "lease_expires_at" not in callback_columns:
+                db.execute("ALTER TABLE callback_deliveries ADD COLUMN lease_expires_at TEXT")
 
     def register_task(self, task: TaskRecord) -> TaskRecord:
         with self._lock, self._connect() as db:
+            manifest_json = json.dumps(task.manifest, sort_keys=True)
+            existing = db.execute("SELECT path,kind,manifest_json FROM tasks WHERE task_ref=?", (task.task_ref,)).fetchone()
+            if existing is not None:
+                existing_manifest = json.loads(existing["manifest_json"])
+                if (existing["path"], existing["kind"], existing_manifest) != (task.path, task.kind, task.manifest):
+                    raise ValueError(f"task_ref is immutable and already points to a different task: {task.task_ref}")
+                return task
             db.execute(
-                """INSERT INTO tasks(task_ref,path,kind,manifest_json,created_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(task_ref) DO UPDATE SET path=excluded.path,
-                     kind=excluded.kind, manifest_json=excluded.manifest_json""",
-                (task.task_ref, task.path, task.kind, json.dumps(task.manifest, sort_keys=True), _now()),
+                "INSERT INTO tasks(task_ref,path,kind,manifest_json,created_at) VALUES(?,?,?,?,?)",
+                (task.task_ref, task.path, task.kind, manifest_json, _now()),
             )
         return task
 
@@ -195,13 +228,18 @@ class JudgeStore:
         return [TaskRecord(row["task_ref"], row["path"], row["kind"], json.loads(row["manifest_json"])) for row in rows]
 
     def register_definition(self, definition_type: str, definition_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Upsert an extensible agent/game definition without leaking DB details."""
+        """Register an immutable extensible agent/game definition."""
         now = _now()
         with self._lock, self._connect() as db:
+            existing = db.execute("SELECT payload_json FROM definitions WHERE definition_type=? AND definition_id=?", (definition_type, definition_id)).fetchone()
+            if existing is not None:
+                current = json.loads(existing["payload_json"])
+                if current != payload:
+                    raise ValueError(f"definition is immutable and already exists: {definition_type}/{definition_id}")
+                return {"definition_type": definition_type, "definition_id": definition_id, **payload}
             db.execute(
                 """INSERT INTO definitions(definition_type,definition_id,payload_json,created_at,updated_at)
-                   VALUES(?,?,?,?,?) ON CONFLICT(definition_type,definition_id) DO UPDATE SET
-                   payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                   VALUES(?,?,?,?,?)""",
                 (definition_type, definition_id, json.dumps(payload, sort_keys=True), now, now),
             )
         return {"definition_type": definition_type, "definition_id": definition_id, **payload}
@@ -313,6 +351,14 @@ class JudgeStore:
             db.commit()
         return {"token_id": row["token_id"], **json.loads(row["payload_json"]), "expires_at": row["expires_at"]}
 
+    def get_enrollment_token(self, token: str) -> dict[str, Any] | None:
+        token_hash = digest_secret(token)
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM node_enrollment_tokens WHERE token_hash=? AND used_at IS NULL", (token_hash,)).fetchone()
+        if row is None or is_expired(row["expires_at"]):
+            return None
+        return {"token_id": row["token_id"], **json.loads(row["payload_json"]), "expires_at": row["expires_at"]}
+
     def create_worker_credential(self, worker_id: str, token: str) -> None:
         """Replace a worker credential; the raw token is never written to disk."""
 
@@ -342,6 +388,105 @@ class JudgeStore:
                 (_now(), worker_id),
             )
         return cursor.rowcount > 0
+
+    def create_service_credential(
+        self,
+        *,
+        credential_id: str,
+        name: str,
+        token: str,
+        scopes: tuple[str, ...],
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a Premium/service credential without its raw token."""
+
+        created_at = _now()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO service_credentials(
+                    credential_id,name,token_hash,scopes_json,expires_at,created_at,revoked_at
+                ) VALUES(?,?,?,?,?,?,NULL)""",
+                (credential_id, name, digest_secret(token), json.dumps(sorted(set(scopes))), expires_at, created_at),
+            )
+        return {
+            "credential_id": credential_id,
+            "name": name,
+            "scopes": sorted(set(scopes)),
+            "expires_at": expires_at,
+            "created_at": created_at,
+        }
+
+    def verify_service_token(self, token: str, scope: str) -> str | None:
+        """Return the credential ID when a live token grants ``scope``."""
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT credential_id,token_hash,scopes_json,expires_at FROM service_credentials "
+                "WHERE revoked_at IS NULL"
+            ).fetchall()
+        token_hash = digest_secret(token)
+        for row in rows:
+            if not hmac.compare_digest(str(row["token_hash"]), token_hash):
+                continue
+            if row["expires_at"] and is_expired(str(row["expires_at"])):
+                return None
+            if scope in json.loads(row["scopes_json"]):
+                return str(row["credential_id"])
+            return None
+        return None
+
+    def revoke_service_credential(self, credential_id: str) -> bool:
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE service_credentials SET revoked_at=? WHERE credential_id=? AND revoked_at IS NULL",
+                (_now(), credential_id),
+            )
+        return cursor.rowcount > 0
+
+    def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        success: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._lock, self._connect() as db:
+            db.execute(
+                """INSERT INTO audit_events(
+                    event_id,actor,action,resource,success,metadata_json,created_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()),
+                    actor,
+                    action,
+                    resource,
+                    int(success),
+                    json.dumps(metadata or {}, sort_keys=True),
+                    _now(),
+                ),
+            )
+            db.execute("DELETE FROM audit_events WHERE event_id IN (SELECT event_id FROM audit_events ORDER BY created_at DESC LIMIT -1 OFFSET 100000)")
+
+    def list_audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit)))
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM audit_events ORDER BY created_at DESC LIMIT ?", (bounded_limit,)
+            ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "actor": row["actor"],
+                "action": row["action"],
+                "resource": row["resource"],
+                "success": bool(row["success"]),
+                "metadata": json.loads(row["metadata_json"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id = str(uuid.uuid4())
@@ -403,7 +548,8 @@ class JudgeStore:
             db.execute("BEGIN IMMEDIATE")
             now = datetime.now(UTC)
             db.execute(
-                """UPDATE executions SET status='queued', worker_id=NULL, lease_expires_at=NULL, updated_at=?
+                """UPDATE executions SET status=CASE WHEN cancel_requested=1 THEN 'canceled' ELSE 'queued' END,
+                   worker_id=NULL, lease_expires_at=NULL, updated_at=?
                    WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
                 (now.isoformat(), now.isoformat()),
             )
@@ -454,12 +600,14 @@ class JudgeStore:
             "resource_class": row["resource_class"],
         }
 
-    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
+    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
+        if not worker_id.strip():
+            raise ValueError("worker_id is required to finish an execution")
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 """UPDATE executions SET status=?,score=?,metrics_json=?,scores_json=?,winner=?,artifacts_json=?,failure_reason=?,
                    metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=?
-                   WHERE execution_id=? AND (? IS NULL OR worker_id=?)""",
+                   WHERE execution_id=? AND worker_id=?""",
                 (
                     result.status,
                     result.score,
@@ -471,7 +619,6 @@ class JudgeStore:
                     json.dumps(result.metadata, sort_keys=True),
                     _now(),
                     execution_id,
-                    worker_id,
                     worker_id,
                 ),
             )
@@ -498,15 +645,26 @@ class JudgeStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def claim_callback(self, execution_id: str, worker_id: str, *, lease_seconds: int = 60) -> bool:
+        now = datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE callback_deliveries SET lease_owner=?,lease_expires_at=?
+                   WHERE execution_id=? AND delivered_at IS NULL AND next_attempt_at<=?
+                   AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=?)""",
+                (worker_id, (now + timedelta(seconds=max(1, lease_seconds))).isoformat(), execution_id, now.isoformat(), now.isoformat()),
+            )
+        return cursor.rowcount == 1
+
     def mark_callback_delivered(self, execution_id: str) -> None:
         with self._lock, self._connect() as db:
-            db.execute("UPDATE callback_deliveries SET delivered_at=?,last_error=NULL WHERE execution_id=?", (_now(), execution_id))
+            db.execute("UPDATE callback_deliveries SET delivered_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=?", (_now(), execution_id))
 
     def mark_callback_failed(self, execution_id: str, error: str) -> None:
         with self._lock, self._connect() as db:
             db.execute(
                 """UPDATE callback_deliveries SET attempts=attempts+1,
-                   next_attempt_at=?,last_error=? WHERE execution_id=?""",
+                   next_attempt_at=?,last_error=?,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=?""",
                 ((datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, self._callback_attempts(db, execution_id)))))).isoformat(), error[:2000], execution_id),
             )
 

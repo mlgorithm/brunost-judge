@@ -1,10 +1,9 @@
 # Brunost Judge
 
-Current release: `1.0.0` — isolated agent runtime, deterministic match orchestration, portable artifacts, worker credentials, capability scheduling, provider
-adapters, deterministic game contracts, and replay artifact results.
+Current release: `1.3.0` — local match execution, formal agent protocols, portable artifacts, worker credentials, scoped service authentication, secret-file loading, audit logging, rate limiting, signed callbacks, capability scheduling, provider adapters, deterministic game contracts, and replay artifact results.
 
 Brunost Judge is the platform-independent judging layer for scorer-backed IOAI,
-model, and output-only tasks, with versioned contracts for ICPC, IOI, interactive,
+model, and output-only tasks, with versioned contracts for ICPC, interactive,
 and agent runners. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary. The built-in runtime fails
@@ -105,7 +104,10 @@ and an LMS/platform.
 Agent and game competitions use the versioned runner-plugin SDK documented in
 [`docs/plugins.md`](docs/plugins.md). Participant bundles are content-addressed,
 worker claims honor required capabilities, and custom runners are installed as
-trusted evaluator-image extensions.
+trusted evaluator-image extensions. See [`docs/agent-protocol.md`](docs/agent-protocol.md)
+and the reference packages under `examples/agents` and `examples/games` for a
+complete protocol-compatible match. Local game authors can exercise that full
+path with `brunost match run` before publishing a task to the worker API.
 
 For the generated application layer, framework adapters, and standalone/
 embedded/hybrid integration modes, see [`docs/platform-kit.md`](docs/platform-kit.md).
@@ -140,42 +142,66 @@ def evaluate(submission_path: str, assets_path: str) -> dict | float:
 {"status": "completed", "score": 0.98,
  "metrics": {"public": 0.98, "private": 0.97, "public_detail": {...}, "private_detail": {...}}}
 ```
-- `score` is the **public** value — safe to surface live; the **private** value lives only
-  in `metrics["private"]`, which the platform gates behind leaderboard freeze/reveal.
+- For legacy scorer-backed tasks, `score` is the **public** value — safe to surface live;
+  the private value lives in `metrics["private"]`.
+- For `model` tasks with `submission_mode: python_code`, `score` is explicitly the
+  private official value. The platform should still gate private metrics and details
+  according to its leaderboard freeze/reveal policy.
 - Any error (missing file, bad shape, scorer exception) → `{"status": "failed", "score": 0.0,
   "failure_reason": "..."}` — the harness never crashes the sandbox.
 
+### Python ML training tasks
+
+Model tasks can opt into a standard train/predict lifecycle. The participant sees
+public training data and private test features, but never the private labels. The
+Judge runs `submission.py` with these environment variables:
+
+```text
+BRUNOST_ML_PUBLIC_DATASET
+BRUNOST_ML_PRIVATE_DATASET
+BRUNOST_ML_OUTPUT_PATH
+BRUNOST_ML_SEED
+```
+
+The submission may use any number of epochs. `training_time_limit_ms` is the hard
+wall-clock limit; when it expires the process tree is killed. Memory is limited
+with `memory_limit_mb`. The submission must create the configured prediction file,
+normally `predictions.csv`, before returning successfully. The private scorer then
+computes the official score and must return a `private` value. A baseline is
+optional and, when enabled, runs through the same input/output contract for task
+validation and comparison only.
+
+See [`docs/model-tasks.md`](docs/model-tasks.md) for the package layout and scorer
+contract.
+
 ### Classic batch tasks
 
-`icpc` and `ioi` task packages use the built-in classic runner. A minimal
+`icpc` task packages use the built-in classic runner. A minimal
 manifest is flat and dependency-free:
 
 ```yaml
 version: 1
-kind: ioi
+kind: icpc
 runner: classic
 language: cpp
 time_limit_ms: 2000
 memory_limit_mb: 512
 output_limit_bytes: 1048576
+scoring_mode: all_or_nothing # or percentage
 ```
 
-The task contains matching `tests/**/*.in` and `.ans`/`.out` files. Without a
-`subtasks.json`, all tests are worth 100 points. For IOI scoring, define a list
-of point-bearing subtasks and assign every test exactly once:
-
-```json
-{"subtasks": [
-  {"id": "basic", "points": 30, "tests": ["basic/01"]},
-  {"id": "full", "points": 70, "tests": ["full/01", "full/02"]}
-]}
-```
+The task contains matching `tests/**/*.in` and `.ans`/`.out` files. With
+`all_or_nothing`, the submission receives full score only when every test
+passes. With `percentage`, each solved test contributes an equal share of the
+task score. Public copies of tests are optional convenience fixtures; every
+test under `tests/` is evaluated.
 
 The default checker compares whitespace-separated tokens. A task can provide
 `checker.py` with `check(input_path, answer_path, output_path)` for custom
 validation. Supported submission languages are Python, C, C++17, and Rust.
 Compile errors, runtime errors, time limits, output limits, and partial scores
-are returned as structured test/subtask metrics.
+are returned as structured test metrics, including the scoring mode and the
+number of passed tests.
 
 For production, the Docker evaluator image installs compilers and bubblewrap;
 private task assets stream into a root-only evaluator tmpfs and are never mounted

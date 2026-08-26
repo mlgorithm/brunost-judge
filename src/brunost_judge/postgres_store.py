@@ -64,7 +64,7 @@ class PostgresJudgeStore:
                 CREATE TABLE IF NOT EXISTS callback_deliveries (
                     execution_id TEXT PRIMARY KEY REFERENCES executions(execution_id), callback_url TEXT NOT NULL,
                     callback_token TEXT, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ NOT NULL,
-                    delivered_at TIMESTAMPTZ, last_error TEXT
+                    delivered_at TIMESTAMPTZ, last_error TEXT, lease_owner TEXT, lease_expires_at TIMESTAMPTZ
                 );
                 CREATE TABLE IF NOT EXISTS definitions (
                     definition_type TEXT NOT NULL,
@@ -101,18 +101,48 @@ class PostgresJudgeStore:
                     created_at TIMESTAMPTZ NOT NULL,
                     revoked_at TIMESTAMPTZ
                 );
+                CREATE TABLE IF NOT EXISTS service_credentials (
+                    credential_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    scopes_json JSONB NOT NULL,
+                    expires_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    revoked_at TIMESTAMPTZ
+                );
+                CREATE INDEX IF NOT EXISTS ix_service_credentials_active
+                    ON service_credentials(revoked_at, expires_at);
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    event_id TEXT PRIMARY KEY,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    success BOOLEAN NOT NULL,
+                    metadata_json JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_audit_events_created_at
+                    ON audit_events(created_at DESC);
                 ALTER TABLE executions ADD COLUMN IF NOT EXISTS scores_json JSONB NOT NULL DEFAULT '{}'::jsonb;
                 ALTER TABLE executions ADD COLUMN IF NOT EXISTS winner TEXT;
                 ALTER TABLE executions ADD COLUMN IF NOT EXISTS artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb;"""
             )
+            db.execute("ALTER TABLE callback_deliveries ADD COLUMN IF NOT EXISTS lease_owner TEXT")
+            db.execute("ALTER TABLE callback_deliveries ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ")
 
     def register_task(self, task: TaskRecord) -> TaskRecord:
         with self._connect() as db:
+            manifest_json = json.dumps(task.manifest, sort_keys=True)
             db.execute(
-                """INSERT INTO tasks(task_ref,path,kind,manifest_json,created_at) VALUES(%s,%s,%s,%s,%s)
-                   ON CONFLICT(task_ref) DO UPDATE SET path=EXCLUDED.path,kind=EXCLUDED.kind,manifest_json=EXCLUDED.manifest_json""",
-                (task.task_ref, task.path, task.kind, json.dumps(task.manifest), _now()),
+                "INSERT INTO tasks(task_ref,path,kind,manifest_json,created_at) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(task_ref) DO NOTHING",
+                (task.task_ref, task.path, task.kind, manifest_json, _now()),
             )
+            existing = db.execute("SELECT path,kind,manifest_json FROM tasks WHERE task_ref=%s", (task.task_ref,)).fetchone()
+            if existing is None:
+                raise RuntimeError("task registration was lost before it could be read")
+            current_manifest = existing["manifest_json"] if isinstance(existing["manifest_json"], dict) else json.loads(existing["manifest_json"])
+            if (existing["path"], existing["kind"], current_manifest) != (task.path, task.kind, task.manifest):
+                raise ValueError(f"task_ref is immutable and already points to a different task: {task.task_ref}")
         return task
 
     def get_task(self, task_ref: str) -> TaskRecord | None:
@@ -131,10 +161,15 @@ class PostgresJudgeStore:
             db.execute(
                 """INSERT INTO definitions(definition_type,definition_id,payload_json,created_at,updated_at)
                    VALUES(%s,%s,%s,%s,%s)
-                   ON CONFLICT(definition_type,definition_id) DO UPDATE SET
-                   payload_json=EXCLUDED.payload_json,updated_at=EXCLUDED.updated_at""",
+                   ON CONFLICT(definition_type,definition_id) DO NOTHING""",
                 (definition_type, definition_id, json.dumps(payload), now, now),
             )
+            existing = db.execute("SELECT payload_json FROM definitions WHERE definition_type=%s AND definition_id=%s", (definition_type, definition_id)).fetchone()
+            if existing is None:
+                raise RuntimeError("definition registration was lost before it could be read")
+            current = existing["payload_json"] if isinstance(existing["payload_json"], dict) else json.loads(existing["payload_json"])
+            if current != payload:
+                raise ValueError(f"definition is immutable and already exists: {definition_type}/{definition_id}")
         return {"definition_type": definition_type, "definition_id": definition_id, **payload}
 
     def get_definition(self, definition_type: str, definition_id: str) -> dict[str, Any] | None:
@@ -240,6 +275,15 @@ class PostgresJudgeStore:
         payload = row["payload_json"] if isinstance(row["payload_json"], dict) else json.loads(row["payload_json"])
         return {"token_id": row["token_id"], **payload, "expires_at": row["expires_at"].isoformat() if hasattr(row["expires_at"], "isoformat") else str(row["expires_at"])}
 
+    def get_enrollment_token(self, token: str) -> dict[str, Any] | None:
+        token_hash = digest_secret(token)
+        with self._connect() as db:
+            row = db.execute("SELECT * FROM node_enrollment_tokens WHERE token_hash=%s AND used_at IS NULL", (token_hash,)).fetchone()
+        if row is None or is_expired(str(row["expires_at"])):
+            return None
+        payload = row["payload_json"] if isinstance(row["payload_json"], dict) else json.loads(row["payload_json"])
+        return {"token_id": row["token_id"], **payload, "expires_at": row["expires_at"].isoformat() if hasattr(row["expires_at"], "isoformat") else str(row["expires_at"])}
+
     def create_worker_credential(self, worker_id: str, token: str) -> None:
         with self._connect() as db:
             db.execute(
@@ -265,6 +309,96 @@ class PostgresJudgeStore:
                 (_now(), worker_id),
             )
         return cursor.rowcount > 0
+
+    def create_service_credential(
+        self,
+        *,
+        credential_id: str,
+        name: str,
+        token: str,
+        scopes: tuple[str, ...],
+        expires_at: str | None = None,
+    ) -> dict[str, Any]:
+        created_at = _now()
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO service_credentials(
+                    credential_id,name,token_hash,scopes_json,expires_at,created_at,revoked_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,NULL)""",
+                (credential_id, name, digest_secret(token), json.dumps(sorted(set(scopes))), expires_at, created_at),
+            )
+        return {
+            "credential_id": credential_id,
+            "name": name,
+            "scopes": sorted(set(scopes)),
+            "expires_at": expires_at,
+            "created_at": created_at,
+        }
+
+    def verify_service_token(self, token: str, scope: str) -> str | None:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT credential_id,token_hash,scopes_json,expires_at FROM service_credentials "
+                "WHERE revoked_at IS NULL"
+            ).fetchall()
+        token_hash = digest_secret(token)
+        for row in rows:
+            if not hmac.compare_digest(str(row["token_hash"]), token_hash):
+                continue
+            expiry = row["expires_at"]
+            if expiry and is_expired(expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)):
+                return None
+            scopes = row["scopes_json"] if isinstance(row["scopes_json"], list) else json.loads(row["scopes_json"])
+            if scope in scopes:
+                return str(row["credential_id"])
+            return None
+        return None
+
+    def revoke_service_credential(self, credential_id: str) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                "UPDATE service_credentials SET revoked_at=%s WHERE credential_id=%s AND revoked_at IS NULL",
+                (_now(), credential_id),
+            )
+        return cursor.rowcount > 0
+
+    def record_audit_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        resource: str,
+        success: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """INSERT INTO audit_events(
+                    event_id,actor,action,resource,success,metadata_json,created_at
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s)""",
+                (str(uuid.uuid4()), actor, action, resource, success, json.dumps(metadata or {}), _now()),
+            )
+            db.execute("DELETE FROM audit_events WHERE event_id IN (SELECT event_id FROM audit_events ORDER BY created_at DESC OFFSET 100000)")
+
+    def list_audit_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit)))
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM audit_events ORDER BY created_at DESC LIMIT %s", (bounded_limit,)
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            created_at = row["created_at"]
+            events.append({
+                "event_id": row["event_id"],
+                "actor": row["actor"],
+                "action": row["action"],
+                "resource": row["resource"],
+                "success": bool(row["success"]),
+                "metadata": row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"]),
+                "created_at": created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at),
+            })
+        return events
 
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id, now = str(uuid.uuid4()), _now()
@@ -302,7 +436,7 @@ class PostgresJudgeStore:
                    lease_seconds: int = 300):
         with self._connect() as db:
             now = datetime.now(UTC)
-            db.execute("UPDATE executions SET status='queued',worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=%s", (now, now))
+            db.execute("UPDATE executions SET status=CASE WHEN cancel_requested THEN 'canceled' ELSE 'queued' END,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=%s", (now, now))
             clauses, params = ["status='queued'", "cancel_requested=FALSE"], []
             if queues:
                 clauses.append("queue = ANY(%s)")
@@ -330,13 +464,11 @@ class PostgresJudgeStore:
             return None
         return self.get_execution(row["execution_id"]), self._task(task_row), {"callback_url": row["callback_url"], "callback_token": row["callback_token"], "submission_path": row["submission_path"], "queue": row["queue"], "resource_class": row["resource_class"]}
 
-    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str | None = None) -> ExecutionResult | None:
+    def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
+        if not worker_id.strip():
+            raise ValueError("worker_id is required to finish an execution")
         with self._connect() as db:
-            # PostgreSQL cannot infer the type of a parameter used only in
-            # ``%s IS NULL`` when the worker id is absent.  Explicitly cast
-            # that guard to the column type so finishing an execution works
-            # for both scoped and unscoped callers.
-            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,scores_json=%s,winner=%s,artifacts_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND (%s::text IS NULL OR worker_id=%s)", (result.status, result.score, json.dumps(result.metrics), json.dumps(result.scores), result.winner, json.dumps(result.artifacts), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id, worker_id))
+            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,scores_json=%s,winner=%s,artifacts_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND worker_id=%s", (result.status, result.score, json.dumps(result.metrics), json.dumps(result.scores), result.winner, json.dumps(result.artifacts), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id))
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
@@ -350,15 +482,25 @@ class PostgresJudgeStore:
             rows = db.execute("SELECT c.*,e.status,e.task_ref,e.score,e.metrics_json,e.failure_reason,e.metadata_json FROM callback_deliveries c JOIN executions e USING(execution_id) WHERE c.delivered_at IS NULL AND c.next_attempt_at<=%s ORDER BY c.next_attempt_at LIMIT %s", (_now(), limit)).fetchall()
         return [dict(row) for row in rows]
 
+    def claim_callback(self, execution_id: str, worker_id: str, *, lease_seconds: int = 60) -> bool:
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE callback_deliveries SET lease_owner=%s,lease_expires_at=%s
+                   WHERE execution_id=%s AND delivered_at IS NULL AND next_attempt_at<=%s
+                   AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at<=%s)""",
+                (worker_id, datetime.now(UTC) + timedelta(seconds=max(1, lease_seconds)), execution_id, datetime.now(UTC), datetime.now(UTC)),
+            )
+        return cursor.rowcount == 1
+
     def mark_callback_delivered(self, execution_id: str) -> None:
         with self._connect() as db:
-            db.execute("UPDATE callback_deliveries SET delivered_at=%s,last_error=NULL WHERE execution_id=%s", (_now(), execution_id))
+            db.execute("UPDATE callback_deliveries SET delivered_at=%s,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=%s", (_now(), execution_id))
 
     def mark_callback_failed(self, execution_id: str, error: str) -> None:
         with self._connect() as db:
             row = db.execute("SELECT attempts FROM callback_deliveries WHERE execution_id=%s", (execution_id,)).fetchone()
             attempts = int(row["attempts"]) if row else 0
-            db.execute("UPDATE callback_deliveries SET attempts=attempts+1,next_attempt_at=%s,last_error=%s WHERE execution_id=%s", (datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, attempts)))), error[:2000], execution_id))
+            db.execute("UPDATE callback_deliveries SET attempts=attempts+1,next_attempt_at=%s,last_error=%s,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=%s", (datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, attempts)))), error[:2000], execution_id))
 
     def cancel(self, execution_id: str) -> ExecutionResult | None:
         with self._connect() as db:

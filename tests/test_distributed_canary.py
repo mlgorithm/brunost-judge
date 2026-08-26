@@ -106,17 +106,17 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
             queues=["default", lease_queue],
             resource_classes=["cpu", lease_queue],
         )
-        task_path = Path(__file__).parents[1] / "examples" / "ioi-sum"
-        submission_path = Path(__file__).parents[1] / "examples" / "canary-ioi-sum"
+        task_path = Path(__file__).parents[1] / "examples" / "deterministic-sum"
+        submission_path = Path(__file__).parents[1] / "examples" / "canary-deterministic-sum"
         uploaded_task = admin.upload_artifact(task_path)
         task = admin.register_task(
-            task_ref="canary/ioi-sum-v1",
+            task_ref="canary/deterministic-sum-v1",
             artifact_id=str(uploaded_task["artifact_id"]),
-            kind="ioi",
+            kind="icpc",
         )
         uploaded_submission = admin.upload_artifact(submission_path)
         request = {
-            "task_ref": "canary/ioi-sum-v1",
+            "task_ref": "canary/deterministic-sum-v1",
             "submission_artifact_id": str(uploaded_submission["artifact_id"]),
             "idempotency_key": "distributed-canary-1",
             "callback_url": callback_url,
@@ -159,7 +159,7 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
             resource_classes=[lease_queue],
         )
         lease_submission = admin.submit(
-            task_ref="canary/ioi-sum-v1",
+        task_ref="canary/deterministic-sum-v1",
             submission_artifact_id=str(uploaded_submission["artifact_id"]),
             idempotency_key="distributed-canary-lease-1",
             queue=lease_queue,
@@ -176,7 +176,7 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
             worker_b_id,
             {
                 "execution_id": lease_submission["execution_id"],
-                "task_ref": "canary/ioi-sum-v1",
+                "task_ref": "canary/deterministic-sum-v1",
                 "status": "completed",
                 "score": 1.0,
                 "result_version": 1,

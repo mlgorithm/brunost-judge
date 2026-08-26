@@ -26,19 +26,27 @@ CONTROL_PLANE_COMPOSE = """services:
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@judge-postgres:5432/${POSTGRES_DB}
       BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN}
+      BRUNOST_JUDGE_API_TOKEN_FILE: ${BRUNOST_JUDGE_API_TOKEN_FILE:-}
       BRUNOST_JUDGE_REQUIRE_API_TOKEN: \"true\"
       BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN: \"true\"
       BRUNOST_JUDGE_CLUSTER_ID: ${BRUNOST_JUDGE_CLUSTER_ID}
       BRUNOST_JUDGE_ARTIFACT_ROOT: /var/lib/brunost/artifacts
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET}
+      BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE:-}
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS: "true"
       # Keep this false for public callbacks.  An isolated service mesh may
       # explicitly enable it only for a hostname in BRUNOST_JUDGE_CALLBACK_HOSTS.
       BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS: ${BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS:-false}
-      BRUNOST_JUDGE_CALLBACK_HOSTS: ${BRUNOST_JUDGE_CALLBACK_HOSTS:?set the platform callback hostname allowlist}
+      BRUNOST_JUDGE_CALLBACK_HOSTS: ${BRUNOST_JUDGE_CALLBACK_HOSTS:?set the Premium callback hostname allowlist}
     ports:
       - \"8787:8787\"
+    healthcheck:
+      test: [\"CMD\", \"python\", \"-c\", \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=3).read()\"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
     volumes:
       - judge-artifacts:/var/lib/brunost/artifacts
     depends_on:
@@ -110,10 +118,11 @@ RUNBOOK = """# Country cluster runbook
 5. Upload task and submission bundles with `brunost artifact upload`.
 6. Run the CPU canary before enabling contest traffic.
 
-The generated compose files are a reference deployment. Put the API behind
-TLS, replace the callback hostname placeholder before startup, keep the global
-API token on the control plane only, and use a replicated PostgreSQL/object-
-storage service for an official contest.
+The generated compose files are a reference Judge deployment. Put the API
+behind TLS, replace the Premium callback hostname placeholder before startup,
+keep the global API token on the control plane only, and use a replicated
+PostgreSQL/object-storage service for an official contest. Deploy Premium
+separately and point it at this Judge API.
 """
 
 

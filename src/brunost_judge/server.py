@@ -4,6 +4,7 @@ FastAPI is optional so the core/CLI remain dependency-light. Install
 ``brunost-judge[server]`` for the HTTP service.
 """
 
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -15,15 +16,27 @@ from brunost_judge.artifacts import (
     artifact_store_from_environment,
     pack_directory,
 )
+from brunost_judge.auth import (
+    SERVICE_SCOPES,
+    RateLimiter,
+    bearer_token,
+    configured_secret,
+    constant_time_equal,
+    int_environment,
+    write_secret_file,
+)
 from brunost_judge.contracts import TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
 from brunost_judge.task import BUILTIN_KINDS, task_digest, validate_task
 
+LOGGER = logging.getLogger(__name__)
+
 
 def create_app(database: str | Path | None = None):
     try:
         from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+        from fastapi.responses import JSONResponse
     except ImportError as exc:  # pragma: no cover - exercised when optional extra is absent
         raise RuntimeError("Install brunost-judge[server] to run the HTTP API") from exc
     from pydantic import BaseModel, Field
@@ -120,6 +133,11 @@ def create_app(database: str | Path | None = None):
         resource_classes: list[str] = Field(default_factory=list, max_length=32)
         metadata: dict[str, Any] = Field(default_factory=dict)
 
+    class ServiceCredentialRequestModel(BaseModel):
+        name: str = Field(min_length=1, max_length=200)
+        scopes: list[str] = Field(default_factory=lambda: ["judge:read", "judge:write"], min_length=1, max_length=3)
+        ttl_seconds: int | None = Field(default=None, ge=60, le=31536000)
+
     class WorkerFinishModel(BaseModel):
         execution_id: str = Field(min_length=1, max_length=200)
         task_ref: str = Field(min_length=1, max_length=200)
@@ -140,8 +158,58 @@ def create_app(database: str | Path | None = None):
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
-    app = FastAPI(title="Brunost Judge", version="1.0.0")
+    app = FastAPI(title="Brunost Judge", version="1.3.0")
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
+    rate_limiter = RateLimiter()
+
+    def _client_key(request: Request) -> str:
+        return request.client.host if request.client else "unknown"
+
+    @app.middleware("http")
+    async def security_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+        if request.url.path.startswith("/v1"):
+            bucket = "auth" if request.url.path.startswith("/v1/auth") or request.url.path == "/v1/nodes/enroll" else "api"
+            setting = "BRUNOST_JUDGE_AUTH_RATE_LIMIT_PER_MINUTE" if bucket == "auth" else "BRUNOST_JUDGE_RATE_LIMIT_PER_MINUTE"
+            default = 30 if bucket == "auth" else 300
+            allowed, retry_after = rate_limiter.allow(
+                _client_key(request),
+                bucket,
+                int_environment(setting, default),
+            )
+            if not allowed:
+                try:
+                    store.record_audit_event(
+                        actor="anonymous",
+                        action=f"{request.method} {request.url.path}",
+                        resource=request.url.path,
+                        success=False,
+                        metadata={"status_code": 429, "rate_limited": True},
+                    )
+                except Exception as exc:  # noqa: BLE001 - audit must never take down the API
+                    LOGGER.debug("could not record rate-limit audit event: %s", exc)
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                    headers={"Retry-After": str(retry_after)},
+                )
+        request.state.auth_subject = "anonymous"
+        response = await call_next(request)
+        if request.url.path.startswith("/v1") and (
+            request.method not in {"GET", "HEAD", "OPTIONS"}
+            or request.url.path.startswith("/v1/auth")
+            or response.status_code >= 400
+        ):
+            try:
+                store.record_audit_event(
+                    actor=str(getattr(request.state, "auth_subject", "anonymous")),
+                    action=f"{request.method} {request.url.path}",
+                    resource=request.url.path,
+                    success=response.status_code < 400,
+                    metadata={"status_code": response.status_code},
+                )
+            except Exception as exc:  # noqa: BLE001 - audit must never take down the API
+                LOGGER.debug("could not record audit event: %s", exc)
+        return response
 
     def _allowed_path(value: str, env_name: str) -> str:
         path = Path(value).expanduser().resolve()
@@ -176,9 +244,9 @@ def create_app(database: str | Path | None = None):
         if not url:
             return None
         parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
             raise HTTPException(status_code=422, detail="callback_url must be an absolute http(s) URL")
-        production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production"}
+        production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         require_https = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS", "false").lower() == "true"
         if require_https and parsed.scheme != "https":
             allowlist = {host.strip().lower() for host in os.environ.get("BRUNOST_JUDGE_CALLBACK_HOSTS", "").split(",") if host.strip()}
@@ -191,10 +259,44 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=503, detail="BRUNOST_JUDGE_CALLBACK_HOSTS is required in production")
         if allowlist and (not parsed.hostname or parsed.hostname.lower() not in allowlist):
             raise HTTPException(status_code=422, detail="callback host is not allowed")
+        if os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true":
+            try:
+                signing_secret = configured_secret("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            if not signing_secret:
+                raise HTTPException(status_code=503, detail="signed callbacks are required but no callback signing secret is configured")
         return url
 
-    def require_api_token(authorization: str | None = Header(default=None)) -> None:
-        expected = os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip()
+    def _required_scope(request: Request) -> str:
+        path = request.url.path
+        if (
+            path.startswith(("/v1/auth", "/v1/audit", "/v1/nodes", "/v1/workers/register"))
+            or path.endswith(("/drain", "/credential/revoke"))
+        ):
+            return "judge:admin"
+        return "judge:read" if request.method in {"GET", "HEAD"} else "judge:write"
+
+    def _configured_admin_token() -> str | None:
+        try:
+            return configured_secret("BRUNOST_JUDGE_API_TOKEN")
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    def require_api_token(request: Request, authorization: str | None = Header(default=None)) -> None:
+        expected = _configured_admin_token()
+        token = bearer_token(authorization)
+        if expected and token and constant_time_equal(token, expected):
+            request.state.auth_subject = "admin"
+            return
+        if token:
+            credential_id = store.verify_service_token(token, _required_scope(request))
+            if credential_id:
+                request.state.auth_subject = f"service:{credential_id}"
+                return
+            raise HTTPException(status_code=401, detail="invalid judge API credential")
+        if expected:
+            raise HTTPException(status_code=401, detail="judge API credential required")
         configured_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN")
         required = (
             configured_requirement.lower() == "true"
@@ -203,23 +305,28 @@ def create_app(database: str | Path | None = None):
         )
         if not expected and (required or not allow_anonymous_api):
             raise HTTPException(status_code=503, detail="judge API token is not configured")
-        if expected and authorization != f"Bearer {expected}":
-            raise HTTPException(status_code=401, detail="invalid judge API token")
 
-    def require_worker_token(worker_id: str, authorization: str | None = Header(default=None)) -> None:
+    def require_worker_token(
+        worker_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
         """Accept the global admin token or the enrolled worker's scoped token."""
 
-        expected = os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip()
+        expected = _configured_admin_token()
+        token = bearer_token(authorization)
         configured_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_API_TOKEN")
         required = (
             configured_requirement.lower() == "true"
             if configured_requirement is not None
             else not allow_anonymous_api
         )
-        if expected and authorization == f"Bearer {expected}":
+        if expected and token and constant_time_equal(token, expected):
+            request.state.auth_subject = "admin"
             return
-        if authorization and authorization.startswith("Bearer "):
-            if store.verify_worker_token(worker_id, authorization.removeprefix("Bearer ").strip()):
+        if token:
+            if store.verify_worker_token(worker_id, token):
+                request.state.auth_subject = f"worker:{worker_id}"
                 return
             raise HTTPException(status_code=401, detail="invalid worker token")
         configured_worker_requirement = os.environ.get("BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN")
@@ -236,10 +343,71 @@ def create_app(database: str | Path | None = None):
         return {
             "status": "ok",
             "service": "brunost-judge",
-            "version": "1.0.0",
+            "version": "1.3.0",
             "database": type(store).__name__,
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
         }
+
+    @app.get("/readyz")
+    def readiness() -> dict[str, Any]:
+        try:
+            # A real store query distinguishes a live process from a control
+            # plane that cannot reach its database.
+            store.stats()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="Judge database is unavailable") from exc
+        return {
+            "status": "ready",
+            "service": "brunost-judge",
+            "database": type(store).__name__,
+            "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
+        }
+
+    @app.post("/v1/auth/service-credentials", status_code=201, dependencies=[Depends(require_api_token)])
+    def create_service_credential(request: ServiceCredentialRequestModel) -> dict[str, Any]:
+        scopes = tuple(sorted(set(request.scopes)))
+        if not set(scopes).issubset(SERVICE_SCOPES):
+            raise HTTPException(status_code=422, detail=f"scopes must be drawn from {sorted(SERVICE_SCOPES)}")
+        raw_token = new_secret()
+        record = store.create_service_credential(
+            credential_id=f"svc-{uuid.uuid4().hex[:16]}",
+            name=request.name.strip(),
+            token=raw_token,
+            scopes=scopes,
+            expires_at=expires_at(request.ttl_seconds) if request.ttl_seconds is not None else None,
+        )
+        # The raw credential is intentionally returned only at creation time.
+        return {**record, "token": raw_token}
+
+    @app.post("/v1/auth/service-credentials/{credential_id}/revoke", dependencies=[Depends(require_api_token)])
+    def revoke_service_credential(credential_id: str) -> dict[str, Any]:
+        if not store.revoke_service_credential(credential_id):
+            raise HTTPException(status_code=404, detail="service credential not found")
+        return {"credential_id": credential_id, "revoked": True}
+
+    @app.post("/v1/auth/admin-token/rotate", dependencies=[Depends(require_api_token)])
+    def rotate_admin_token() -> dict[str, Any]:
+        token_file = os.environ.get("BRUNOST_JUDGE_API_TOKEN_FILE", "").strip()
+        if not token_file:
+            raise HTTPException(
+                status_code=503,
+                detail="admin token rotation requires BRUNOST_JUDGE_API_TOKEN_FILE",
+            )
+        if os.environ.get("BRUNOST_JUDGE_API_TOKEN", "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail="remove BRUNOST_JUDGE_API_TOKEN and use BRUNOST_JUDGE_API_TOKEN_FILE for reloadable rotation",
+            )
+        raw_token = new_secret()
+        try:
+            destination = write_secret_file(token_file, raw_token)
+        except (OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail=f"could not rotate admin token: {exc}") from exc
+        return {"token": raw_token, "token_file": str(destination), "rotated": True}
+
+    @app.get("/v1/audit", dependencies=[Depends(require_api_token)])
+    def list_audit(limit: int = 100) -> list[dict[str, Any]]:
+        return store.list_audit_events(limit=limit)
 
     @app.get("/v1/cluster", dependencies=[Depends(require_api_token)])
     def cluster() -> dict[str, Any]:
@@ -247,7 +415,7 @@ def create_app(database: str | Path | None = None):
         return {
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
             "service": "brunost-judge",
-            "version": "1.0.0",
+            "version": "1.3.0",
             "workers": len(workers),
             "ready_workers": sum(1 for worker in workers if worker.status == "ready" and not worker.draining),
         }
@@ -320,7 +488,7 @@ def create_app(database: str | Path | None = None):
 
     @app.post("/v1/nodes/enroll", status_code=201)
     def enroll_node(request: NodeEnrollmentModel) -> dict[str, Any]:
-        payload = store.consume_enrollment_token(request.join_token)
+        payload = store.get_enrollment_token(request.join_token)
         if payload is None:
             raise HTTPException(status_code=401, detail="invalid, expired, or already used join token")
         worker_id = str(payload["worker_id"])
@@ -340,6 +508,10 @@ def create_app(database: str | Path | None = None):
         detected_resource_classes = set(request.resource_classes)
         if not detected_resource_classes.issubset(approved_resource_classes):
             raise HTTPException(status_code=422, detail="node resource classes exceed the enrollment token")
+        consumed = store.consume_enrollment_token(request.join_token)
+        if consumed is None:
+            raise HTTPException(status_code=409, detail="enrollment token was already consumed")
+        payload = consumed
         capabilities = tuple(sorted(approved_capabilities))
         resource_classes = tuple(sorted(approved_resource_classes))
         worker = WorkerRecord(
@@ -348,7 +520,7 @@ def create_app(database: str | Path | None = None):
             queues=tuple(payload.get("queues") or ("default",)),
             resource_classes=resource_classes,
             region=payload.get("region"),
-            metadata={"node_id": payload.get("node_id"), "role": payload.get("role", "worker"), **metadata},
+            metadata={**metadata, "node_id": payload.get("node_id"), "role": payload.get("role", "worker")},
         )
         registered = store.register_worker(worker)
         worker_token = new_secret()
@@ -414,7 +586,10 @@ def create_app(database: str | Path | None = None):
         }
         if artifact_identifier:
             manifest["artifact_id"] = artifact_identifier
-        task = store.register_task(TaskRecord(request.task_ref, task_path, requested_kind or "unknown", manifest))
+        try:
+            task = store.register_task(TaskRecord(request.task_ref, task_path, requested_kind or "unknown", manifest))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return task.as_dict()
 
     @app.get("/v1/task-definitions", dependencies=[Depends(require_api_token)])
@@ -540,7 +715,10 @@ def create_app(database: str | Path | None = None):
             payload["artifact_path"] = _artifact_path(artifact_id)
         elif artifact_path:
             payload["artifact_path"], _ = _directory_artifact(artifact_path, "BRUNOST_AGENT_ROOT")
-        return store.register_definition("agent", request.agent_id, payload)
+        try:
+            return store.register_definition("agent", request.agent_id, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v1/agents", dependencies=[Depends(require_api_token)])
     def list_agents() -> list[dict[str, Any]]:
@@ -557,7 +735,10 @@ def create_app(database: str | Path | None = None):
     def register_game(request: GameDefinitionModel) -> dict[str, Any]:
         if store.get_task(request.task_ref) is None:
             raise HTTPException(status_code=404, detail=f"unknown task_ref: {request.task_ref}")
-        return store.register_definition("game", request.game_id, request.model_dump())
+        try:
+            return store.register_definition("game", request.game_id, request.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/v1/games", dependencies=[Depends(require_api_token)])
     def list_games() -> list[dict[str, Any]]:

@@ -95,7 +95,17 @@ class AgentGameRunner:
                 for agent in request.agents
             )
             with AgentRuntime(specs, limits=limits, seed=request.seed) as agents:
-                return referee.run(request, rng=random.Random(request.seed), agents=agents)
+                result = referee.run(request, rng=random.Random(request.seed), agents=agents)
+                metrics = dict(result.metrics)
+                metrics.setdefault("agent_runtime", agents.metrics())
+                return MatchResult(
+                    result.match_id,
+                    result.status,
+                    dict(result.scores),
+                    replay=dict(result.replay),
+                    metrics=metrics,
+                    failure_reason=result.failure_reason,
+                )
         except AgentRuntimeError as exc:
             return MatchResult(request.match_id, "failed", {}, failure_reason=f"agent runtime failure: {exc}"[:2000])
         except Exception as exc:  # noqa: BLE001 - referee failures become match results
