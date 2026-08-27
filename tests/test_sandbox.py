@@ -50,6 +50,28 @@ def test_docker_runner_uses_hardened_flags(tmp_path: Path, monkeypatch):
     assert result["status"] == "completed"
 
 
+def test_docker_runner_passes_model_evaluation_profile(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    task.mkdir()
+    submission.mkdir()
+    monkeypatch.setenv("BRUNOST_EVALUATION_PROFILE", "post_competition")
+    monkeypatch.setattr("brunost_judge.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+
+    def fake_run(command, **kwargs):
+        assert "BRUNOST_EVALUATION_PROFILE=post_competition" in command
+        volume_args = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--volume"]
+        output_mount = next(value for value in volume_args if value.endswith(":/workspace/output:rw"))
+        Path(output_mount.rsplit(":/workspace/output:rw", 1)[0]).joinpath("results.json").write_text(
+            '{"status":"completed","score":1}', encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("brunost_judge.sandbox.subprocess.run", fake_run)
+    result = DockerSandboxRunner("judge@sha256:" + "a" * 64, "runsc").run(submission, task, "exec-profile")
+    assert result["status"] == "completed"
+
+
 def test_docker_runner_selects_image_from_task_runtime(tmp_path: Path, monkeypatch):
     task = tmp_path / "task"
     submission = tmp_path / "submission"

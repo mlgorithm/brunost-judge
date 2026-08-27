@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,22 @@ from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
 
 LOGGER = logging.getLogger(__name__)
+
+
+@contextmanager
+def _evaluation_profile_environment(metadata: dict[str, Any]):
+    """Pass the selected ML evaluation profile into local or Docker sandboxes."""
+
+    profile = str(metadata.get("evaluation_profile") or "live").strip().lower()
+    previous = os.environ.get("BRUNOST_EVALUATION_PROFILE")
+    os.environ["BRUNOST_EVALUATION_PROFILE"] = profile
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("BRUNOST_EVALUATION_PROFILE", None)
+        else:
+            os.environ["BRUNOST_EVALUATION_PROFILE"] = previous
 
 
 def _callback_secret_from_environment() -> str | None:
@@ -255,7 +271,8 @@ class LocalWorker:
                             materialize=lambda value: self._materialize(value, stack),
                         )
                     runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(execution.metadata, task.manifest))
-                    raw = runner.run(submission, task_path, execution.execution_id)
+                    with _evaluation_profile_environment(execution.metadata):
+                        raw = runner.run(submission, task_path, execution.execution_id)
                     if self.store.is_cancel_requested(execution.execution_id):
                         raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
                     else:
@@ -457,7 +474,8 @@ class RemoteWorker:
                             materialize=lambda value: self._materialize(value, stack),
                         )
                     runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(metadata, task_manifest))
-                    raw = runner.run(submission, task_path, execution_id)
+                    with _evaluation_profile_environment(metadata):
+                        raw = runner.run(submission, task_path, execution_id)
                     if self.client.execution_cancel_requested(self.worker_id, execution_id):
                         raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
                     else:

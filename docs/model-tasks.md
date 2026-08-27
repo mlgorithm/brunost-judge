@@ -1,133 +1,151 @@
 # Model and ML tasks
 
-`model` tasks support two modes:
-
-- `scorer`: the legacy contract. The task scorer directly reads the uploaded
-  artifact and computes the result.
-- `python_code`: the standard train/predict contract. The Judge runs the
-  participant's Python entrypoint, then invokes the private scorer.
-
-The second mode is recommended for new Premium ML tasks.
-
-Premium publishes `python-3.13-ml-v1` for Python training tasks. The runtime
-image contains the portable CPU stack (`numpy`, `pandas`, `scikit-learn`, and
-`pyarrow`) in addition to the normal Judge tools. Operators must map that
-runtime to a separately built, digest-pinned sandbox image; the Judge never
-silently runs an ML task in the smaller default image.
+`model` tasks use one contract everywhere: participant code trains an artifact,
+the Judge runs prediction against each evaluation split, and an author-owned
+evaluator scores the resulting predictions. There is no artifact-only model
+mode and no model-specific `metrics.py` contract.
 
 ## Package layout
 
 ```text
 judge.yaml
-public/datasets/train.csv
+evaluator.py
+public/statement.md
+public/datasets/training.csv
+public/datasets/public-test.csv       optional
+public/datasets/public-labels.csv     optional
 private/datasets/test.csv
-private/datasets/test_labels.csv
-private/baseline.py             optional
-scorer/metrics.py
+private/datasets/labels.csv
+private/baseline.py                   optional
+private/post/training/...             optional
+private/post/test/...
+private/post/labels/...
+post_evaluator.py                      optional
 ```
 
-`test.csv` contains features only. `test_labels.csv` is private ground truth and
-is available to `scorer/metrics.py`, never to the participant process.
+The training dataset and an optional public test split are visible to
+participants. Private test features and labels are copied into isolated Judge
+workspaces only when the corresponding phase needs them. Private labels are
+never available to participant code.
 
 ## Manifest
 
 ```yaml
-version: 1
+version: 2
 kind: model
 runner: model
+model_contract: train_predict_v2
 runtime: python-3.13-ml-v1
-scoring: scorer.metrics:evaluate
+evaluation: evaluator:evaluate
 network: disabled
-time_limit_ms: 125000
+time_limit_ms: 150000
 training_time_limit_ms: 120000
+prediction_time_limit_ms: 10000
+evaluator_time_limit_ms: 10000
 memory_limit_mb: 2048
-public_dataset: public/datasets/train.csv
-hidden_dataset: private/datasets/test.csv
-hidden_labels_dataset: private/datasets/test_labels.csv
-submission_mode: python_code
-submission_language: python
+model_max_bytes: 64000000
+training_dataset: public/datasets/training.csv
+public_test_dataset: public/datasets/public-test.csv
+public_labels_dataset: public/datasets/public-labels.csv
+private_test_dataset: private/datasets/test.csv
+private_labels_dataset: private/datasets/labels.csv
 submission_entrypoint: submission.py
-prediction_output: predictions.csv
-prediction_max_bytes: 10000000
-official_split: private
 baseline_enabled: false
-metric: accuracy
-direction: maximize
-aggregation: mean
+post_competition_enabled: false
 ```
 
-`time_limit_ms` is the complete evaluator budget shared by the optional baseline,
-participant, and scorer. `training_time_limit_ms` is the per-process ceiling for
-the baseline and participant, but neither phase can extend the total deadline.
-Epoch counts are not inspected or capped: 2,000 epochs are valid if they finish
-before the remaining budget. A timeout, crash, memory violation, missing output,
-empty output, or output larger than `prediction_max_bytes` receives no score.
-The default prediction limit is 10 MB; task manifests may raise it up to 64 MB.
+The two public fields must be declared together. `model_max_bytes` limits the
+artifact produced by `train()` and is also bounded by the Judge's 64 MB safety
+limit. The total time limit is the complete budget; each phase also has its own
+ceiling. Premium calculates the total from the phase limits when it publishes a
+package.
 
 ## Submission contract
 
-The participant entrypoint is executed once with:
-
-```text
-BRUNOST_ML_PUBLIC_DATASET=/.../input/public/train.csv
-BRUNOST_ML_PRIVATE_DATASET=/.../input/private/test.csv
-BRUNOST_ML_OUTPUT_PATH=/.../output/predictions.csv
-BRUNOST_ML_SEED=42
-```
-
-The private dataset path contains features only. The output format is task-defined
-but must be a file at the configured path. The scorer can also read:
-
-```text
-BRUNOST_ML_PREDICTIONS_PATH
-BRUNOST_ML_PRIVATE_LABELS
-BRUNOST_ML_BASELINE_PREDICTIONS_PATH   optional
-```
-
-The scorer must return either a private numeric score or both public and private
-scores:
+The submitted module must define these functions:
 
 ```python
-def evaluate(submission_path: str, assets_path: str) -> dict:
-    private_score = ...
-    public_score = ...
-    return {
-        "public": public_score,
-        "private": private_score,
-        "metrics": {"metric": "accuracy"},
-    }
+def train(train_dataset: str, model_path: str) -> None:
+    # Read the visible training dataset and write a non-empty model artifact.
+    ...
+
+
+def predict(model_path: str, test_dataset: str, predictions_path: str) -> None:
+    # Read the model and test features and write a non-empty prediction file.
+    ...
 ```
 
-For this mode the Judge always uses `private` as the canonical `score`. Returning
-only a public value is an invalid result. The Premium platform is responsible for
-deciding when public/private details are visible to participants.
+Training and prediction run in separate processes and separate workspaces.
+Training cannot see the test features, private labels, or predictions. The
+artifact is copied read-only into prediction workspaces. Each prediction file
+must be non-empty and stay within the Judge output limit.
 
-The participant and scorer run in separate processes. Participant code receives
-only the documented ML variables plus basic runtime variables; private labels,
-baseline predictions, and scorer-only variables are not present during training.
-The scorer has a bounded JSON response and its own time and memory limits.
+Epoch counts are intentionally not interpreted by the Judge. A submission may
+run 2,000 epochs or any other number as long as it finishes within the training
+time limit and memory limit. The Judge terminates the process when the limit is
+reached.
+
+## Evaluator contract
+
+`evaluator.py` defines the author-owned scoring function:
+
+```python
+def evaluate(predictions_path: str, labels_path: str) -> float | dict:
+    # Read only these two files and return the score for this split.
+    return 0.0
+```
+
+It may return a finite number or:
+
+```python
+{
+    "score": 0.91,
+    "metrics": {"accuracy": 0.91},
+}
+```
+
+The Judge evaluates the public split first when it exists, then the private
+split. The participant's private score is the official live score. Baseline
+scores are reported as diagnostic metrics and never replace the participant's
+score. Returning the old `public`/`private` mapping is rejected for model v2.
 
 ## Baselines
 
-Set `baseline_enabled: true` and include `private/baseline.py` to enable a
-baseline. It receives the same public dataset, private test features, seed, and
-resource limits. Its predictions are exposed to the scorer through
-`BRUNOST_ML_BASELINE_PREDICTIONS_PATH`.
+With `baseline_enabled: true`, `private/baseline.py` must implement the same
+`train()` and `predict()` functions as a participant submission. It runs in an
+independent workspace and uses the same datasets and limits. It is useful for
+checking that the task data and evaluator are healthy; it is not an automatic
+normalization factor.
 
-The baseline is not used to normalize participant scores automatically. It is a
-reference and task-health check; the official score remains the participant's
-private metric.
+## Post-competition evaluation
 
-## Runtime image configuration
+Authors can enable a second, hidden leaderboard profile:
 
-Keep the default image for ordinary Python tasks and map the ML runtime explicitly
-in production:
+```yaml
+post_competition_enabled: true
+post_training_dataset: private/post/training/training.csv
+post_test_dataset: private/post/test/test.csv
+post_labels_dataset: private/post/labels/labels.csv
+post_training_time_limit_ms: 600000
+post_prediction_time_limit_ms: 10000
+post_evaluator_time_limit_ms: 60000
+post_evaluator_entrypoint: post_evaluator.py
+```
+
+The same submitted module is trained from scratch on the new training data,
+evaluated on the new hidden test set, and scored with `post_evaluator.py` (or
+the live evaluator if no separate code is supplied by Premium). Workers select
+this profile through execution metadata; it is not participant-controlled.
+Premium can keep the result in a separate post-competition leaderboard.
+
+## Runtime image
+
+Premium publishes `python-3.13-ml-v1`. Operators must map that runtime to a
+digest-pinned sandbox image containing the supported CPU ML libraries:
 
 ```text
-BRUNOST_JUDGE_SANDBOX_IMAGE=...@sha256:<digest>
 BRUNOST_JUDGE_SANDBOX_IMAGES={"python-3.13":"...@sha256:<digest>","python-3.13-ml-v1":"...@sha256:<digest>"}
 ```
 
-`BRUNOST_JUDGE_SANDBOX_IMAGES` is JSON. Every image reference must be pinned by
-digest in production, and a task with an unmapped non-default runtime fails
-closed before Docker starts.
+If the ML runtime is not mapped, the Judge fails closed before starting the
+container. The standard Python image is not used as an implicit fallback.

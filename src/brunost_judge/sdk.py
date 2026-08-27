@@ -78,7 +78,18 @@ class JudgeClient:
     def audit_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self._request("GET", f"/v1/audit?limit={max(1, min(1000, int(limit)))}")  # type: ignore[return-value]
 
-    def register_task(self, *, task_ref: str, path: str | None = None, artifact_id: str | None = None, kind: str | None = None) -> dict[str, Any]:
+    def register_task(
+        self,
+        *,
+        task_ref: str,
+        path: str | None = None,
+        artifact_id: str | None = None,
+        kind: str | None = None,
+        version: int | None = None,
+        runtime: str | None = None,
+        evaluator: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {"task_ref": task_ref}
         if path:
             payload["path"] = path
@@ -86,6 +97,14 @@ class JudgeClient:
             payload["artifact_id"] = artifact_id
         if kind:
             payload["kind"] = kind
+        if version is not None:
+            payload["version"] = version
+        if runtime:
+            payload["runtime"] = runtime
+        if evaluator:
+            payload["evaluator"] = evaluator
+        if metadata:
+            payload["metadata"] = metadata
         return self._request("POST", "/v1/tasks", payload)
 
     def upload_artifact(self, path: str | Path, *, artifact_id: str | None = None) -> dict[str, Any]:

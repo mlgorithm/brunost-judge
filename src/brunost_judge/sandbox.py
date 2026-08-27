@@ -222,6 +222,9 @@ class DockerSandboxRunner:
             plugin_module = os.environ.get("BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE", "").strip()
             if plugin_module:
                 command.extend(["--env", f"BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE={plugin_module}"])
+            evaluation_profile = os.environ.get("BRUNOST_EVALUATION_PROFILE", "").strip()
+            if evaluation_profile:
+                command.extend(["--env", f"BRUNOST_EVALUATION_PROFILE={evaluation_profile}"])
             command.extend([image, "python", "-m", "grader.evaluate"])
             try:
                 completed = subprocess.run(

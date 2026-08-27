@@ -8,6 +8,7 @@ the CLI without a large framework.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import re
 from dataclasses import dataclass
@@ -15,18 +16,20 @@ from pathlib import Path
 
 SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "model", "output-only"})
 # These are the task kinds executed by the built-in scorer sandbox.
-SCORER_KINDS = frozenset({"ioai", "model", "output-only"})
+SCORER_KINDS = frozenset({"ioai", "output-only"})
+MODEL_KINDS = frozenset({"model"})
 CLASSIC_KINDS = frozenset({"icpc"})
 INTERACTIVE_KINDS = frozenset({"interactive"})
 PLUGIN_KINDS = frozenset({"agent", "game"})
-BUILTIN_KINDS = SCORER_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
+BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
 MANIFEST_VERSION = 1
+MODEL_MANIFEST_VERSION = 2
 CLASSIC_LANGUAGES = frozenset({"python", "py", "c", "cpp", "c++", "c++17", "gnu++17", "g++", "rust", "rs"})
-MODEL_SUBMISSION_MODES = frozenset({"scorer", "python_code"})
 MAX_MODEL_ASSET_BYTES = 10_000_000
+MAX_MODEL_CODE_BYTES = 1_000_000
 MAX_MODEL_PREDICTION_BYTES = 64_000_000
 MIN_MODEL_TIME_MS = 1_000
-MAX_MODEL_TIME_MS = 900_000
+MAX_MODEL_TIME_MS = 3_600_000
 MIN_MODEL_MEMORY_MB = 64
 MAX_MODEL_MEMORY_MB = 16_384
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
@@ -58,8 +61,66 @@ def _manifest_field(manifest: str, name: str) -> str | None:
 
 def _validate_relative_path(value: str, label: str, errors: list[str]) -> None:
     path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
+    if path.is_absolute() or "\\" in value or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         errors.append(f"{label} must stay inside the task directory")
+
+
+def _validate_python_functions(root: Path, relative: str, label: str, names: tuple[str, ...], errors: list[str]) -> None:
+    path = root / relative
+    if not path.is_file():
+        return
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+    except (OSError, UnicodeDecodeError, SyntaxError) as exc:
+        errors.append(f"{label} has invalid Python syntax: {exc}")
+        return
+    defined = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in names:
+        if name not in defined:
+            errors.append(f"{label} must define {name}()")
+
+
+def _validate_model_asset(
+    root: Path,
+    value: str,
+    field: str,
+    errors: list[str],
+    *,
+    directory: str,
+) -> None:
+    """Validate a model asset's path, visibility boundary, and size."""
+
+    _validate_relative_path(value, field, errors)
+    asset_path = (root / value).resolve()
+    task_root = root.resolve()
+    if asset_path == task_root or task_root not in asset_path.parents:
+        errors.append(f"{field} must stay inside the task directory")
+        return
+    if not asset_path.as_posix().startswith(f"{(task_root / directory).resolve().as_posix()}/"):
+        errors.append(f"{field} must be stored under {directory}/")
+    if not asset_path.is_file():
+        errors.append(f"model task needs {field}: {value}")
+    elif asset_path.stat().st_size > MAX_MODEL_ASSET_BYTES:
+        errors.append(f"model asset {value} exceeds {MAX_MODEL_ASSET_BYTES} bytes")
+
+
+def _validate_model_code(root: Path, relative: str, label: str, names: tuple[str, ...], errors: list[str]) -> None:
+    path = (root / relative).resolve()
+    task_root = root.resolve()
+    if path == task_root or task_root not in path.parents:
+        errors.append(f"{label} must stay inside the task directory")
+        return
+    if not path.is_file():
+        errors.append(f"model task needs {relative}")
+        return
+    if path.stat().st_size > MAX_MODEL_CODE_BYTES:
+        errors.append(f"model code {relative} exceeds {MAX_MODEL_CODE_BYTES} bytes")
+        return
+    _validate_python_functions(root, relative, label, names, errors)
 
 
 def _validate_positive_field(manifest: str, name: str, errors: list[str]) -> None:
@@ -81,84 +142,116 @@ def _manifest_bool(manifest: str, name: str, default: bool = False) -> bool:
 
 
 def _validate_model_manifest(root: Path, manifest: str, errors: list[str]) -> None:
-    """Validate the explicit model-training contract when one is declared.
+    """Validate the strict v2 train/model/predict contract."""
 
-    Older model packages remain scorer-backed and are intentionally accepted
-    without these fields. New Python training packages opt into the stricter
-    lifecycle with ``submission_mode: python_code``.
-    """
-
-    submission_mode = (_manifest_field(manifest, "submission_mode") or "scorer").lower()
-    if submission_mode not in MODEL_SUBMISSION_MODES:
-        errors.append("model submission_mode must be scorer or python_code")
-        return
-    if submission_mode != "python_code":
-        return
+    legacy_fields = {
+        "public_dataset", "hidden_dataset", "hidden_labels_dataset", "submission_mode",
+        "submission_language", "prediction_output", "prediction_max_bytes", "official_split",
+        "scoring", "scoring_code", "metric", "direction", "aggregation",
+    }
+    for field in sorted(legacy_fields):
+        if _manifest_field(manifest, field) is not None:
+            errors.append(f"legacy model field {field} is not supported")
+    if _manifest_field(manifest, "model_contract") != "train_predict_v2":
+        errors.append("model tasks must declare model_contract: train_predict_v2")
 
     if _manifest_field(manifest, "runner") not in {"model"}:
-        errors.append("python_code model tasks must declare runner: model")
-    if (_manifest_field(manifest, "official_split") or "private").lower() != "private":
-        errors.append("model official_split must be private")
-    if (_manifest_field(manifest, "submission_language") or "python").lower() not in {"python", "py"}:
-        errors.append("python_code model submissions must use Python")
-    if not (_manifest_field(manifest, "runtime") or "").strip():
-        errors.append("python_code model tasks must declare runtime")
+        errors.append("model tasks must declare runner: model")
+    if (_manifest_field(manifest, "runtime") or "") != "python-3.13-ml-v1":
+        errors.append("model tasks must use runtime: python-3.13-ml-v1")
+    if (_manifest_field(manifest, "evaluation") or "") != "evaluator:evaluate":
+        errors.append("model tasks must declare evaluation: evaluator:evaluate")
 
     entrypoint = _manifest_field(manifest, "submission_entrypoint") or "submission.py"
     _validate_relative_path(entrypoint, "submission_entrypoint", errors)
-    output = _manifest_field(manifest, "prediction_output") or "predictions.csv"
-    _validate_relative_path(output, "prediction_output", errors)
-    for field in ("time_limit_ms", "training_time_limit_ms", "memory_limit_mb"):
+    for field in ("time_limit_ms", "training_time_limit_ms", "prediction_time_limit_ms", "evaluator_time_limit_ms", "memory_limit_mb", "model_max_bytes"):
         _validate_positive_field(manifest, field, errors)
-    prediction_limit = _manifest_field(manifest, "prediction_max_bytes")
-    if prediction_limit is not None:
+    model_limit = _manifest_field(manifest, "model_max_bytes")
+    if model_limit is not None:
         try:
-            if not 1_024 <= int(prediction_limit) <= MAX_MODEL_PREDICTION_BYTES:
+            if not 1_024 <= int(model_limit) <= MAX_MODEL_PREDICTION_BYTES:
                 raise ValueError
         except ValueError:
-            errors.append(f"prediction_max_bytes must be between 1024 and {MAX_MODEL_PREDICTION_BYTES}")
+            errors.append(f"model_max_bytes must be between 1024 and {MAX_MODEL_PREDICTION_BYTES}")
     try:
         total = int(_manifest_field(manifest, "time_limit_ms") or "0")
-        training = int(_manifest_field(manifest, "training_time_limit_ms") or str(total))
+        training = int(_manifest_field(manifest, "training_time_limit_ms") or "0")
+        prediction = int(_manifest_field(manifest, "prediction_time_limit_ms") or "0")
+        evaluator = int(_manifest_field(manifest, "evaluator_time_limit_ms") or "0")
         memory = int(_manifest_field(manifest, "memory_limit_mb") or "0")
-        if not MIN_MODEL_TIME_MS <= total <= MAX_MODEL_TIME_MS:
-            errors.append(f"time_limit_ms must be between {MIN_MODEL_TIME_MS} and {MAX_MODEL_TIME_MS}")
-        if not MIN_MODEL_TIME_MS <= training <= total:
-            errors.append(f"training_time_limit_ms must be between {MIN_MODEL_TIME_MS} and time_limit_ms")
+        if not MIN_MODEL_TIME_MS <= total <= 3_600_000:
+            errors.append("time_limit_ms must be between 1000 and 3600000")
+        for value, label in ((training, "training_time_limit_ms"), (prediction, "prediction_time_limit_ms"), (evaluator, "evaluator_time_limit_ms")):
+            if not MIN_MODEL_TIME_MS <= value <= 3_600_000:
+                errors.append(f"{label} must be between 1000 and 3600000")
         if not MIN_MODEL_MEMORY_MB <= memory <= MAX_MODEL_MEMORY_MB:
             errors.append(f"memory_limit_mb must be between {MIN_MODEL_MEMORY_MB} and {MAX_MODEL_MEMORY_MB}")
     except ValueError:
         pass
 
-    task_root = root.resolve()
-    for field in ("public_dataset", "hidden_dataset", "hidden_labels_dataset"):
+    for field in ("training_dataset", "private_test_dataset", "private_labels_dataset"):
         value = _manifest_field(manifest, field)
         if not value:
-            errors.append(f"python_code model tasks must declare {field}")
+            errors.append(f"model tasks must declare {field}")
             continue
-        _validate_relative_path(value, field, errors)
-        asset_path = (root / value).resolve()
-        if asset_path != task_root and task_root not in asset_path.parents:
-            errors.append(f"{field} must stay inside the task directory")
-        elif not asset_path.is_file():
-            errors.append(f"model task needs {value}")
-        elif asset_path.stat().st_size > MAX_MODEL_ASSET_BYTES:
-            errors.append(f"model asset {value} exceeds {MAX_MODEL_ASSET_BYTES} bytes")
+        directory = "public/datasets" if field == "training_dataset" else "private/datasets"
+        _validate_model_asset(root, value, field, errors, directory=directory)
+
+    public_test = _manifest_field(manifest, "public_test_dataset")
+    public_labels = _manifest_field(manifest, "public_labels_dataset")
+    if bool(public_test) != bool(public_labels):
+        errors.append("public_test_dataset and public_labels_dataset must be declared together")
+    for field in ("public_test_dataset", "public_labels_dataset"):
+        value = _manifest_field(manifest, field)
+        if value:
+            _validate_model_asset(root, value, field, errors, directory="public/datasets")
 
     baseline_enabled = _manifest_bool(manifest, "baseline_enabled", bool(_manifest_field(manifest, "baseline_entrypoint")))
     if baseline_enabled:
-        if (_manifest_field(manifest, "baseline_language") or "python").lower() not in {"python", "py"}:
-            errors.append("python_code model baselines must use Python")
         baseline_entrypoint = _manifest_field(manifest, "baseline_entrypoint") or "private/baseline.py"
-        _validate_relative_path(baseline_entrypoint, "baseline_entrypoint", errors)
-        if not (root / baseline_entrypoint).is_file():
-            errors.append(f"model task needs {baseline_entrypoint}")
-    direction = (_manifest_field(manifest, "direction") or "maximize").lower()
-    if direction not in {"maximize", "minimize"}:
-        errors.append("model direction must be maximize or minimize")
-    aggregation = (_manifest_field(manifest, "aggregation") or "mean").lower()
-    if aggregation not in {"mean", "weighted_mean"}:
-        errors.append("model aggregation must be mean or weighted_mean")
+        _validate_model_code(root, baseline_entrypoint, "baseline entrypoint", ("train", "predict"), errors)
+    post_enabled = _manifest_bool(manifest, "post_competition_enabled")
+    if post_enabled:
+        for field in ("post_training_dataset", "post_test_dataset", "post_labels_dataset", "post_training_time_limit_ms", "post_prediction_time_limit_ms", "post_evaluator_time_limit_ms", "post_evaluator_entrypoint"):
+            value = _manifest_field(manifest, field)
+            if not value:
+                errors.append(f"post-competition model tasks must declare {field}")
+                continue
+            if field.endswith("_dataset"):
+                directory = {
+                    "post_training_dataset": "private/post/training",
+                    "post_test_dataset": "private/post/test",
+                    "post_labels_dataset": "private/post/labels",
+                }[field]
+                _validate_model_asset(root, value, field, errors, directory=directory)
+            elif field == "post_evaluator_entrypoint":
+                _validate_model_code(root, value, "post evaluator", ("evaluate",), errors)
+            else:
+                _validate_positive_field(manifest, field, errors)
+
+    try:
+        total = int(_manifest_field(manifest, "time_limit_ms") or "0")
+        training = int(_manifest_field(manifest, "training_time_limit_ms") or "0")
+        prediction = int(_manifest_field(manifest, "prediction_time_limit_ms") or "0")
+        evaluator = int(_manifest_field(manifest, "evaluator_time_limit_ms") or "0")
+        solutions = 2 if baseline_enabled else 1
+        live_splits = 2 if public_test else 1
+        live_budget = solutions * (training + live_splits * prediction + live_splits * evaluator) + 5_000
+        if total < live_budget:
+            errors.append("time_limit_ms must cover all live model phases")
+        if live_budget > MAX_MODEL_TIME_MS:
+            errors.append("live model evaluation budget exceeds 3600000 ms")
+        if post_enabled:
+            post_training = int(_manifest_field(manifest, "post_training_time_limit_ms") or "0")
+            post_prediction = int(_manifest_field(manifest, "post_prediction_time_limit_ms") or "0")
+            post_evaluator = int(_manifest_field(manifest, "post_evaluator_time_limit_ms") or "0")
+            post_budget = solutions * (post_training + post_prediction + post_evaluator) + 5_000
+            if total < post_budget:
+                errors.append("time_limit_ms must cover all post-competition model phases")
+            if post_budget > MAX_MODEL_TIME_MS:
+                errors.append("post-competition model evaluation budget exceeds 3600000 ms")
+    except ValueError:
+        pass
 
 
 def validate_task(path: str | Path) -> TaskValidation:
@@ -177,13 +270,13 @@ def validate_task(path: str | Path) -> TaskValidation:
             errors.append("judge.yaml must declare a kind")
         elif kind not in SUPPORTED_KINDS:
             errors.append(f"unsupported task kind {kind!r}; choose one of {sorted(SUPPORTED_KINDS)}")
-
     manifest_text = manifest_path.read_text(encoding="utf-8") if manifest_path.is_file() else ""
     version = _manifest_field(manifest_text, "version")
+    expected_version = MODEL_MANIFEST_VERSION if kind == "model" else MANIFEST_VERSION
     if version is None:
-        errors.append("judge.yaml must declare version: 1")
-    elif version != str(MANIFEST_VERSION):
-        errors.append(f"unsupported judge.yaml version {version!r}; choose {MANIFEST_VERSION}")
+        errors.append(f"judge.yaml must declare version: {expected_version}")
+    elif version != str(expected_version):
+        errors.append(f"unsupported judge.yaml version {version!r}; choose {expected_version}")
     if kind in CLASSIC_KINDS:
         if _manifest_field(manifest_text, "runner") not in {None, "classic"}:
             errors.append("classic tasks must declare runner: classic")
@@ -240,8 +333,12 @@ def validate_task(path: str | Path) -> TaskValidation:
             errors.append(f"{kind} tasks need {entrypoint}")
     elif kind == "model":
         _validate_model_manifest(root, manifest_text, errors)
-        if not (root / "scorer" / "metrics.py").is_file() and not (root / "metrics.py").is_file():
-            errors.append("missing scorer/metrics.py (or legacy root metrics.py)")
+        if not (root / "evaluator.py").is_file():
+            errors.append("missing evaluator.py")
+        elif (root / "evaluator.py").stat().st_size > MAX_MODEL_CODE_BYTES:
+            errors.append(f"model code evaluator.py exceeds {MAX_MODEL_CODE_BYTES} bytes")
+        else:
+            _validate_python_functions(root, "evaluator.py", "evaluator", ("evaluate",), errors)
     elif not (root / "scorer" / "metrics.py").is_file() and not (root / "metrics.py").is_file():
         errors.append("missing scorer/metrics.py (or legacy root metrics.py)")
     if not (root / "public").is_dir():
@@ -283,7 +380,6 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
     if root.exists() and any(root.iterdir()) and not force:
         raise FileExistsError(f"refusing to overwrite non-empty directory: {root}")
 
-    (root / "scorer").mkdir(parents=True, exist_ok=True)
     (root / "public").mkdir(parents=True, exist_ok=True)
     (root / "private").mkdir(parents=True, exist_ok=True)
     (root / "tests").mkdir(parents=True, exist_ok=True)
@@ -296,7 +392,64 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
             "Add matching .in/.ans files here, then choose scoring_mode: all_or_nothing or percentage.\n",
             encoding="utf-8",
         )
+    elif normalized_kind == "model":
+        (root / "public" / "datasets").mkdir(parents=True, exist_ok=True)
+        (root / "private" / "datasets").mkdir(parents=True, exist_ok=True)
+        (root / "public" / "datasets" / "training.csv").write_text("feature,label\n1,0\n", encoding="utf-8")
+        (root / "private" / "datasets" / "test.csv").write_text("feature\n2\n", encoding="utf-8")
+        (root / "private" / "datasets" / "labels.csv").write_text("label\n1\n", encoding="utf-8")
+        (root / "judge.yaml").write_text(
+            """# Brunost Judge model task manifest (train_predict_v2)
+version: 2
+kind: model
+runner: model
+model_contract: train_predict_v2
+runtime: python-3.13-ml-v1
+evaluation: evaluator:evaluate
+network: disabled
+time_limit_ms: 150000
+training_time_limit_ms: 120000
+prediction_time_limit_ms: 10000
+evaluator_time_limit_ms: 10000
+memory_limit_mb: 2048
+model_max_bytes: 64000000
+training_dataset: public/datasets/training.csv
+private_test_dataset: private/datasets/test.csv
+private_labels_dataset: private/datasets/labels.csv
+submission_entrypoint: submission.py
+baseline_enabled: false
+post_competition_enabled: false
+""",
+            encoding="utf-8",
+        )
+        (root / "evaluator.py").write_text(
+            '''"""Official split evaluator. It must return one numeric score."""
+
+
+def evaluate(predictions_path: str, labels_path: str) -> float:
+    _ = predictions_path, labels_path
+    return 0.0
+''',
+            encoding="utf-8",
+        )
+        (root / "submission.example.py").write_text(
+            '''"""Participant module contract."""
+
+
+def train(train_dataset: str, model_path: str) -> None:
+    with open(model_path, "wb") as model:
+        model.write(b"replace with a trained model")
+
+
+def predict(model_path: str, test_dataset: str, predictions_path: str) -> None:
+    _ = model_path, test_dataset
+    with open(predictions_path, "w", encoding="utf-8") as predictions:
+        predictions.write("prediction\\n")
+''',
+            encoding="utf-8",
+        )
     else:
+        (root / "scorer").mkdir(parents=True, exist_ok=True)
         runner = "\nrunner: python" if normalized_kind in PLUGIN_KINDS else ""
         (root / "judge.yaml").write_text(
             f"""# Brunost Judge task manifest\nversion: 1\nkind: {normalized_kind}{runner}\nruntime: python-3.13\nscoring: scorer.metrics:evaluate\nnetwork: disabled\n\n# Add resource_profile and feedback policy before publishing an official task.\n""",
@@ -311,7 +464,8 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
                 '''"""Reference agent/game runner. Return a canonical result mapping."""\n\n\ndef run(context: dict) -> dict:\n    _ = context\n    return {"status": "completed", "score": 0.0, "metrics": {}}\n''',
                 encoding="utf-8",
             )
-    (root / "public" / "README.md").write_text("Put contestant-visible data here.\n", encoding="utf-8")
+    if normalized_kind != "model":
+        (root / "public" / "README.md").write_text("Put contestant-visible data here.\n", encoding="utf-8")
     (root / "private" / ".gitkeep").write_text("", encoding="utf-8")
     (root / "tests" / "test_task.py").write_text(
         """# Add deterministic scorer tests here.\n""",

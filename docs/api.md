@@ -34,8 +34,10 @@ Set `timeout_seconds` on an evaluation for a per-run wall-clock limit. A
 running worker checks cancellation at the sandbox boundary and records a
 finished-after-cancel run as `canceled`.
 
-`ioai`, `model`, and `output-only` tasks use the scorer contract. `icpc` tasks
-use the classic batch runner and return structured compile, test, scoring,
+`ioai` and `output-only` tasks use the generic scorer contract. `model` tasks
+use the v2 train/model/predict contract documented in
+[`model-tasks.md`](model-tasks.md). `icpc` tasks use the classic batch runner
+and return structured compile, test, scoring,
 verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
 runner-plugin contract; registered participant artifacts are staged into the

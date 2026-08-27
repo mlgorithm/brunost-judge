@@ -193,44 +193,71 @@ def _write_train_predict_task(
     training_ms: int = 5_000,
     total_ms: int | None = None,
     baseline: bool = False,
-    scorer_code: str | None = None,
+    evaluator_code: str | None = None,
+    public: bool = False,
+    post: bool = False,
 ) -> None:
     (root / "public" / "datasets").mkdir(parents=True)
     (root / "private" / "datasets").mkdir(parents=True)
-    (root / "scorer").mkdir()
+    (root / "private" / "post").mkdir(parents=True)
     (root / "public" / "datasets" / "train.csv").write_text("x,label\n1,0\n", encoding="utf-8")
     (root / "private" / "datasets" / "test.csv").write_text("x\n2\n", encoding="utf-8")
     (root / "private" / "datasets" / "labels.csv").write_text("label\n1\n", encoding="utf-8")
+    if public:
+        (root / "public" / "datasets" / "public-test.csv").write_text("x\n3\n", encoding="utf-8")
+        (root / "public" / "datasets" / "public-labels.csv").write_text("label\n1\n", encoding="utf-8")
+    if post:
+        (root / "private" / "post" / "training.csv").write_text("x,label\n4,0\n", encoding="utf-8")
+        (root / "private" / "post" / "test.csv").write_text("x\n5\n", encoding="utf-8")
+        (root / "private" / "post" / "labels.csv").write_text("label\n1\n", encoding="utf-8")
+        (root / "post_evaluator.py").write_text("def evaluate(predictions_path, labels_path): return 0.55\n", encoding="utf-8")
+    total = total_ms if total_ms is not None else training_ms + 25_000
+    lines = [
+        "version: 2",
+        "kind: model",
+        "runner: model",
+        "model_contract: train_predict_v2",
+        "runtime: python-3.13-ml-v1",
+        "evaluation: evaluator:evaluate",
+        "network: disabled",
+        f"time_limit_ms: {total}",
+        f"training_time_limit_ms: {training_ms}",
+        "prediction_time_limit_ms: 10000",
+        "evaluator_time_limit_ms: 10000",
+        "memory_limit_mb: 512",
+        "model_max_bytes: 64000000",
+        "training_dataset: public/datasets/train.csv",
+        "private_test_dataset: private/datasets/test.csv",
+        "private_labels_dataset: private/datasets/labels.csv",
+        "submission_entrypoint: submission.py",
+        "baseline_enabled: " + ("true" if baseline else "false"),
+        "post_competition_enabled: " + ("true" if post else "false"),
+    ]
+    if public:
+        lines.extend(["public_test_dataset: public/datasets/public-test.csv", "public_labels_dataset: public/datasets/public-labels.csv"])
+    if baseline:
+        lines.append("baseline_entrypoint: private/baseline.py")
+    if post:
+        lines.extend([
+            "post_training_dataset: private/post/training.csv",
+            "post_test_dataset: private/post/test.csv",
+            "post_labels_dataset: private/post/labels.csv",
+            "post_training_time_limit_ms: 600000",
+            "post_prediction_time_limit_ms: 10000",
+            "post_evaluator_time_limit_ms: 60000",
+            "post_evaluator_entrypoint: post_evaluator.py",
+        ])
     (root / "judge.yaml").write_text(
-        "\n".join([
-            "version: 1",
-            "kind: model",
-            "runner: model",
-            "runtime: python-3.13-ml-v1",
-            "scoring: scorer.metrics:evaluate",
-            "network: disabled",
-            f"time_limit_ms: {total_ms if total_ms is not None else training_ms + 5000}",
-            "training_time_limit_ms: " + str(training_ms),
-            "memory_limit_mb: 512",
-            "public_dataset: public/datasets/train.csv",
-            "hidden_dataset: private/datasets/test.csv",
-            "hidden_labels_dataset: private/datasets/labels.csv",
-            "submission_mode: python_code",
-            "submission_language: python",
-            "submission_entrypoint: submission.py",
-            "prediction_output: predictions.csv",
-            "official_split: private",
-            "baseline_enabled: " + ("true" if baseline else "false"),
-        ]) + "\n",
+        "\n".join(lines) + "\n",
         encoding="utf-8",
     )
-    (root / "scorer" / "metrics.py").write_text(
-        scorer_code or """import os\n\ndef evaluate(submission_path, assets_path):\n    assert os.environ['BRUNOST_ML_PRIVATE_LABELS'].endswith('labels.csv')\n    assert os.path.isfile(os.environ['BRUNOST_ML_PREDICTIONS_PATH'])\n    if os.environ.get('BRUNOST_ML_BASELINE_PREDICTIONS_PATH'):\n        assert os.path.isfile(os.environ['BRUNOST_ML_BASELINE_PREDICTIONS_PATH'])\n    return {'public': 0.25, 'private': 0.75}\n""",
+    (root / "evaluator.py").write_text(
+        evaluator_code or """import os\nfrom pathlib import Path\n\ndef evaluate(predictions_path, labels_path):\n    assert Path(predictions_path).is_file()\n    assert Path(labels_path).read_text() == 'label\\n1\\n'\n    split = os.environ.get('BRUNOST_ML_SPLIT')\n    return 0.25 if split == 'public' else 0.75\n""",
         encoding="utf-8",
     )
     if baseline:
         (root / "private" / "baseline.py").write_text(
-            "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('baseline\\n1\\n')\n",
+            "def train(train_dataset, model_path):\n    open(model_path, 'wb').write(b'baseline')\n\ndef predict(model_path, test_dataset, predictions_path):\n    open(predictions_path, 'w').write('baseline\\n')\n",
             encoding="utf-8",
         )
     submission = root.parent / "submission"
@@ -243,7 +270,8 @@ def test_run_model_training_submission_uses_private_score_and_allows_many_epochs
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        """import os\nfrom pathlib import Path\nfor _ in range(2000):\n    pass\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n""",
+        """from pathlib import Path\ndef train(train_dataset, model_path):\n    for _ in range(2000):\n        pass\n    Path(model_path).write_bytes(b'model')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('prediction\\n')\n""",
+        public=True,
     )
     submission = assets.parent / "submission"
     r = run(str(submission), str(assets))
@@ -251,12 +279,13 @@ def test_run_model_training_submission_uses_private_score_and_allows_many_epochs
     assert r["score"] == pytest.approx(0.75)
     assert r["metrics"]["public"] == pytest.approx(0.25)
     assert r["metrics"]["private"] == pytest.approx(0.75)
+    assert r["metrics"]["profile"] == "live"
 
 
 def test_run_model_training_submission_times_out(tmp_path):
     assets = tmp_path / "assets"
     assets.mkdir()
-    _write_train_predict_task(assets, """import time\ntime.sleep(1)\n""", training_ms=100)
+    _write_train_predict_task(assets, """import time\ndef train(train_dataset, model_path):\n    time.sleep(1)\ndef predict(model_path, test_dataset, predictions_path):\n    pass\n""", training_ms=100)
     submission = assets.parent / "submission"
     r = run(str(submission), str(assets))
     assert r["status"] == "failed"
@@ -268,7 +297,7 @@ def test_run_model_training_submission_can_use_optional_baseline(tmp_path):
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n",
+        "from pathlib import Path\ndef train(train_dataset, model_path):\n    Path(model_path).write_bytes(b'baseline-test')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('prediction\\n')\n",
         baseline=True,
     )
     submission = assets.parent / "submission"
@@ -282,13 +311,13 @@ def test_run_model_training_uses_one_total_budget_for_baseline_and_submission(tm
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        "import time\ntime.sleep(0.15)\n",
+        "import time\nfrom pathlib import Path\ndef train(train_dataset, model_path):\n    time.sleep(0.15)\n    Path(model_path).write_bytes(b'model')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('prediction\\n')\n",
         training_ms=220,
         total_ms=250,
         baseline=True,
     )
     (assets / "private" / "baseline.py").write_text(
-        "import os, time\nfrom pathlib import Path\ntime.sleep(0.15)\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('baseline\\n')\n",
+        "import time\nfrom pathlib import Path\ndef train(train_dataset, model_path):\n    time.sleep(0.15)\n    Path(model_path).write_bytes(b'baseline')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('baseline\\n')\n",
         encoding="utf-8",
     )
     r = run(str(assets.parent / "submission"), str(assets))
@@ -302,12 +331,11 @@ def test_run_model_training_does_not_inherit_unapproved_environment(tmp_path, mo
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('leaked' if os.environ.get('BRUNOST_PRIVATE_SENTINEL') else 'clean')\n",
-        scorer_code="""from pathlib import Path
+        "from pathlib import Path\ndef train(train_dataset, model_path):\n    Path(model_path).write_text('clean' if not __import__('os').environ.get('BRUNOST_PRIVATE_SENTINEL') else 'leaked')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text(Path(model_path).read_text())\n",
+        evaluator_code="""from pathlib import Path
 
-def evaluate(submission_path, assets_path):
-    value = Path(submission_path, 'predictions.csv').read_text()
-    return {'private': 1.0 if value == 'clean' else 0.0}
+def evaluate(predictions_path, labels_path):
+    return 1.0 if Path(predictions_path).read_text() == 'clean' else 0.0
 """,
     )
     r = run(str(assets.parent / "submission"), str(assets))
@@ -320,29 +348,39 @@ def test_run_model_training_rejects_empty_prediction_output(tmp_path):
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('')\n",
+        "from pathlib import Path\ndef train(train_dataset, model_path):\n    Path(model_path).write_bytes(b'model')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('')\n",
     )
     r = run(str(assets.parent / "submission"), str(assets))
     assert r["status"] == "failed"
     assert "empty" in r["failure_reason"]
 
 
-def test_run_model_training_submission_rejects_output_escape(tmp_path):
+def test_run_model_training_rejects_empty_model(tmp_path):
     assets = tmp_path / "assets"
     assets.mkdir()
     _write_train_predict_task(
         assets,
-        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('prediction\\n1\\n')\n",
-    )
-    manifest = assets / "judge.yaml"
-    manifest.write_text(
-        manifest.read_text(encoding="utf-8").replace("prediction_output: predictions.csv", "prediction_output: ../escape.csv"),
-        encoding="utf-8",
+        "from pathlib import Path\ndef train(train_dataset, model_path):\n    Path(model_path).write_bytes(b'')\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_text('prediction\\n')\n",
     )
     submission = assets.parent / "submission"
     r = run(str(submission), str(assets))
     assert r["status"] == "failed"
-    assert "prediction output" in r["failure_reason"]
+    assert "model.bin" in r["failure_reason"]
+
+
+def test_run_model_post_competition_profile_uses_new_data(tmp_path, monkeypatch):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "from pathlib import Path\ndef train(train_dataset, model_path):\n    Path(model_path).write_bytes(Path(train_dataset).read_bytes())\ndef predict(model_path, test_dataset, predictions_path):\n    Path(predictions_path).write_bytes(Path(model_path).read_bytes())\n",
+        post=True,
+    )
+    monkeypatch.setenv("BRUNOST_EVALUATION_PROFILE", "post_competition")
+    r = run(str(assets.parent / "submission"), str(assets))
+    assert r["status"] == "completed", r
+    assert r["score"] == pytest.approx(0.55)
+    assert r["metrics"]["profile"] == "post_competition"
 
 
 def test_grader_has_no_backend_imports():

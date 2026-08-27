@@ -11,6 +11,17 @@ def test_task_scaffold_and_validation(tmp_path: Path, capsys):
     assert "valid task" in capsys.readouterr().out
 
 
+def test_model_task_scaffold_uses_v2_contract(tmp_path: Path):
+    task = tmp_path / "model-task"
+    assert main(["task", "new", "model", str(task)]) == 0
+    assert main(["task", "validate", str(task)]) == 0
+    manifest = (task / "judge.yaml").read_text(encoding="utf-8")
+    assert "version: 2" in manifest
+    assert "model_contract: train_predict_v2" in manifest
+    assert (task / "evaluator.py").is_file()
+    assert not (task / "scorer" / "metrics.py").exists()
+
+
 def test_task_validation_reports_missing_files(tmp_path: Path, capsys):
     task = tmp_path / "task"
     task.mkdir()

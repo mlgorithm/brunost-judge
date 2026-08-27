@@ -67,7 +67,9 @@ multi-node country deployment, put that root on replicated S3/MinIO-compatible
 object storage or deploy an equivalent artifact adapter; the worker protocol
 does not require shared POSIX mounts.
 
-Every task manifest must declare `version: 1`. Registration snapshots the task
+Every classic, interactive, plugin, and generic scorer manifest must declare
+`version: 1`; model manifests use `version: 2` and the `train_predict_v2`
+contract. Registration snapshots the task
 as a content-addressed artifact and workers verify its digest again immediately
 before evaluation. Generated Python bytecode is excluded from both snapshots
 and digests so local caches cannot change the task identity.

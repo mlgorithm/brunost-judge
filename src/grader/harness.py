@@ -1,6 +1,6 @@
-"""Scorer harness: run a task's metrics.py and normalize its output.
+"""Sandbox harness for generic scorer and v2 model task execution.
 
-Pure standard-library (the task's metrics.py may use numpy/pandas; the harness itself
+Pure standard-library (task evaluators may use numpy/pandas; the harness itself
 does not). No Brunost backend imports — this is the extraction seam (ADR-0010).
 """
 
@@ -370,154 +370,310 @@ def _run_scorer_process(
     return result
 
 
-def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, Any]:
-    """Run a Python train/predict submission without exposing private labels."""
+def _run_model_evaluator_process(
+    evaluator_path: str,
+    predictions_path: str,
+    labels_path: str,
+    *,
+    timeout_ms: int,
+    memory_mb: int,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run the strict v2 evaluator with only the selected split files."""
+
+    if timeout_ms <= 0:
+        return _failed("evaluator exceeded its time limit", metrics={"verdict": "time_limit_exceeded"})
+    command = [sys.executable, "-m", "grader.model_evaluator_process", evaluator_path, predictions_path, labels_path]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(Path(evaluator_path).parent),
+            env=_child_environment(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            preexec_fn=_submission_preexec(memory_mb, timeout_ms, drop_privileges=True),  # noqa: PLW1509
+        )
+    except OSError as exc:
+        return _failed(f"could not start evaluator process: {exc}")
+    started = time.monotonic()
+    try:
+        stdout, _ = process.communicate(timeout=max(0.001, timeout_ms / 1000))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.wait()
+        return _failed("evaluator exceeded its time limit", metrics={"verdict": "time_limit_exceeded"})
+    if process.returncode != 0:
+        return _failed("evaluator process exited unsuccessfully", metrics={"verdict": "evaluator_error"})
+    if len(stdout or b"") > _MAX_SCORER_OUTPUT_BYTES:
+        return _failed("evaluator result exceeds the output limit")
+    try:
+        result = json.loads((stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _failed(f"evaluator returned invalid JSON: {exc}")
+    if not isinstance(result, dict):
+        return _failed("evaluator returned a non-object result")
+    result.setdefault("metrics", {})
+    result["metrics"].setdefault("evaluator_time_ms", int((time.monotonic() - started) * 1000))
+    return result
+
+
+def _run_model_submission_v2(submission_path: str, assets_path: str) -> dict[str, Any]:
+    """Run the strict v2 train/model/predict lifecycle.
+
+    Training and prediction are separate processes and separate workspaces.
+    This makes the model artifact explicit while ensuring training cannot read
+    the private test set or labels.
+    """
+
+    profile = os.environ.get("BRUNOST_EVALUATION_PROFILE", "live").strip().lower() or "live"
+    if profile in {"post", "generalization"}:
+        profile = "post_competition"
+    if profile not in {"live", "post_competition"}:
+        return _failed("unknown model evaluation profile")
+    if profile == "post_competition" and (_manifest_field(assets_path, "post_competition_enabled") or "false").lower() not in {"1", "true", "yes", "on"}:
+        return _failed("post-competition evaluation is not enabled for this task")
 
     submission_root = Path(submission_path).resolve()
-    entrypoint = _manifest_field(assets_path, "submission_entrypoint") or "submission.py"
-    prediction_output = _manifest_field(assets_path, "prediction_output") or "predictions.csv"
-    public_dataset = _manifest_field(assets_path, "public_dataset")
-    hidden_dataset = _manifest_field(assets_path, "hidden_dataset")
-    hidden_labels = _manifest_field(assets_path, "hidden_labels_dataset")
-    if not public_dataset or not hidden_dataset or not hidden_labels:
-        return _failed("python_code model tasks need public, hidden, and hidden-label datasets")
+    entrypoint_name = _manifest_field(assets_path, "submission_entrypoint") or "submission.py"
+    evaluator_name = _manifest_field(assets_path, "post_evaluator_entrypoint") if profile == "post_competition" else "evaluator.py"
+    evaluator_name = evaluator_name or "evaluator.py"
+    if profile == "post_competition":
+        train_name = _manifest_field(assets_path, "post_training_dataset")
+        test_name = _manifest_field(assets_path, "post_test_dataset")
+        labels_name = _manifest_field(assets_path, "post_labels_dataset")
+        training_time_field = "post_training_time_limit_ms"
+        prediction_time_field = "post_prediction_time_limit_ms"
+        evaluator_time_field = "post_evaluator_time_limit_ms"
+    else:
+        train_name = _manifest_field(assets_path, "training_dataset")
+        test_name = _manifest_field(assets_path, "private_test_dataset")
+        labels_name = _manifest_field(assets_path, "private_labels_dataset")
+        training_time_field = "training_time_limit_ms"
+        prediction_time_field = "prediction_time_limit_ms"
+        evaluator_time_field = "evaluator_time_limit_ms"
+    if not train_name or not test_name or not labels_name:
+        return _failed("model task is missing its training, test, or labels dataset")
     try:
-        entrypoint_path = _submission_file(submission_root, entrypoint, "submission entrypoint")
-        if not entrypoint_path.is_file():
-            return _failed(f"submission is missing {entrypoint}")
-        public_path = _task_file(assets_path, public_dataset, "public dataset")
-        hidden_path = _task_file(assets_path, hidden_dataset, "hidden dataset")
-        labels_path = _task_file(assets_path, hidden_labels, "hidden labels dataset")
-        total_time_ms = int(_manifest_field(assets_path, "time_limit_ms") or str(_DEFAULT_MODEL_TIME_MS))
-        training_time_ms = int(_manifest_field(assets_path, "training_time_limit_ms") or str(total_time_ms))
+        entrypoint = _submission_file(submission_root, entrypoint_name, "submission entrypoint")
+        if not entrypoint.is_file():
+            return _failed(f"submission is missing {entrypoint_name}")
+        training_source = _task_file(assets_path, train_name, "training dataset")
+        private_test_source = _task_file(assets_path, test_name, "test dataset")
+        labels_source = _task_file(assets_path, labels_name, "labels dataset")
+        evaluator_source = _task_file(assets_path, evaluator_name, "evaluator")
+        training_time_ms = int(_manifest_field(assets_path, training_time_field) or "120000")
+        prediction_time_ms = int(_manifest_field(assets_path, prediction_time_field) or "10000")
+        evaluator_time_ms = int(_manifest_field(assets_path, evaluator_time_field) or "10000")
         memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or str(_DEFAULT_MODEL_MEMORY_MB))
-        prediction_limit_bytes = int(
-            _manifest_field(assets_path, "prediction_max_bytes") or str(_DEFAULT_PREDICTION_MAX_BYTES)
-        )
+        model_max_bytes = int(_manifest_field(assets_path, "model_max_bytes") or str(_MAX_PREDICTION_MAX_BYTES))
     except (FileNotFoundError, ValueError) as exc:
         return _failed(str(exc))
-    if total_time_ms < 1 or training_time_ms < 1 or training_time_ms > total_time_ms:
-        return _failed("model task has invalid time limits")
-    if not 1_024 <= prediction_limit_bytes <= _MAX_PREDICTION_MAX_BYTES:
-        return _failed("model task has an invalid prediction output limit")
+    if profile == "live":
+        public_test_name = _manifest_field(assets_path, "public_test_dataset")
+        public_labels_name = _manifest_field(assets_path, "public_labels_dataset")
+        if bool(public_test_name) != bool(public_labels_name):
+            return _failed("public test and public labels must be declared together")
+        public_test_source = _task_file(assets_path, public_test_name, "public test dataset") if public_test_name else None
+        public_labels_source = _task_file(assets_path, public_labels_name, "public labels dataset") if public_labels_name else None
+    else:
+        public_test_source = public_labels_source = None
+    if model_max_bytes < 1_024 or model_max_bytes > _MAX_PREDICTION_MAX_BYTES:
+        return _failed("model task has an invalid model artifact limit")
 
-    with tempfile.TemporaryDirectory(prefix="brunost-model-run-") as temporary:
+    baseline_enabled = (_manifest_field(assets_path, "baseline_enabled") or "false").lower() in {"1", "true", "yes", "on"}
+    baseline_source: Path | None = None
+    if baseline_enabled:
+        try:
+            baseline_source = _task_file(assets_path, _manifest_field(assets_path, "baseline_entrypoint") or "private/baseline.py", "baseline")
+        except (FileNotFoundError, ValueError) as exc:
+            return _failed(str(exc))
+    splits: list[tuple[str, Path, Path]] = []
+    if public_test_source is not None and public_labels_source is not None:
+        splits.append(("public", public_test_source, public_labels_source))
+    splits.append(("private", private_test_source, labels_source))
+    solution_count = 2 if baseline_enabled else 1
+    calculated_budget_ms = solution_count * (training_time_ms + len(splits) * prediction_time_ms + len(splits) * evaluator_time_ms) + 5_000
+    try:
+        declared_budget_ms = int(_manifest_field(assets_path, "time_limit_ms") or str(calculated_budget_ms))
+    except ValueError:
+        return _failed("model task has an invalid total time limit")
+    budget_ms = min(calculated_budget_ms, declared_budget_ms)
+    if budget_ms < 1 or training_time_ms < 1 or prediction_time_ms < 1 or evaluator_time_ms < 1:
+        return _failed("model task has invalid phase time limits")
+
+    with tempfile.TemporaryDirectory(prefix="brunost-model-v2-") as temporary:
         root = Path(temporary)
-        root.chmod(0o755)
-        public_input = root / "input" / "public" / public_path.name
-        hidden_input = root / "input" / "private" / hidden_path.name
-        public_input.parent.mkdir(parents=True)
-        hidden_input.parent.mkdir(parents=True)
-        public_input.parent.chmod(0o755)
-        hidden_input.parent.chmod(0o755)
-        shutil.copyfile(public_path, public_input)
-        shutil.copyfile(hidden_path, hidden_input)
-        public_input.chmod(0o644)
-        hidden_input.chmod(0o644)
-        output_path = _submission_file(root / "output", prediction_output, "prediction output")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        (root / "output").chmod(0o733)
-        output_path.parent.chmod(0o733)
-
-        base_env = _child_environment({
-            "BRUNOST_ML_PUBLIC_DATASET": str(public_input),
-            "BRUNOST_ML_PRIVATE_DATASET": str(hidden_input),
-            "BRUNOST_ML_OUTPUT_PATH": str(output_path),
-            "BRUNOST_ML_SEED": _manifest_field(assets_path, "seed") or "42",
-            "PYTHONHASHSEED": _manifest_field(assets_path, "seed") or "42",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        })
-        deadline = time.monotonic() + total_time_ms / 1000
-
-        def remaining_ms() -> int:
-            return max(0, int((deadline - time.monotonic()) * 1000))
+        deadline = time.monotonic() + budget_ms / 1000
 
         def phase_timeout(limit_ms: int, label: str) -> tuple[int | None, dict[str, Any] | None]:
-            remaining = remaining_ms()
+            remaining = max(0, int((deadline - time.monotonic()) * 1000))
             if remaining <= 0:
-                return None, _failed(
-                    f"{label} exceeded the model evaluation time budget",
-                    metrics={"verdict": "time_limit_exceeded"},
-                )
+                return None, _failed(f"{label} exceeded the model evaluation time budget", metrics={"verdict": "time_limit_exceeded"})
             return min(limit_ms, remaining), None
 
-        baseline_enabled = (_manifest_field(assets_path, "baseline_enabled") or "false").lower() in {"1", "true", "yes", "on"}
-        baseline_output: Path | None = None
-        if baseline_enabled:
-            baseline_entrypoint = _manifest_field(assets_path, "baseline_entrypoint") or "private/baseline.py"
-            try:
-                baseline_path = _task_file(assets_path, baseline_entrypoint, "baseline solution")
-            except (FileNotFoundError, ValueError) as exc:
-                return _failed(str(exc))
-            baseline_output = _submission_file(root / "baseline", prediction_output, "prediction output")
-            baseline_output.parent.mkdir(parents=True, exist_ok=True)
-            baseline_output.parent.chmod(0o700)
-            baseline_env = {**base_env, "BRUNOST_ML_OUTPUT_PATH": str(baseline_output), "BRUNOST_ML_BASELINE": "1"}
-            timeout_ms, failure = phase_timeout(training_time_ms, "baseline")
+        def run_solution(label: str, source: Path) -> tuple[dict[str, Path] | None, dict[str, Any] | None]:
+            training_workspace = root / f"{label}-training"
+            training_workspace.mkdir(parents=True)
+            training_workspace.chmod(0o755)
+            train_input = training_workspace / "input" / "training" / training_source.name
+            train_input.parent.mkdir(parents=True)
+            train_input.parent.parent.chmod(0o755)
+            train_input.parent.chmod(0o755)
+            shutil.copyfile(training_source, train_input)
+            train_input.chmod(0o644)
+            submission_workspace = training_workspace / "submission"
+            if label == "participant":
+                shutil.copytree(submission_root, submission_workspace, symlinks=False)
+            else:
+                submission_workspace.mkdir()
+            code_path = _submission_file(submission_workspace, entrypoint_name, "submission entrypoint")
+            if label != "participant":
+                # Baselines are task-owned files; keep the same entrypoint shape
+                # as participant submissions so both use the identical contract.
+                code_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, code_path)
+            code_path.chmod(0o644)
+            model_path = training_workspace / "model" / "model.bin"
+            model_path.parent.mkdir()
+            model_path.parent.chmod(0o733)
+            timeout_ms, failure = phase_timeout(training_time_ms, f"{label} training")
             if failure is not None:
-                return failure
-            baseline_result = _run_submission_process(
-                [sys.executable, str(baseline_path)],
-                baseline_path.parent,
-                baseline_env,
+                return None, failure
+            training_env = _child_environment({
+                "BRUNOST_ML_PHASE": "train",
+                "BRUNOST_ML_TRAINING_DATASET": str(train_input),
+                "BRUNOST_ML_MODEL_PATH": str(model_path),
+                "BRUNOST_ML_SEED": _manifest_field(assets_path, "seed") or "42",
+                "PYTHONHASHSEED": _manifest_field(assets_path, "seed") or "42",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            })
+            result = _run_submission_process(
+                [sys.executable, "-m", "grader.model_process", str(code_path), "train", str(train_input), str(model_path)],
+                training_workspace,
+                training_env,
                 timeout_ms=timeout_ms or 1,
                 memory_mb=memory_mb,
-                output_limit_bytes=prediction_limit_bytes,
-                drop_privileges=False,
+                output_limit_bytes=model_max_bytes,
             )
-            if baseline_result.get("status") != "completed" or not baseline_output.is_file():
-                return _failed("baseline solution did not produce a valid prediction file")
-            if baseline_output.stat().st_size == 0 or baseline_output.stat().st_size > prediction_limit_bytes:
-                return _failed("baseline prediction file is empty or exceeds the output limit")
+            if result.get("status") != "completed":
+                return None, result
+            if not model_path.is_file() or model_path.stat().st_size == 0:
+                return None, _failed(f"{label} training did not create model.bin")
+            if model_path.stat().st_size > model_max_bytes:
+                return None, _failed(f"{label} model artifact exceeds the model size limit")
 
-        participant_env = {**base_env, "BRUNOST_ML_BASELINE": "0"}
-        timeout_ms, failure = phase_timeout(training_time_ms, "participant")
-        if failure is not None:
-            return failure
-        participant_result = _run_submission_process(
-            [sys.executable, str(entrypoint_path)],
-            submission_root,
-            participant_env,
-            timeout_ms=timeout_ms or 1,
-            memory_mb=memory_mb,
-            output_limit_bytes=prediction_limit_bytes,
-        )
-        if participant_result.get("status") != "completed":
-            return participant_result
-        if not output_path.is_file():
-            return _failed(f"submission did not create {prediction_output}")
-        if output_path.stat().st_size == 0 or output_path.stat().st_size > prediction_limit_bytes:
-            return _failed("prediction output is empty or exceeds the output limit")
+            outputs: dict[str, Path] = {}
+            for split, test_source, _labels in splits:
+                prediction_workspace = root / f"{label}-{split}-prediction"
+                prediction_workspace.mkdir(parents=True)
+                prediction_workspace.chmod(0o755)
+                test_input = prediction_workspace / "input" / "test" / test_source.name
+                test_input.parent.mkdir(parents=True)
+                test_input.parent.parent.chmod(0o755)
+                test_input.parent.chmod(0o755)
+                shutil.copyfile(test_source, test_input)
+                test_input.chmod(0o644)
+                prediction_model = prediction_workspace / "model.bin"
+                shutil.copyfile(model_path, prediction_model)
+                prediction_model.chmod(0o444)
+                output_path = prediction_workspace / "output" / "predictions.csv"
+                output_path.parent.mkdir()
+                output_path.parent.chmod(0o733)
+                timeout_ms, failure = phase_timeout(prediction_time_ms, f"{label} {split} prediction")
+                if failure is not None:
+                    return None, failure
+                prediction_env = _child_environment({
+                    "BRUNOST_ML_PHASE": "predict",
+                    "BRUNOST_ML_MODEL_PATH": str(prediction_model),
+                    "BRUNOST_ML_TEST_DATASET": str(test_input),
+                    "BRUNOST_ML_OUTPUT_PATH": str(output_path),
+                    "BRUNOST_ML_SEED": _manifest_field(assets_path, "seed") or "42",
+                    "PYTHONHASHSEED": _manifest_field(assets_path, "seed") or "42",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                })
+                result = _run_submission_process(
+                    [sys.executable, "-m", "grader.model_process", str(code_path), "predict", str(prediction_model), str(test_input), str(output_path)],
+                    prediction_workspace,
+                    prediction_env,
+                    timeout_ms=timeout_ms or 1,
+                    memory_mb=memory_mb,
+                    output_limit_bytes=_MAX_PREDICTION_MAX_BYTES,
+                )
+                if result.get("status") != "completed":
+                    return None, result
+                if not output_path.is_file() or output_path.stat().st_size == 0:
+                    return None, _failed(f"{label} {split} prediction did not create a non-empty predictions.csv")
+                if output_path.stat().st_size > _MAX_PREDICTION_MAX_BYTES:
+                    return None, _failed(f"{label} {split} predictions exceed the output size limit")
+                outputs[split] = output_path
+            return outputs, None
 
-        scored_submission = root / "scored-submission"
-        shutil.copytree(submission_root, scored_submission)
-        scored_prediction = _submission_file(scored_submission, prediction_output, "prediction output")
-        scored_prediction.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(output_path, scored_prediction)
-        scorer_values = {
-            "BRUNOST_ML_PREDICTIONS_PATH": str(scored_prediction),
-            "BRUNOST_ML_PRIVATE_LABELS": str(labels_path),
-            "BRUNOST_ML_PUBLIC_DATASET": str(public_path),
-            "BRUNOST_ML_PRIVATE_DATASET": str(hidden_path),
-        }
-        if baseline_output is not None:
-            scorer_values["BRUNOST_ML_BASELINE_PREDICTIONS_PATH"] = str(baseline_output)
-        timeout_ms, failure = phase_timeout(total_time_ms, "scorer")
-        if failure is not None:
-            return failure
-        result = _run_scorer_process(
-            str(scored_submission),
-            assets_path,
-            timeout_ms=timeout_ms or 1,
-            memory_mb=memory_mb,
-            official_split="private",
-            require_official=True,
-            environment=_child_environment(scorer_values),
-        )
-        result.setdefault("metrics", {})
-        if participant_result.get("metrics", {}).get("training_time_ms") is not None:
-            result["metrics"]["training_time_ms"] = participant_result["metrics"]["training_time_ms"]
-        return result
+        def evaluate_outputs(label: str, outputs: dict[str, Path]) -> tuple[dict[str, float] | None, dict[str, Any] | None]:
+            scores: dict[str, float] = {}
+            for split, predictions_path in outputs.items():
+                labels_path = next(labels for split_name, _test, labels in splits if split_name == split)
+                evaluator_workspace = root / f"{label}-{split}-evaluator"
+                evaluator_workspace.mkdir(parents=True)
+                evaluator_workspace.chmod(0o755)
+                evaluator_path = evaluator_workspace / "evaluator.py"
+                shutil.copyfile(evaluator_source, evaluator_path)
+                evaluator_path.chmod(0o644)
+                copied_predictions = evaluator_workspace / "predictions.csv"
+                copied_labels = evaluator_workspace / "labels"
+                shutil.copyfile(predictions_path, copied_predictions)
+                shutil.copyfile(labels_path, copied_labels)
+                copied_predictions.chmod(0o644)
+                copied_labels.chmod(0o644)
+                timeout_ms, failure = phase_timeout(evaluator_time_ms, f"{label} {split} evaluator")
+                if failure is not None:
+                    return None, failure
+                result = _run_model_evaluator_process(
+                    str(evaluator_path),
+                    str(copied_predictions),
+                    str(copied_labels),
+                    timeout_ms=timeout_ms or 1,
+                    memory_mb=memory_mb,
+                    environment=_child_environment({
+                        "BRUNOST_ML_PROFILE": profile,
+                        "BRUNOST_ML_SPLIT": split,
+                        "BRUNOST_ML_PREDICTIONS_PATH": str(copied_predictions),
+                        "BRUNOST_ML_LABELS_PATH": str(copied_labels),
+                    }),
+                )
+                if result.get("status") != "completed":
+                    return None, result
+                try:
+                    scores[split] = float(result["score"])
+                except (KeyError, TypeError, ValueError):
+                    return None, _failed(f"{label} {split} evaluator returned no numeric score")
+            return scores, None
+
+        metrics: dict[str, Any] = {"profile": profile}
+        if baseline_source is not None:
+            baseline_outputs, failure = run_solution("baseline", baseline_source)
+            if failure is not None or baseline_outputs is None:
+                return failure or _failed("baseline evaluation failed")
+            baseline_scores, failure = evaluate_outputs("baseline", baseline_outputs)
+            if failure is not None or baseline_scores is None:
+                return failure or _failed("baseline evaluation failed")
+            metrics.update({f"baseline_{key}": value for key, value in baseline_scores.items()})
+
+        participant_outputs, failure = run_solution("participant", entrypoint)
+        if failure is not None or participant_outputs is None:
+            return failure or _failed("participant evaluation failed")
+        participant_scores, failure = evaluate_outputs("participant", participant_outputs)
+        if failure is not None or participant_scores is None:
+            return failure or _failed("participant evaluation failed")
+        metrics.update(participant_scores)
+        official = participant_scores.get("private")
+        if official is None:
+            return _failed("private evaluation did not produce an official score", metrics=metrics)
+        return {"status": "completed", "score": official, "metrics": metrics}
 
 
 def _run_plugin(submission_path: str, assets_path: str) -> dict[str, Any]:
@@ -572,19 +728,7 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
         if kind in {"agent", "game"}:
             return _run_plugin(submission_path, assets_path)
         if kind == "model":
-            submission_mode = (_manifest_field(assets_path, "submission_mode") or "scorer").lower()
-            if submission_mode == "python_code":
-                return _run_model_submission(submission_path, assets_path)
-            # Legacy model packages predate the train/predict lifecycle and
-            # keep the original public-score scorer behavior.
-            timeout_ms = int(_manifest_field(assets_path, "time_limit_ms") or "15000")
-            memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or "4096")
-            return _run_scorer_process(
-                submission_path,
-                assets_path,
-                timeout_ms=timeout_ms,
-                memory_mb=memory_mb,
-            )
+            return _run_model_submission_v2(submission_path, assets_path)
         return _run_scorer(submission_path, assets_path)
     except Exception as exc:  # noqa: BLE001 — the harness must contain all scorer errors
         detail = f"{type(exc).__name__}: {exc}"

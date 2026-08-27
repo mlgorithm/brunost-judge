@@ -2,9 +2,9 @@
 
 Current release: `1.3.0` — local match execution, formal agent protocols, portable artifacts, worker credentials, scoped service authentication, secret-file loading, audit logging, rate limiting, signed callbacks, capability scheduling, provider adapters, deterministic game contracts, and replay artifact results.
 
-Brunost Judge is the platform-independent judging layer for scorer-backed IOAI,
-model, and output-only tasks, with versioned contracts for ICPC, interactive,
-and agent runners. It is intentionally separate from the NOKI/Brunost education
+Brunost Judge is the platform-independent judging layer for scorer-backed IOAI
+and output-only tasks, plus versioned model, ICPC, interactive, and agent
+runners. Model tasks use the dedicated `train_predict_v2` lifecycle. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary. The built-in runtime fails
 closed for runner kinds that do not have an installed evaluator plugin.
@@ -117,9 +117,9 @@ in CI.
 The API and provider model are documented in [`docs/api.md`](docs/api.md) and
 [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md).
 
-## The contract
+## Generic scorer contract
 
-**Inputs** (mounted read-only into a sealed sandbox by the worker):
+Generic scorer tasks receive these inputs (mounted read-only into a sealed sandbox by the worker):
 - `SUBMISSION_PATH` — directory with the contestant's uploaded file(s) (e.g. `submission.npz`, `submission.csv`).
 - `ASSETS_PATH` — directory with the task's **`metrics.py`** + its **hidden labels** (answer key).
 
@@ -144,39 +144,17 @@ def evaluate(submission_path: str, assets_path: str) -> dict | float:
 ```
 - For legacy scorer-backed tasks, `score` is the **public** value — safe to surface live;
   the private value lives in `metrics["private"]`.
-- For `model` tasks with `submission_mode: python_code`, `score` is explicitly the
-  private official value. The platform should still gate private metrics and details
-  according to its leaderboard freeze/reveal policy.
 - Any error (missing file, bad shape, scorer exception) → `{"status": "failed", "score": 0.0,
   "failure_reason": "..."}` — the harness never crashes the sandbox.
 
-### Python ML training tasks
+### Model and ML tasks
 
-Model tasks can opt into a standard train/predict lifecycle. The participant sees
-public training data and private test features, but never the private labels. The
-Judge runs `submission.py` with these environment variables:
-
-```text
-BRUNOST_ML_PUBLIC_DATASET
-BRUNOST_ML_PRIVATE_DATASET
-BRUNOST_ML_OUTPUT_PATH
-BRUNOST_ML_SEED
-```
-
-The submission may use any number of epochs. `time_limit_ms` is the complete
-budget shared by the optional baseline, participant, and scorer; when the
-remaining budget expires, the active process tree is killed. `training_time_limit_ms`
-is the per-process ceiling. Memory is limited with `memory_limit_mb`. The
-submission must create a non-empty prediction file, normally `predictions.csv`,
-within the configured output-size limit before returning successfully. The
-private scorer then computes the official score and must return a `private` value.
-A baseline is optional and, when enabled, runs through the same input/output
-contract for task validation and comparison only. Python training tasks require
-the `python-3.13-ml-v1` runtime image, which is selected through the explicit
-`BRUNOST_JUDGE_SANDBOX_IMAGES` map.
-
-See [`docs/model-tasks.md`](docs/model-tasks.md) for the package layout and scorer
-contract.
+Model tasks use a separate v2 contract: `train()` writes a model artifact,
+`predict()` writes predictions for a selected split, and `evaluator.py` scores
+those predictions. The same lifecycle supports optional baselines and a hidden
+post-competition leaderboard using new training and test data. See
+[`docs/model-tasks.md`](docs/model-tasks.md) for the manifest, phase boundaries,
+runtime, and complete submission contract.
 
 ### Classic batch tasks
 
