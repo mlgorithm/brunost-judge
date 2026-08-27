@@ -163,13 +163,17 @@ BRUNOST_ML_OUTPUT_PATH
 BRUNOST_ML_SEED
 ```
 
-The submission may use any number of epochs. `training_time_limit_ms` is the hard
-wall-clock limit; when it expires the process tree is killed. Memory is limited
-with `memory_limit_mb`. The submission must create the configured prediction file,
-normally `predictions.csv`, before returning successfully. The private scorer then
-computes the official score and must return a `private` value. A baseline is
-optional and, when enabled, runs through the same input/output contract for task
-validation and comparison only.
+The submission may use any number of epochs. `time_limit_ms` is the complete
+budget shared by the optional baseline, participant, and scorer; when the
+remaining budget expires, the active process tree is killed. `training_time_limit_ms`
+is the per-process ceiling. Memory is limited with `memory_limit_mb`. The
+submission must create a non-empty prediction file, normally `predictions.csv`,
+within the configured output-size limit before returning successfully. The
+private scorer then computes the official score and must return a `private` value.
+A baseline is optional and, when enabled, runs through the same input/output
+contract for task validation and comparison only. Python training tasks require
+the `python-3.13-ml-v1` runtime image, which is selected through the explicit
+`BRUNOST_JUDGE_SANDBOX_IMAGES` map.
 
 See [`docs/model-tasks.md`](docs/model-tasks.md) for the package layout and scorer
 contract.

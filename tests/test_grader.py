@@ -186,7 +186,15 @@ def test_run_bad_submission_is_contained(tmp_path):
     assert r["score"] == 0.0
 
 
-def _write_train_predict_task(root, submission_code: str, *, training_ms: int = 5_000, baseline: bool = False) -> None:
+def _write_train_predict_task(
+    root,
+    submission_code: str,
+    *,
+    training_ms: int = 5_000,
+    total_ms: int | None = None,
+    baseline: bool = False,
+    scorer_code: str | None = None,
+) -> None:
     (root / "public" / "datasets").mkdir(parents=True)
     (root / "private" / "datasets").mkdir(parents=True)
     (root / "scorer").mkdir()
@@ -201,7 +209,7 @@ def _write_train_predict_task(root, submission_code: str, *, training_ms: int = 
             "runtime: python-3.13-ml-v1",
             "scoring: scorer.metrics:evaluate",
             "network: disabled",
-            f"time_limit_ms: {training_ms + 5000}",
+            f"time_limit_ms: {total_ms if total_ms is not None else training_ms + 5000}",
             "training_time_limit_ms: " + str(training_ms),
             "memory_limit_mb: 512",
             "public_dataset: public/datasets/train.csv",
@@ -217,7 +225,7 @@ def _write_train_predict_task(root, submission_code: str, *, training_ms: int = 
         encoding="utf-8",
     )
     (root / "scorer" / "metrics.py").write_text(
-        """import os\n\ndef evaluate(submission_path, assets_path):\n    assert os.environ['BRUNOST_ML_PRIVATE_LABELS'].endswith('labels.csv')\n    assert os.path.isfile(os.environ['BRUNOST_ML_PREDICTIONS_PATH'])\n    if os.environ.get('BRUNOST_ML_BASELINE_PREDICTIONS_PATH'):\n        assert os.path.isfile(os.environ['BRUNOST_ML_BASELINE_PREDICTIONS_PATH'])\n    return {'public': 0.25, 'private': 0.75}\n""",
+        scorer_code or """import os\n\ndef evaluate(submission_path, assets_path):\n    assert os.environ['BRUNOST_ML_PRIVATE_LABELS'].endswith('labels.csv')\n    assert os.path.isfile(os.environ['BRUNOST_ML_PREDICTIONS_PATH'])\n    if os.environ.get('BRUNOST_ML_BASELINE_PREDICTIONS_PATH'):\n        assert os.path.isfile(os.environ['BRUNOST_ML_BASELINE_PREDICTIONS_PATH'])\n    return {'public': 0.25, 'private': 0.75}\n""",
         encoding="utf-8",
     )
     if baseline:
@@ -267,6 +275,56 @@ def test_run_model_training_submission_can_use_optional_baseline(tmp_path):
     r = run(str(submission), str(assets))
     assert r["status"] == "completed", r
     assert r["score"] == pytest.approx(0.75)
+
+
+def test_run_model_training_uses_one_total_budget_for_baseline_and_submission(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "import time\ntime.sleep(0.15)\n",
+        training_ms=220,
+        total_ms=250,
+        baseline=True,
+    )
+    (assets / "private" / "baseline.py").write_text(
+        "import os, time\nfrom pathlib import Path\ntime.sleep(0.15)\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('baseline\\n')\n",
+        encoding="utf-8",
+    )
+    r = run(str(assets.parent / "submission"), str(assets))
+    assert r["status"] == "failed", r
+    assert r["metrics"]["verdict"] == "time_limit_exceeded"
+
+
+def test_run_model_training_does_not_inherit_unapproved_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_PRIVATE_SENTINEL", "must-not-leak")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('leaked' if os.environ.get('BRUNOST_PRIVATE_SENTINEL') else 'clean')\n",
+        scorer_code="""from pathlib import Path
+
+def evaluate(submission_path, assets_path):
+    value = Path(submission_path, 'predictions.csv').read_text()
+    return {'private': 1.0 if value == 'clean' else 0.0}
+""",
+    )
+    r = run(str(assets.parent / "submission"), str(assets))
+    assert r["status"] == "completed", r
+    assert r["score"] == pytest.approx(1.0)
+
+
+def test_run_model_training_rejects_empty_prediction_output(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    _write_train_predict_task(
+        assets,
+        "import os\nfrom pathlib import Path\nPath(os.environ['BRUNOST_ML_OUTPUT_PATH']).write_text('')\n",
+    )
+    r = run(str(assets.parent / "submission"), str(assets))
+    assert r["status"] == "failed"
+    assert "empty" in r["failure_reason"]
 
 
 def test_run_model_training_submission_rejects_output_escape(tmp_path):

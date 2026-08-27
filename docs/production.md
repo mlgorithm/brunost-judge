@@ -45,6 +45,7 @@ use the hardened overlay:
 export BRUNOST_JUDGE_SANDBOX_IMAGE='ghcr.io/example/brunost-judge-runtime@sha256:<64-hex-digest>'
 export BRUNOST_JUDGE_SANDBOX_RUNTIME=runsc   # or a certified Kata runtime
 export BRUNOST_JUDGE_SANDBOX_SECCOMP=/etc/docker/seccomp/brunost-seccomp.json
+export BRUNOST_JUDGE_SANDBOX_IMAGES='{"python-3.13":"ghcr.io/example/brunost-judge-runtime@sha256:<64-hex-digest>","python-3.13-ml-v1":"ghcr.io/example/brunost-judge-runtime-ml@sha256:<64-hex-digest>"}'
 docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d
 ```
 
@@ -56,8 +57,10 @@ processes to dedicated UID 65533; task assets are never mounted into that
 contestant process. On runtimes that permit it, bubblewrap adds a second mount
 namespace as defense in depth. Build the sandbox image with
 `Dockerfile.sandbox` on top of the pinned task runtime, then publish it by
-digest. GPU workers should use a separately
-certified runtime because gVisor GPU support is limited.
+digest. Build `Dockerfile.sandbox.ml` for the `python-3.13-ml-v1` entry and map
+it with `BRUNOST_JUDGE_SANDBOX_IMAGES`; unmapped non-default runtimes fail closed.
+GPU workers should use a separately certified runtime because gVisor GPU support
+is limited.
 
 The reference artifact backend is a content-addressed filesystem. For a
 multi-node country deployment, put that root on replicated S3/MinIO-compatible

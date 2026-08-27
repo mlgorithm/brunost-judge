@@ -143,6 +143,32 @@ class DockerSandboxRunner:
     cpus: str = "2"
     pids_limit: int = 256
     seccomp_profile: str | None = None
+    runtime_images: dict[str, str] | None = None
+
+    @staticmethod
+    def _task_runtime(task: Path) -> str:
+        manifest = task / "judge.yaml"
+        try:
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key.strip().lower() == "runtime":
+                    return value.strip().strip('"').strip("'") or "python-3.13"
+        except OSError:
+            pass
+        return "python-3.13"
+
+    def _image_for_task(self, task: Path) -> str:
+        task_runtime = self._task_runtime(task)
+        if self.runtime_images:
+            image = self.runtime_images.get(task_runtime)
+            if not image:
+                raise RuntimeError(f"no sandbox image is configured for task runtime {task_runtime!r}")
+            return image
+        if task_runtime != "python-3.13":
+            raise RuntimeError(
+                f"task runtime {task_runtime!r} requires BRUNOST_JUDGE_SANDBOX_IMAGES"
+            )
+        return self.image
 
     def run(self, submission: Path, task: Path, execution_id: str) -> dict[str, Any]:
         if shutil.which("docker") is None:
@@ -155,7 +181,10 @@ class DockerSandboxRunner:
         with tempfile.TemporaryDirectory(prefix="brunost-judge-output-") as output_dir:
             try:
                 task_bundle = pack_directory(task)
+                image = self._image_for_task(task)
             except (OSError, ValueError) as exc:
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": str(exc)}
+            except RuntimeError as exc:
                 return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": str(exc)}
             output = Path(output_dir)
             output.chmod(0o777)
@@ -193,7 +222,7 @@ class DockerSandboxRunner:
             plugin_module = os.environ.get("BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE", "").strip()
             if plugin_module:
                 command.extend(["--env", f"BRUNOST_JUDGE_RUNNER_PLUGIN_MODULE={plugin_module}"])
-            command.extend([self.image, "python", "-m", "grader.evaluate"])
+            command.extend([image, "python", "-m", "grader.evaluate"])
             try:
                 completed = subprocess.run(
                     command,
@@ -234,6 +263,7 @@ class DockerSandboxRunner:
         return type(self)(
             image=self.image,
             runtime=self.runtime,
+            runtime_images=self.runtime_images,
             timeout_seconds=max(1, int(timeout_seconds)),
             memory=self.memory,
             cpus=self.cpus,
@@ -271,9 +301,28 @@ def sandbox_from_environment() -> SandboxRunner:
         raise RuntimeError("production sandbox image must be pinned by a sha256 digest")
     if os.environ.get("BRUNOST_JUDGE_REQUIRE_SECCOMP", "true").lower() == "true" and not seccomp_profile:
         raise RuntimeError("BRUNOST_JUDGE_SANDBOX_SECCOMP is required for Docker sandbox mode")
+    runtime_images: dict[str, str] | None = None
+    raw_images = os.environ.get("BRUNOST_JUDGE_SANDBOX_IMAGES", "").strip()
+    if raw_images:
+        try:
+            parsed_images = json.loads(raw_images)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("BRUNOST_JUDGE_SANDBOX_IMAGES must be valid JSON") from exc
+        if not isinstance(parsed_images, dict) or not parsed_images or not all(
+            isinstance(key, str) and key.strip() and isinstance(value, str) and value.strip()
+            for key, value in parsed_images.items()
+        ):
+            raise RuntimeError("BRUNOST_JUDGE_SANDBOX_IMAGES must map runtime names to image references")
+        runtime_images = {str(key).strip(): str(value).strip() for key, value in parsed_images.items()}
+        if production and any(
+            not re.fullmatch(r"[^\s@]+@sha256:[0-9a-fA-F]{64}", value)
+            for value in runtime_images.values()
+        ):
+            raise RuntimeError("all production sandbox images must be pinned by a sha256 digest")
     return DockerSandboxRunner(
         image=image,
         runtime=runtime,
+        runtime_images=runtime_images,
         timeout_seconds=int(os.environ.get("BRUNOST_JUDGE_SANDBOX_TIMEOUT_SECONDS", "900")),
         memory=os.environ.get("BRUNOST_JUDGE_SANDBOX_MEMORY", "4g"),
         cpus=os.environ.get("BRUNOST_JUDGE_SANDBOX_CPUS", "2"),

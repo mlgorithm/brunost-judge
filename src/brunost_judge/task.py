@@ -23,6 +23,12 @@ BUILTIN_KINDS = SCORER_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
 MANIFEST_VERSION = 1
 CLASSIC_LANGUAGES = frozenset({"python", "py", "c", "cpp", "c++", "c++17", "gnu++17", "g++", "rust", "rs"})
 MODEL_SUBMISSION_MODES = frozenset({"scorer", "python_code"})
+MAX_MODEL_ASSET_BYTES = 10_000_000
+MAX_MODEL_PREDICTION_BYTES = 64_000_000
+MIN_MODEL_TIME_MS = 1_000
+MAX_MODEL_TIME_MS = 900_000
+MIN_MODEL_MEMORY_MB = 64
+MAX_MODEL_MEMORY_MB = 16_384
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
 
@@ -95,6 +101,8 @@ def _validate_model_manifest(root: Path, manifest: str, errors: list[str]) -> No
         errors.append("model official_split must be private")
     if (_manifest_field(manifest, "submission_language") or "python").lower() not in {"python", "py"}:
         errors.append("python_code model submissions must use Python")
+    if not (_manifest_field(manifest, "runtime") or "").strip():
+        errors.append("python_code model tasks must declare runtime")
 
     entrypoint = _manifest_field(manifest, "submission_entrypoint") or "submission.py"
     _validate_relative_path(entrypoint, "submission_entrypoint", errors)
@@ -102,22 +110,40 @@ def _validate_model_manifest(root: Path, manifest: str, errors: list[str]) -> No
     _validate_relative_path(output, "prediction_output", errors)
     for field in ("time_limit_ms", "training_time_limit_ms", "memory_limit_mb"):
         _validate_positive_field(manifest, field, errors)
+    prediction_limit = _manifest_field(manifest, "prediction_max_bytes")
+    if prediction_limit is not None:
+        try:
+            if not 1_024 <= int(prediction_limit) <= MAX_MODEL_PREDICTION_BYTES:
+                raise ValueError
+        except ValueError:
+            errors.append(f"prediction_max_bytes must be between 1024 and {MAX_MODEL_PREDICTION_BYTES}")
     try:
         total = int(_manifest_field(manifest, "time_limit_ms") or "0")
         training = int(_manifest_field(manifest, "training_time_limit_ms") or str(total))
-        if total and training > total:
-            errors.append("training_time_limit_ms must not exceed time_limit_ms")
+        memory = int(_manifest_field(manifest, "memory_limit_mb") or "0")
+        if not MIN_MODEL_TIME_MS <= total <= MAX_MODEL_TIME_MS:
+            errors.append(f"time_limit_ms must be between {MIN_MODEL_TIME_MS} and {MAX_MODEL_TIME_MS}")
+        if not MIN_MODEL_TIME_MS <= training <= total:
+            errors.append(f"training_time_limit_ms must be between {MIN_MODEL_TIME_MS} and time_limit_ms")
+        if not MIN_MODEL_MEMORY_MB <= memory <= MAX_MODEL_MEMORY_MB:
+            errors.append(f"memory_limit_mb must be between {MIN_MODEL_MEMORY_MB} and {MAX_MODEL_MEMORY_MB}")
     except ValueError:
         pass
 
+    task_root = root.resolve()
     for field in ("public_dataset", "hidden_dataset", "hidden_labels_dataset"):
         value = _manifest_field(manifest, field)
         if not value:
             errors.append(f"python_code model tasks must declare {field}")
             continue
         _validate_relative_path(value, field, errors)
-        if not (root / value).is_file():
+        asset_path = (root / value).resolve()
+        if asset_path != task_root and task_root not in asset_path.parents:
+            errors.append(f"{field} must stay inside the task directory")
+        elif not asset_path.is_file():
             errors.append(f"model task needs {value}")
+        elif asset_path.stat().st_size > MAX_MODEL_ASSET_BYTES:
+            errors.append(f"model asset {value} exceeds {MAX_MODEL_ASSET_BYTES} bytes")
 
     baseline_enabled = _manifest_bool(manifest, "baseline_enabled", bool(_manifest_field(manifest, "baseline_entrypoint")))
     if baseline_enabled:

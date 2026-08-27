@@ -50,6 +50,34 @@ def test_docker_runner_uses_hardened_flags(tmp_path: Path, monkeypatch):
     assert result["status"] == "completed"
 
 
+def test_docker_runner_selects_image_from_task_runtime(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    task.mkdir()
+    submission.mkdir()
+    (task / "judge.yaml").write_text("kind: model\nruntime: python-3.13-ml-v1\n", encoding="utf-8")
+    monkeypatch.setattr("brunost_judge.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    selected: list[str] = []
+
+    def fake_run(command, **kwargs):
+        selected.append(command[-4])
+        volume_args = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--volume"]
+        output_mount = next(value for value in volume_args if value.endswith(":/workspace/output:rw"))
+        Path(output_mount.rsplit(":/workspace/output:rw", 1)[0]).joinpath("results.json").write_text(
+            '{"status":"completed","score":1}', encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("brunost_judge.sandbox.subprocess.run", fake_run)
+    result = DockerSandboxRunner(
+        "judge@sha256:" + "a" * 64,
+        "runsc",
+        runtime_images={"python-3.13-ml-v1": "ml@sha256:" + "b" * 64},
+    ).run(submission, task, "exec-runtime")
+    assert result["status"] == "completed"
+    assert selected == ["ml@sha256:" + "b" * 64]
+
+
 def test_docker_runner_rejects_invalid_result_payload(tmp_path: Path, monkeypatch):
     task = tmp_path / "task"
     submission = tmp_path / "submission"
@@ -107,3 +135,19 @@ def test_production_docker_mode_requires_digest_pinned_image(monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_SECCOMP", "/tmp/seccomp.json")
     with pytest.raises(RuntimeError, match="pinned by a sha256 digest"):
         sandbox_from_environment()
+
+
+def test_production_docker_mode_validates_runtime_image_map(monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_ENV", "production")
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_MODE", "docker")
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_IMAGE", "judge@sha256:" + "a" * 64)
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_RUNTIME", "runsc")
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_SECCOMP", "/tmp/seccomp.json")
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_IMAGES", '{"python-3.13-ml-v1":"ml:latest"}')
+    with pytest.raises(RuntimeError, match="all production sandbox images"):
+        sandbox_from_environment()
+
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_IMAGES", '{"python-3.13-ml-v1":"ml@sha256:' + "b" * 64 + '"}')
+    runner = sandbox_from_environment()
+    assert isinstance(runner, DockerSandboxRunner)
+    assert runner.runtime_images == {"python-3.13-ml-v1": "ml@sha256:" + "b" * 64}

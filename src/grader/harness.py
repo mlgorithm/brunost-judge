@@ -7,6 +7,7 @@ does not). No Brunost backend imports — this is the extraction seam (ADR-0010)
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import shutil
@@ -20,6 +21,20 @@ from pathlib import Path
 from typing import Any
 
 _MAX_REASON_CHARS = 2000
+_MAX_SCORER_OUTPUT_BYTES = 1_000_000
+_DEFAULT_MODEL_TIME_MS = 120_000
+_DEFAULT_MODEL_MEMORY_MB = 2_048
+_DEFAULT_PREDICTION_MAX_BYTES = 10_000_000
+_MAX_PREDICTION_MAX_BYTES = 64_000_000
+_CHILD_ENV_KEYS = (
+    "PATH",
+    "PYTHONPATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+)
 
 
 def _finite_float(value: Any) -> float | None:
@@ -175,7 +190,27 @@ def _submission_file(root: Path, relative: str, label: str) -> Path:
     return path
 
 
-def _submission_preexec(memory_mb: int, timeout_ms: int, *, drop_privileges: bool = True):
+def _child_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a deliberately small environment for task-controlled code."""
+
+    environment = {key: os.environ[key] for key in _CHILD_ENV_KEYS if os.environ.get(key) is not None}
+    if "PYTHONPATH" in environment:
+        environment["PYTHONPATH"] = os.pathsep.join(
+            str(Path(part).resolve())
+            for part in environment["PYTHONPATH"].split(os.pathsep)
+            if part
+        )
+    environment.update(overrides or {})
+    return environment
+
+
+def _submission_preexec(
+    memory_mb: int,
+    timeout_ms: int,
+    *,
+    output_limit_bytes: int | None = None,
+    drop_privileges: bool = True,
+):
     """Apply per-submission resource limits before Python starts."""
 
     if os.name != "posix":
@@ -195,6 +230,11 @@ def _submission_preexec(memory_mb: int, timeout_ms: int, *, drop_privileges: boo
                 _, current_hard = resource.getrlimit(resource.RLIMIT_CPU)
                 hard = cpu_seconds if current_hard == resource.RLIM_INFINITY else min(current_hard, cpu_seconds)
                 resource.setrlimit(resource.RLIMIT_CPU, (hard, hard))
+            if output_limit_bytes is not None and hasattr(resource, "RLIMIT_FSIZE"):
+                output_bytes = max(1, int(output_limit_bytes))
+                _, current_hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+                hard = output_bytes if current_hard == resource.RLIM_INFINITY else min(current_hard, output_bytes)
+                resource.setrlimit(resource.RLIMIT_FSIZE, (hard, hard))
         except (ImportError, OSError, ValueError):
             # The outer Judge sandbox still enforces its own limits. Some local
             # development platforms do not permit every rlimit operation.
@@ -216,6 +256,7 @@ def _run_submission_process(
     *,
     timeout_ms: int,
     memory_mb: int,
+    output_limit_bytes: int | None = None,
     drop_privileges: bool = True,
 ) -> dict[str, Any]:
     started = time.monotonic()
@@ -226,14 +267,19 @@ def _run_submission_process(
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
-            preexec_fn=_submission_preexec(memory_mb, timeout_ms, drop_privileges=drop_privileges),  # noqa: PLW1509
+            preexec_fn=_submission_preexec(  # noqa: PLW1509
+                memory_mb,
+                timeout_ms,
+                output_limit_bytes=output_limit_bytes,
+                drop_privileges=drop_privileges,
+            ),
         )
     except OSError as exc:
         return _failed(f"could not start training process: {exc}")
     try:
-        _, stderr = process.communicate(timeout=max(0.1, timeout_ms / 1000))
+        process.communicate(timeout=max(0.001, timeout_ms / 1000))
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -246,11 +292,7 @@ def _run_submission_process(
         )
     elapsed_ms = int((time.monotonic() - started) * 1000)
     if process.returncode != 0:
-        detail = (stderr or b"").decode("utf-8", errors="replace").strip()
-        reason = "training process exited unsuccessfully"
-        if detail:
-            reason += f": {detail[-1000:]}"
-        return _failed(reason, metrics={"verdict": "runtime_error", "training_time_ms": elapsed_ms})
+        return _failed("training process exited unsuccessfully", metrics={"verdict": "runtime_error", "training_time_ms": elapsed_ms})
     return {"status": "completed", "score": None, "metrics": {"training_time_ms": elapsed_ms}}
 
 
@@ -271,6 +313,63 @@ def _run_scorer(
     return normalize_result(raw, official_split=official_split, require_official=require_official)
 
 
+def _run_scorer_process(
+    submission_path: str,
+    assets_path: str,
+    *,
+    timeout_ms: int,
+    memory_mb: int,
+    official_split: str | None = None,
+    require_official: bool = False,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Run task-controlled scoring code outside the evaluator process."""
+
+    if timeout_ms <= 0:
+        return _failed("scorer exceeded the model evaluation time budget", metrics={"verdict": "time_limit_exceeded"})
+    command = [sys.executable, "-m", "grader.scorer_process", submission_path, assets_path]
+    if official_split:
+        command.extend(["--official-split", official_split])
+    if require_official:
+        command.append("--require-official")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=assets_path,
+            env=_child_environment(environment),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            preexec_fn=_submission_preexec(memory_mb, timeout_ms, drop_privileges=False),  # noqa: PLW1509
+        )
+    except OSError as exc:
+        return _failed(f"could not start scorer process: {exc}")
+    started = time.monotonic()
+    try:
+        stdout, _ = process.communicate(timeout=max(0.001, timeout_ms / 1000))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.wait()
+        return _failed("scorer exceeded the model evaluation time budget", metrics={"verdict": "time_limit_exceeded"})
+    if process.returncode != 0:
+        return _failed("scorer process exited unsuccessfully", metrics={"verdict": "scorer_error"})
+    if len(stdout or b"") > _MAX_SCORER_OUTPUT_BYTES:
+        return _failed("scorer result exceeds the output limit")
+    try:
+        result = json.loads((stdout or b"").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _failed(f"scorer returned invalid JSON: {exc}")
+    if not isinstance(result, dict):
+        return _failed("scorer returned a non-object result")
+    result.setdefault("metrics", {})
+    result["metrics"].setdefault("scoring_time_ms", int((time.monotonic() - started) * 1000))
+    return result
+
+
 def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, Any]:
     """Run a Python train/predict submission without exposing private labels."""
 
@@ -289,10 +388,18 @@ def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, A
         public_path = _task_file(assets_path, public_dataset, "public dataset")
         hidden_path = _task_file(assets_path, hidden_dataset, "hidden dataset")
         labels_path = _task_file(assets_path, hidden_labels, "hidden labels dataset")
-        time_ms = int(_manifest_field(assets_path, "training_time_limit_ms") or _manifest_field(assets_path, "time_limit_ms") or "120000")
-        memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or "2048")
+        total_time_ms = int(_manifest_field(assets_path, "time_limit_ms") or str(_DEFAULT_MODEL_TIME_MS))
+        training_time_ms = int(_manifest_field(assets_path, "training_time_limit_ms") or str(total_time_ms))
+        memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or str(_DEFAULT_MODEL_MEMORY_MB))
+        prediction_limit_bytes = int(
+            _manifest_field(assets_path, "prediction_max_bytes") or str(_DEFAULT_PREDICTION_MAX_BYTES)
+        )
     except (FileNotFoundError, ValueError) as exc:
         return _failed(str(exc))
+    if total_time_ms < 1 or training_time_ms < 1 or training_time_ms > total_time_ms:
+        return _failed("model task has invalid time limits")
+    if not 1_024 <= prediction_limit_bytes <= _MAX_PREDICTION_MAX_BYTES:
+        return _failed("model task has an invalid prediction output limit")
 
     with tempfile.TemporaryDirectory(prefix="brunost-model-run-") as temporary:
         root = Path(temporary)
@@ -309,10 +416,10 @@ def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, A
         hidden_input.chmod(0o644)
         output_path = _submission_file(root / "output", prediction_output, "prediction output")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.parent.chmod(0o777)
+        (root / "output").chmod(0o733)
+        output_path.parent.chmod(0o733)
 
-        base_env = os.environ.copy()
-        base_env.update({
+        base_env = _child_environment({
             "BRUNOST_ML_PUBLIC_DATASET": str(public_input),
             "BRUNOST_ML_PRIVATE_DATASET": str(hidden_input),
             "BRUNOST_ML_OUTPUT_PATH": str(output_path),
@@ -320,6 +427,19 @@ def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, A
             "PYTHONHASHSEED": _manifest_field(assets_path, "seed") or "42",
             "PYTHONDONTWRITEBYTECODE": "1",
         })
+        deadline = time.monotonic() + total_time_ms / 1000
+
+        def remaining_ms() -> int:
+            return max(0, int((deadline - time.monotonic()) * 1000))
+
+        def phase_timeout(limit_ms: int, label: str) -> tuple[int | None, dict[str, Any] | None]:
+            remaining = remaining_ms()
+            if remaining <= 0:
+                return None, _failed(
+                    f"{label} exceeded the model evaluation time budget",
+                    metrics={"verdict": "time_limit_exceeded"},
+                )
+            return min(limit_ms, remaining), None
 
         baseline_enabled = (_manifest_field(assets_path, "baseline_enabled") or "false").lower() in {"1", "true", "yes", "on"}
         baseline_output: Path | None = None
@@ -331,31 +451,43 @@ def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, A
                 return _failed(str(exc))
             baseline_output = _submission_file(root / "baseline", prediction_output, "prediction output")
             baseline_output.parent.mkdir(parents=True, exist_ok=True)
-            baseline_output.parent.chmod(0o777)
+            baseline_output.parent.chmod(0o700)
             baseline_env = {**base_env, "BRUNOST_ML_OUTPUT_PATH": str(baseline_output), "BRUNOST_ML_BASELINE": "1"}
+            timeout_ms, failure = phase_timeout(training_time_ms, "baseline")
+            if failure is not None:
+                return failure
             baseline_result = _run_submission_process(
                 [sys.executable, str(baseline_path)],
                 baseline_path.parent,
                 baseline_env,
-                timeout_ms=time_ms,
+                timeout_ms=timeout_ms or 1,
                 memory_mb=memory_mb,
+                output_limit_bytes=prediction_limit_bytes,
                 drop_privileges=False,
             )
             if baseline_result.get("status") != "completed" or not baseline_output.is_file():
                 return _failed("baseline solution did not produce a valid prediction file")
+            if baseline_output.stat().st_size == 0 or baseline_output.stat().st_size > prediction_limit_bytes:
+                return _failed("baseline prediction file is empty or exceeds the output limit")
 
         participant_env = {**base_env, "BRUNOST_ML_BASELINE": "0"}
+        timeout_ms, failure = phase_timeout(training_time_ms, "participant")
+        if failure is not None:
+            return failure
         participant_result = _run_submission_process(
             [sys.executable, str(entrypoint_path)],
             submission_root,
             participant_env,
-            timeout_ms=time_ms,
+            timeout_ms=timeout_ms or 1,
             memory_mb=memory_mb,
+            output_limit_bytes=prediction_limit_bytes,
         )
         if participant_result.get("status") != "completed":
             return participant_result
         if not output_path.is_file():
             return _failed(f"submission did not create {prediction_output}")
+        if output_path.stat().st_size == 0 or output_path.stat().st_size > prediction_limit_bytes:
+            return _failed("prediction output is empty or exceeds the output limit")
 
         scored_submission = root / "scored-submission"
         shutil.copytree(submission_root, scored_submission)
@@ -370,19 +502,18 @@ def _run_model_submission(submission_path: str, assets_path: str) -> dict[str, A
         }
         if baseline_output is not None:
             scorer_values["BRUNOST_ML_BASELINE_PREDICTIONS_PATH"] = str(baseline_output)
-        scorer_keys = (*scorer_values, "BRUNOST_ML_BASELINE_PREDICTIONS_PATH")
-        previous_env = {key: os.environ.get(key) for key in scorer_keys}
-        os.environ.update(scorer_values)
-        if baseline_output is None:
-            os.environ.pop("BRUNOST_ML_BASELINE_PREDICTIONS_PATH", None)
-        try:
-            result = _run_scorer(str(scored_submission), assets_path, official_split="private", require_official=True)
-        finally:
-            for key, value in previous_env.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+        timeout_ms, failure = phase_timeout(total_time_ms, "scorer")
+        if failure is not None:
+            return failure
+        result = _run_scorer_process(
+            str(scored_submission),
+            assets_path,
+            timeout_ms=timeout_ms or 1,
+            memory_mb=memory_mb,
+            official_split="private",
+            require_official=True,
+            environment=_child_environment(scorer_values),
+        )
         result.setdefault("metrics", {})
         if participant_result.get("metrics", {}).get("training_time_ms") is not None:
             result["metrics"]["training_time_ms"] = participant_result["metrics"]["training_time_ms"]
@@ -446,7 +577,14 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
                 return _run_model_submission(submission_path, assets_path)
             # Legacy model packages predate the train/predict lifecycle and
             # keep the original public-score scorer behavior.
-            return _run_scorer(submission_path, assets_path)
+            timeout_ms = int(_manifest_field(assets_path, "time_limit_ms") or "15000")
+            memory_mb = int(_manifest_field(assets_path, "memory_limit_mb") or "4096")
+            return _run_scorer_process(
+                submission_path,
+                assets_path,
+                timeout_ms=timeout_ms,
+                memory_mb=memory_mb,
+            )
         return _run_scorer(submission_path, assets_path)
     except Exception as exc:  # noqa: BLE001 — the harness must contain all scorer errors
         detail = f"{type(exc).__name__}: {exc}"
