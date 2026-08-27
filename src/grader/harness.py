@@ -727,6 +727,10 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
             return runner(submission_path, assets_path)
         if kind in {"agent", "game"}:
             return _run_plugin(submission_path, assets_path)
+        if kind == "optimization":
+            from grader.optimization import run_optimization
+
+            return run_optimization(submission_path, assets_path)
         if kind == "model":
             return _run_model_submission_v2(submission_path, assets_path)
         return _run_scorer(submission_path, assets_path)

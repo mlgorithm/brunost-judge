@@ -3,7 +3,7 @@
 Current release: `1.3.0` — local match execution, formal agent protocols, portable artifacts, worker credentials, scoped service authentication, secret-file loading, audit logging, rate limiting, signed callbacks, capability scheduling, provider adapters, deterministic game contracts, and replay artifact results.
 
 Brunost Judge is the platform-independent judging layer for scorer-backed IOAI
-and output-only tasks, plus versioned model, ICPC, interactive, and agent
+and output-only tasks, plus versioned model, optimization, ICPC, interactive, and agent
 runners. Model tasks use the dedicated `train_predict_v2` lifecycle. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary. The built-in runtime fails

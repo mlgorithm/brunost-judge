@@ -14,14 +14,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "model", "output-only"})
+SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only"})
 # These are the task kinds executed by the built-in scorer sandbox.
 SCORER_KINDS = frozenset({"ioai", "output-only"})
 MODEL_KINDS = frozenset({"model"})
+OPTIMIZATION_KINDS = frozenset({"optimization"})
 CLASSIC_KINDS = frozenset({"icpc"})
 INTERACTIVE_KINDS = frozenset({"interactive"})
 PLUGIN_KINDS = frozenset({"agent", "game"})
-BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
+BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | OPTIMIZATION_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
 MANIFEST_VERSION = 1
 MODEL_MANIFEST_VERSION = 2
 CLASSIC_LANGUAGES = frozenset({"python", "py", "c", "cpp", "c++", "c++17", "gnu++17", "g++", "rust", "rs"})
@@ -254,6 +255,74 @@ def _validate_model_manifest(root: Path, manifest: str, errors: list[str]) -> No
         pass
 
 
+def _validate_optimization_manifest(root: Path, manifest: str, errors: list[str]) -> None:
+    """Validate the bounded code-plus-objective optimization contract."""
+
+    if _manifest_field(manifest, "runner") not in {"optimization"}:
+        errors.append("optimization tasks must declare runner: optimization")
+    language = (_manifest_field(manifest, "language") or "").lower()
+    if language not in CLASSIC_LANGUAGES:
+        errors.append("optimization tasks must declare language: python, c, cpp, or rust")
+    for field in ("time_limit_ms", "memory_limit_mb", "output_limit_bytes"):
+        _validate_positive_field(manifest, field, errors)
+    try:
+        time_limit = int(_manifest_field(manifest, "time_limit_ms") or "0")
+        memory_limit = int(_manifest_field(manifest, "memory_limit_mb") or "0")
+        output_limit = int(_manifest_field(manifest, "output_limit_bytes") or "0")
+        if not 100 <= time_limit <= 15_000:
+            errors.append("optimization time_limit_ms must be between 100 and 15000")
+        if not 64 <= memory_limit <= 4_096:
+            errors.append("optimization memory_limit_mb must be between 64 and 4096")
+        if not 1_024 <= output_limit <= 64 * 1024 * 1024:
+            errors.append("optimization output_limit_bytes must be between 1024 and 67108864")
+    except ValueError:
+        pass
+
+    if (_manifest_field(manifest, "evaluation") or "") != "evaluator:evaluate":
+        errors.append("optimization tasks must declare evaluation: evaluator:evaluate")
+    direction = (_manifest_field(manifest, "objective_direction") or "").lower()
+    if direction not in {"maximize", "minimize"}:
+        errors.append("optimization tasks must declare objective_direction: maximize or minimize")
+    score_mode = (_manifest_field(manifest, "score_mode") or "").lower()
+    if score_mode not in {"checker_score", "baseline_ratio"}:
+        errors.append("optimization tasks must declare score_mode: checker_score or baseline_ratio")
+    aggregation = (_manifest_field(manifest, "aggregation") or "").lower()
+    if aggregation not in {"mean", "minimum", "geometric_mean"}:
+        errors.append("optimization tasks must declare aggregation: mean, minimum, or geometric_mean")
+
+    evaluator_entrypoint = _manifest_field(manifest, "evaluator_entrypoint") or "private/evaluator.py"
+    _validate_relative_path(evaluator_entrypoint, "evaluator_entrypoint", errors)
+    evaluator_path = root / evaluator_entrypoint
+    if not evaluator_path.is_file():
+        errors.append(f"optimization tasks need {evaluator_entrypoint}")
+    elif evaluator_path.stat().st_size > MAX_MODEL_CODE_BYTES:
+        errors.append(f"optimization evaluator exceeds {MAX_MODEL_CODE_BYTES} bytes")
+    else:
+        _validate_python_functions(root, evaluator_entrypoint, "optimization evaluator", ("evaluate",), errors)
+
+    inputs = sorted((root / "tests").rglob("*.in")) if (root / "tests").is_dir() else []
+    if not inputs:
+        errors.append("optimization tasks need tests/*.in files")
+    if len(inputs) > 100:
+        errors.append("optimization tasks support at most 100 test inputs")
+    for input_path in inputs:
+        if input_path.stat().st_size > 1_000_000:
+            errors.append(f"optimization input {input_path.relative_to(root)} exceeds 1 MB")
+
+    baseline_enabled = _manifest_bool(manifest, "baseline_enabled")
+    baseline_entrypoint = _manifest_field(manifest, "baseline_entrypoint")
+    if score_mode == "baseline_ratio" and not baseline_enabled:
+        errors.append("baseline_ratio scoring requires baseline_enabled: true")
+    if baseline_enabled:
+        baseline_entrypoint = baseline_entrypoint or "private/baseline.py"
+        _validate_relative_path(baseline_entrypoint, "baseline_entrypoint", errors)
+        baseline_path = root / baseline_entrypoint
+        if not baseline_path.is_file():
+            errors.append(f"optimization tasks need {baseline_entrypoint}")
+        elif baseline_path.stat().st_size > MAX_MODEL_CODE_BYTES:
+            errors.append(f"optimization baseline exceeds {MAX_MODEL_CODE_BYTES} bytes")
+
+
 def validate_task(path: str | Path) -> TaskValidation:
     root = Path(path).expanduser().resolve()
     errors: list[str] = []
@@ -277,7 +346,9 @@ def validate_task(path: str | Path) -> TaskValidation:
         errors.append(f"judge.yaml must declare version: {expected_version}")
     elif version != str(expected_version):
         errors.append(f"unsupported judge.yaml version {version!r}; choose {expected_version}")
-    if kind in CLASSIC_KINDS:
+    if kind in OPTIMIZATION_KINDS:
+        _validate_optimization_manifest(root, manifest_text, errors)
+    elif kind in CLASSIC_KINDS:
         if _manifest_field(manifest_text, "runner") not in {None, "classic"}:
             errors.append("classic tasks must declare runner: classic")
         language = (_manifest_field(manifest_text, "language") or "").lower()
@@ -392,6 +463,52 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
             "Add matching .in/.ans files here, then choose scoring_mode: all_or_nothing or percentage.\n",
             encoding="utf-8",
         )
+    elif normalized_kind in OPTIMIZATION_KINDS:
+        (root / "public" / "instances").mkdir(parents=True, exist_ok=True)
+        (root / "judge.yaml").write_text(
+            """# Brunost Judge optimization task manifest
+version: 1
+kind: optimization
+runner: optimization
+language: python
+time_limit_ms: 2000
+memory_limit_mb: 512
+output_limit_bytes: 1048576
+network: disabled
+evaluation: evaluator:evaluate
+objective_direction: maximize
+score_mode: baseline_ratio
+aggregation: mean
+evaluator_entrypoint: private/evaluator.py
+baseline_enabled: true
+baseline_entrypoint: private/baseline.py
+""",
+            encoding="utf-8",
+        )
+        (root / "private" / "evaluator.py").write_text(
+            '''"""Trusted feasibility and objective evaluator."""
+
+
+def evaluate(input_path: str, output_path: str) -> dict:
+    capacity = int(open(input_path, encoding="utf-8").read().strip())
+    value = int(open(output_path, encoding="utf-8").read().strip())
+    return {"feasible": 0 <= value <= capacity, "objective": value}
+''',
+            encoding="utf-8",
+        )
+        (root / "private" / "baseline.py").write_text(
+            '''"""Reference solution for the example optimization task."""
+
+
+import sys
+
+
+print(sys.stdin.read().strip())
+''',
+            encoding="utf-8",
+        )
+        (root / "tests" / "example.in").write_text("10\n", encoding="utf-8")
+        (root / "public" / "instances" / "example.in").write_text("10\n", encoding="utf-8")
     elif normalized_kind == "model":
         (root / "public" / "datasets").mkdir(parents=True, exist_ok=True)
         (root / "private" / "datasets").mkdir(parents=True, exist_ok=True)

@@ -36,7 +36,9 @@ finished-after-cancel run as `canceled`.
 
 `ioai` and `output-only` tasks use the generic scorer contract. `model` tasks
 use the v2 train/model/predict contract documented in
-[`model-tasks.md`](model-tasks.md). `icpc` tasks use the classic batch runner
+[`model-tasks.md`](model-tasks.md). `optimization` tasks use the trusted
+feasibility/objective evaluator documented in
+[`optimization-tasks.md`](optimization-tasks.md). `icpc` tasks use the classic batch runner
 and return structured compile, test, scoring,
 verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
