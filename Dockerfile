@@ -24,4 +24,5 @@ EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/readyz', timeout=3)"
 
-CMD ["brunost", "server", "--host", "0.0.0.0", "--port", "8787"]
+ENTRYPOINT ["brunost"]
+CMD ["server", "--host", "0.0.0.0", "--port", "8787"]
