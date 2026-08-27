@@ -16,7 +16,7 @@ services:
 
   judge-api:
     build: .
-    command: ["brunost", "server", "--host", "0.0.0.0", "--port", "8787"]
+    command: ["server", "--host", "0.0.0.0", "--port", "8787"]
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_API_TOKEN: ${BRUNOST_JUDGE_API_TOKEN:-change-me-before-exposure}
@@ -44,7 +44,7 @@ services:
 
   judge-worker:
     build: .
-    command: ["brunost", "worker", "--poll-seconds", "1", "--queue", "default", "--resource-class", "cpu"]
+    command: ["worker", "--poll-seconds", "1", "--queue", "default", "--resource-class", "cpu"]
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}

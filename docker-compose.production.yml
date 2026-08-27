@@ -27,7 +27,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    command: ["brunost", "worker", "--poll-seconds", "1", "--lease-seconds", "${BRUNOST_JUDGE_LEASE_SECONDS:-300}"]
+    command: ["worker", "--poll-seconds", "1", "--lease-seconds", "${BRUNOST_JUDGE_LEASE_SECONDS:-300}"]
     environment:
       BRUNOST_JUDGE_SANDBOX_MODE: docker
       BRUNOST_JUDGE_SANDBOX_IMAGE: ${BRUNOST_JUDGE_SANDBOX_IMAGE:?set BRUNOST_JUDGE_SANDBOX_IMAGE to an immutable evaluator image}
