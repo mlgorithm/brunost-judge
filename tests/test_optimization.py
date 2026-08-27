@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from brunost_judge.task import scaffold_task, validate_task
+from grader.classic import ClassicConfig, _compile
 from grader.harness import run
 
 
@@ -112,3 +113,29 @@ def test_optimization_scaffold_is_runnable(tmp_path):
     )
     assert result["status"] == "completed", result
     assert result["score"] == pytest.approx(1.0)
+
+
+def test_optimization_stages_private_submission_source_for_contestant_user(tmp_path):
+    submission = _submission(tmp_path, "print(1)\n")
+    source = submission / "solution.py"
+    source.chmod(0o600)
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    _compile(
+        source,
+        ClassicConfig(
+            kind="optimization",
+            language="python",
+            entrypoint=None,
+            interactor="",
+            time_limit_ms=1000,
+            memory_limit_mb=256,
+            output_limit_bytes=65536,
+            answer_source="answer_key",
+            scoring_mode="percentage",
+            reference_language="python",
+            reference_entrypoint=None,
+        ),
+        build_dir,
+    )
+    assert (build_dir / "solution.py").stat().st_mode & 0o777 == 0o644

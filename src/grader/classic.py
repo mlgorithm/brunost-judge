@@ -435,6 +435,10 @@ def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list
     build_dir.chmod(0o755)
     staged_source = build_dir / source.name
     shutil.copy2(source, staged_source)
+    # Artifact extraction intentionally makes uploaded files private.  The
+    # contestant process is later dropped to UID 65533, so a preserved 0600
+    # mode would make an otherwise valid source unreadable in production.
+    staged_source.chmod(0o644)
     if config.language == "python":
         return [sys.executable, str(staged_source)], ""
     compiler_name = {"c": "gcc", "cpp": "g++", "rust": "rustc"}[config.language]
