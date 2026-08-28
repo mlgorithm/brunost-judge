@@ -99,6 +99,22 @@ def test_lease_renewal_keeps_the_current_owner(tmp_path: Path):
     assert store.claim_next(worker_id="worker-b") is None
 
 
+def test_expired_lease_cannot_be_renewed_or_finished(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "expired-finish"))
+    assert store.claim_next(worker_id="worker-a", lease_seconds=1) is not None
+    time.sleep(1.1)
+
+    assert not store.renew_lease(execution.execution_id, "worker-a", lease_seconds=60)
+    assert store.finish(
+        execution.execution_id,
+        ExecutionResult(execution.execution_id, "demo/v1", "completed", score=1.0),
+        worker_id="worker-a",
+    ) is None
+
+
 def test_idempotency_key_rejects_a_different_request(tmp_path: Path):
     store = _store(tmp_path)
     first = tmp_path / "first"

@@ -17,6 +17,12 @@ mkdir -p local-submissions
 docker compose up --build
 ```
 
+The reference profile creates PostgreSQL plus a shared `judge-artifacts` Docker
+volume for immutable bundles. The API and worker containers run with read-only
+root filesystems; the initialized artifact volume stores their shared immutable
+bundles. Stop the local stack with `docker compose down`. Add `--volumes` only
+when you deliberately want to delete the local PostgreSQL and artifact data.
+
 The API is available at `http://127.0.0.1:8787`, with interactive docs at
 `/docs` and a small operator landing page at `/console`. Register a task through
 `POST /v1/tasks`, submit an execution through `POST /v1/executions`, and poll the
@@ -63,6 +69,11 @@ The API exposes `/v1/stats` and `/v1/executions` for a lightweight operator
 view; the `/console` page uses the API token stored in the current browser. It
 also shows cluster identity, workers, regions, capabilities, and queue health,
 and can issue one-time node join tokens.
+
+For the end-to-end request, lease, artifact, and callback flow, see
+[`architecture.md`](architecture.md). The API guide includes copyable
+artifact-first requests and callback-verification rules in
+[`api.md`](api.md).
 
 For the hardened CPU worker, use the production overlay and run the canary:
 

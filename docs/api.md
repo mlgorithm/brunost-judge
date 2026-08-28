@@ -55,6 +55,66 @@ launch one bounded JSONL process per seat with deterministic turn ordering;
 see the [runner-plugin protocol](plugins.md#agent-protocol) for the wire
 contract and resource limits.
 
+## Common integration flow
+
+For a distributed deployment, use artifacts rather than `path` or
+`submission_path`. Paths are only useful when the API can safely see the local
+directory; artifacts are immutable and work across separate API and worker
+hosts.
+
+```bash
+export BRUNOST_JUDGE_URL=https://judge.example
+export BRUNOST_JUDGE_API_TOKEN='replace-with-service-token'
+
+# Each command prints JSON containing artifact_id. Copy those values into the
+# following requests, or use the SDK's upload_artifact()/submit_directory().
+brunost artifact upload ./tasks/sum --url "$BRUNOST_JUDGE_URL" --token "$BRUNOST_JUDGE_API_TOKEN"
+brunost artifact upload ./submissions/alice-1 --url "$BRUNOST_JUDGE_URL" --token "$BRUNOST_JUDGE_API_TOKEN"
+
+curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/tasks" \
+  -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"task_ref":"sum/v1","artifact_id":"<task-artifact-id>","kind":"icpc"}'
+
+curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/evaluations" \
+  -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"task_ref":"sum/v1","submission_artifact_id":"<submission-artifact-id>","idempotency_key":"platform-submission-123","queue":"default","resource_class":"cpu"}'
+```
+
+The `202 Accepted` response contains `execution_id` (also returned as the
+compatibility alias `evaluation_id`). Poll it until its status is terminal:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \
+  "$BRUNOST_JUDGE_URL/v1/executions/<execution-id>"
+```
+
+Provide exactly one of `submission_path` and `submission_artifact_id`. Task
+registration has the equivalent `path`/`artifact_id` choice. The API snapshots
+an accepted path immediately, but an integrating service should normally
+upload the bundle itself and retain the returned artifact ID for auditability.
+
+### Request, retry, and result rules
+
+| Situation | Expected behaviour for an integration |
+| --- | --- |
+| Network failure before a submission response | Retry the identical request with the identical idempotency key. |
+| Same idempotency key and same request | Receive the original execution; do not create another platform attempt. |
+| Same idempotency key with changed inputs | Receive `409 Conflict`; create a new platform attempt and key. |
+| `202 Accepted` | Poll `/v1/executions/{id}` or wait for the callback. Accepted does not mean evaluated. |
+| `completed`, `failed`, or `canceled` | Terminal. Store the result against the platform’s attempt once. |
+| `429 Too Many Requests` | Back off for the `Retry-After` interval and retry safely. |
+| `422 Unprocessable Content` | Correct the request/task bundle; retries alone will not help. |
+| `503 Service Unavailable` | Treat as transient only after checking deployment configuration, especially callback and secret settings. |
+
+Terminal records include `score`, `metrics`, optional per-seat `scores`,
+optional `winner`, and result `artifacts`. A canceled result has no score or
+result artifacts. `metadata` returned on the execution includes judge-owned
+provenance such as `task_digest`, `runtime_image`, evaluator, and `event_id`.
+Workers cannot replace those fields in their finish request.
+
 ## Authentication
 
 Set `BRUNOST_JUDGE_API_TOKEN` and send `Authorization: Bearer <token>`. The
@@ -114,6 +174,45 @@ Register a task with `artifact_id` and submit an evaluation with
 duplicate names, archive member/count/expansion limits, checksum mismatches, and
 bundles larger than the configured limit.
 
+## Callback receiver contract
+
+Callbacks are a convenience for low-latency result delivery; polling remains
+available as the recovery path. Treat every callback as at-least-once and keep
+an application-level record keyed by `X-Brunost-Judge-Event-ID` (the same value
+is in the result’s `event_id`).
+
+When a callback signing secret is configured, workers send these headers:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Brunost-Judge-Timestamp` | Unix epoch seconds when the callback was signed |
+| `X-Brunost-Judge-Event-ID` | Stable execution result event ID |
+| `X-Brunost-Judge-Signature` | `sha256=` followed by HMAC-SHA256 of `timestamp.event_id.raw-body` |
+| `Authorization` | Optional bearer token supplied on the evaluation request |
+
+Verify the signature against the exact raw request body before decoding it,
+reject timestamps outside the receiver’s replay window (the SDK default is
+five minutes), and then de-duplicate the event ID in the same transaction that
+applies the result. Do not use a callback’s arrival time or an execution ID
+alone as the deduplication key. The SDK exposes the compatible verifier:
+
+```python
+from brunost_judge.sdk import JudgeClient
+
+valid = JudgeClient.verify_callback(
+    raw_body,
+    secret=callback_secret,
+    timestamp=request.headers["X-Brunost-Judge-Timestamp"],
+    event_id=request.headers["X-Brunost-Judge-Event-ID"],
+    signature=request.headers["X-Brunost-Judge-Signature"],
+    require_event_id=True,
+)
+```
+
+In production, callbacks require an allowlisted host and HTTPS. Workers do not
+follow callback redirects. See [production.md](production.md) for the required
+environment settings and [rollout.md](rollout.md) for replay testing.
+
 ## Worker lifecycle
 
 Workers register their capabilities, send heartbeats, and can be drained before
@@ -138,6 +237,13 @@ When a node enrollment request includes `capabilities` or `resource_classes`,
 the registered worker uses that reported subset (which must be within the
 operator-approved enrollment token). Older nodes that omit an inventory retain
 the token's approved inventory for compatibility.
+
+`claim` returns `204 No Content` when no compatible execution is queued. A
+claimed execution includes its task, artifact references, callback context, and
+`lease_seconds`. A worker should renew at a fraction of that duration, check
+the cancellation endpoint while evaluating, and finish only with a terminal
+result. A finish or renewal after cancellation, lease expiry, or ownership
+change returns `409 Conflict`; the worker must discard that stale result.
 
 The scheduler must never infer a GPU or runtime capability from a hostname. A
 worker advertises capabilities such as `gpu:true`, `runtime:kubernetes`, and

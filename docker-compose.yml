@@ -60,6 +60,10 @@ services:
   judge-worker:
     build: .
     command: ["worker", "--poll-seconds", "1", "--queue", "default", "--resource-class", "cpu"]
+    # The image healthcheck probes the API's /readyz endpoint; a worker is not
+    # an HTTP service, so inherit no HTTP healthcheck from the shared image.
+    healthcheck:
+      disable: true
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}

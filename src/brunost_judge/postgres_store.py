@@ -491,7 +491,8 @@ class PostgresJudgeStore:
                    artifacts_json=CASE WHEN cancel_requested THEN '{}'::jsonb ELSE %s::jsonb END,
                    failure_reason=CASE WHEN cancel_requested THEN 'execution canceled while running' ELSE %s END,
                    worker_id=NULL,lease_expires_at=NULL,updated_at=%s
-                   WHERE execution_id=%s AND worker_id=%s AND status='running'""",
+                   WHERE execution_id=%s AND worker_id=%s AND status='running'
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at >= NOW()""",
                 (
                     result.status,
                     result.score,
@@ -516,8 +517,9 @@ class PostgresJudgeStore:
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE executions SET lease_expires_at=%s,updated_at=%s
-                   WHERE execution_id=%s AND worker_id=%s AND status='running' AND cancel_requested=FALSE""",
-                (now + timedelta(seconds=max(1, lease_seconds)), now, execution_id, worker_id),
+                   WHERE execution_id=%s AND worker_id=%s AND status='running' AND cancel_requested=FALSE
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at >= %s""",
+                (now + timedelta(seconds=max(1, lease_seconds)), now, execution_id, worker_id, now),
             )
         return cursor.rowcount == 1
 

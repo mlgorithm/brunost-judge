@@ -117,6 +117,24 @@ in CI.
 The API and provider model are documented in [`docs/api.md`](docs/api.md) and
 [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md).
 
+## Documentation guide
+
+Use the document that matches the role you are performing; the Judge keeps
+execution concerns separate from contest and identity policy.
+
+| If you are… | Start here | Then read |
+| --- | --- | --- |
+| Trying the Judge on one machine | [`docs/standalone.md`](docs/standalone.md) | [`docs/local-worker-smoke-test.md`](docs/local-worker-smoke-test.md) |
+| Integrating an LMS, contest system, or submission service | [`docs/api.md`](docs/api.md) | [`docs/ownership.md`](docs/ownership.md) and [`docs/architecture.md`](docs/architecture.md) |
+| Authoring a task | This README’s runner sections | [`docs/model-tasks.md`](docs/model-tasks.md), [`docs/optimization-tasks.md`](docs/optimization-tasks.md), or [`docs/plugins.md`](docs/plugins.md) |
+| Adding a CPU/GPU worker node | [`docs/node-onboarding.md`](docs/node-onboarding.md) | [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md) |
+| Operating a shared or official contest deployment | [`docs/production.md`](docs/production.md) | [`docs/rollout.md`](docs/rollout.md) and [`docs/architecture.md`](docs/architecture.md) |
+
+The most useful production reading order is: architecture, API contract,
+production profile, node onboarding, then the supervised rollout checklist.
+The OpenAPI schema at `/openapi.json` is the authoritative field-level HTTP
+reference for the version of the server you are running.
+
 ## Generic scorer contract
 
 Generic scorer tasks receive these inputs (mounted read-only into a sealed sandbox by the worker):

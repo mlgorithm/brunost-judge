@@ -13,6 +13,11 @@ can run it in its own infrastructure.
   read-only/read-write paths respectively.
 - Confirm the task package hash and scorer version in the contest manifest.
 - Confirm PostgreSQL backups and a tested restore in a separate environment.
+- Record the API, worker, evaluator-image, task-bundle, and scorer digests in
+  the change record. A canary result is only meaningful when these inputs are
+  known and can be reproduced.
+- Confirm the callback receiver has an event-ID unique constraint or equivalent
+  durable de-duplication before it receives live traffic.
 
 ## Smoke test
 
@@ -31,6 +36,11 @@ can run it in its own infrastructure.
    reclaims the execution.
 6. Confirm `/v1/stats` returns zero queued/running work after the callback.
 
+Capture the terminal execution JSON, callback receiver log, `/v1/stats`, and
+image/task digests as the canary evidence. If any check fails, keep traffic on
+the existing path, drain the affected worker pool, and preserve those artifacts
+for diagnosis instead of re-running the same canary without a change.
+
 The same workflow is covered in CI by
 `tests/test_distributed_canary.py`. It starts a real HTTP API, enrolls a remote
 worker, downloads artifacts over the worker API, verifies a signed callback,
@@ -46,3 +56,18 @@ gateway flag and draining the standalone queues; no platform tables are shared.
 Do not promote to an official contest until sandbox escape, network egress,
 resource exhaustion, database restore, and worker-loss tests are documented by
 the hosting operator.
+
+## Minimum release record
+
+For each promotion, retain:
+
+- the commit, container image digests, evaluator-image digests, and task
+  artifact digests;
+- the canary execution ID and its terminal JSON response;
+- the callback receiver’s de-duplication/replay evidence;
+- the worker IDs, queues, resource classes, and capabilities used;
+- the most recent successful backup and restore-drill timestamp; and
+- the named operator who can drain workers and roll back the gateway.
+
+This record turns a successful smoke test into a reproducible release decision,
+and gives the next operator enough context to investigate a later regression.

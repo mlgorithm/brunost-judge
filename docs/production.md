@@ -49,6 +49,12 @@ export BRUNOST_JUDGE_SANDBOX_IMAGES='{"python-3.13":"ghcr.io/example/brunost-jud
 docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d
 ```
 
+The base Compose profile creates `judge-artifacts`, a shared writable named
+volume. It is initialized before the read-only API and worker containers start.
+That makes the reference deployment runnable without weakening their
+read-only root filesystems. It is still a single-host convenience volume: use
+an S3/MinIO-compatible backend for a multi-host control plane and workers.
+
 The overlay makes the worker's Docker socket explicit, but every evaluator is
 still launched with no network, read-only rootfs, dropped capabilities, quotas,
 and the configured gVisor/Kata runtime. The classic runner gives the evaluator
@@ -129,3 +135,23 @@ signing secret on both services. The open-source `brunost-deploy` repository
 automates this Judge control-plane/worker deployment boundary; it does not
 deploy Premium. Keep the current in-repo worker available until the canary has
 passed and a rollback window has closed.
+
+## Configuration safety gate
+
+Before starting a shared deployment, verify these settings are intentional.
+
+| Setting | Production expectation | Why it matters |
+| --- | --- | --- |
+| `BRUNOST_JUDGE_DATABASE_URL` | PostgreSQL URL, supplied as a secret | SQLite has no multi-host durability or coordination guarantee |
+| `BRUNOST_JUDGE_API_TOKEN_FILE` | Mounted secret file; do not use Compose defaults | Protects every control-plane mutation |
+| `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN` | `true` | Limits claims, leases, and finishes to enrolled workers |
+| `BRUNOST_JUDGE_ARTIFACT_BACKEND` | Replicated object storage for multi-host deployments | Makes immutable task/submission bundles available to every worker |
+| `BRUNOST_JUDGE_SANDBOX_MODE` | `docker` with a certified runtime | Prevents a production fallback to the development process runner |
+| `BRUNOST_JUDGE_SANDBOX_IMAGES` | Every allowed runtime mapped to a digest-pinned image | Prevents unreviewed runtime image drift |
+| `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE` | Mounted secret file, with signed callbacks required | Enables callback authenticity and replay protection |
+| `BRUNOST_JUDGE_CALLBACK_HOSTS` | Explicit callback receiver allowlist | Prevents callback SSRF to arbitrary hosts |
+| `BRUNOST_JUDGE_LEASE_SECONDS` | Longer than normal renewal latency, shorter than recovery tolerance | Balances worker-loss recovery against long-running evaluations |
+
+Use `docker compose ... config --quiet` with all required variables supplied
+before bringing up the hardened overlay. Never point a production service at
+the reference Compose defaults or an untested host Docker socket.

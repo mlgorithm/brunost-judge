@@ -630,6 +630,7 @@ class JudgeStore:
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
         if not worker_id.strip():
             raise ValueError("worker_id is required to finish an execution")
+        now = _now()
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 """UPDATE executions SET
@@ -641,7 +642,8 @@ class JudgeStore:
                    artifacts_json=CASE WHEN cancel_requested=1 THEN '{}' ELSE ? END,
                    failure_reason=CASE WHEN cancel_requested=1 THEN 'execution canceled while running' ELSE ? END,
                    worker_id=NULL,lease_expires_at=NULL,updated_at=?
-                   WHERE execution_id=? AND worker_id=? AND status='running'""",
+                   WHERE execution_id=? AND worker_id=? AND status='running'
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at >= ?""",
                 (
                     result.status,
                     result.score,
@@ -650,9 +652,10 @@ class JudgeStore:
                     result.winner,
                     json.dumps(result.artifacts, sort_keys=True),
                     result.failure_reason,
-                    _now(),
+                    now,
                     execution_id,
                     worker_id,
+                    now,
                 ),
             )
         if cursor.rowcount == 0:
@@ -666,12 +669,14 @@ class JudgeStore:
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 """UPDATE executions SET lease_expires_at=?,updated_at=?
-                   WHERE execution_id=? AND worker_id=? AND status='running' AND cancel_requested=0""",
+                   WHERE execution_id=? AND worker_id=? AND status='running' AND cancel_requested=0
+                   AND lease_expires_at IS NOT NULL AND lease_expires_at >= ?""",
                 (
                     (now + timedelta(seconds=max(1, lease_seconds))).isoformat(),
                     now.isoformat(),
                     execution_id,
                     worker_id,
+                    now.isoformat(),
                 ),
             )
         return cursor.rowcount == 1
