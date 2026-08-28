@@ -126,7 +126,7 @@ execution concerns separate from contest and identity policy.
 | --- | --- | --- |
 | Trying the Judge on one machine | [`docs/standalone.md`](docs/standalone.md) | [`docs/local-worker-smoke-test.md`](docs/local-worker-smoke-test.md) |
 | Integrating an LMS, contest system, or submission service | [`docs/api.md`](docs/api.md) | [`docs/ownership.md`](docs/ownership.md) and [`docs/architecture.md`](docs/architecture.md) |
-| Authoring a task | This README’s runner sections | [`docs/model-tasks.md`](docs/model-tasks.md), [`docs/optimization-tasks.md`](docs/optimization-tasks.md), or [`docs/plugins.md`](docs/plugins.md) |
+| Authoring a task | This README’s runner sections | [`docs/classic-tasks.md`](docs/classic-tasks.md), [`docs/model-tasks.md`](docs/model-tasks.md), [`docs/optimization-tasks.md`](docs/optimization-tasks.md), or [`docs/plugins.md`](docs/plugins.md) |
 | Adding a CPU/GPU worker node | [`docs/node-onboarding.md`](docs/node-onboarding.md) | [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md) |
 | Operating a shared or official contest deployment | [`docs/production.md`](docs/production.md) | [`docs/rollout.md`](docs/rollout.md) and [`docs/architecture.md`](docs/architecture.md) |
 
@@ -196,9 +196,11 @@ version: 1
 kind: icpc
 runner: classic
 language: cpp
+runtime: python-3.13
 time_limit_ms: 2000
 memory_limit_mb: 512
 output_limit_bytes: 1048576
+network: disabled
 scoring_mode: all_or_nothing # or percentage
 ```
 
@@ -224,6 +226,13 @@ The local process runner remains a development mode only.
 Production workers fail closed unless `BRUNOST_JUDGE_SANDBOX_MODE=docker` is
 explicitly configured with a digest-pinned evaluator image. Artifact-backed
 tasks and submissions are verified by SHA-256 before execution.
+
+The package's runtime, scheduling labels, resource class, and network policy
+are authoritative at registration; callers cannot replace them when creating
+an evaluation. `brunost task validate` also rejects ambiguous answer keys,
+orphan answer files, oversized test sets, and reference solutions outside
+`private/`. See [`docs/classic-tasks.md`](docs/classic-tasks.md) for the full
+ICPC package, checker, reference-solution, and CI contract.
 
 `interactive` task packages use the same manifest and `tests/**/*.in` layout,
 but provide an `interactor.py` with `interact(session, input_path)`. The

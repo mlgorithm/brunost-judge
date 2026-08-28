@@ -2,6 +2,7 @@ version: 1
 kind: icpc
 runner: classic
 language: python
+runtime: python-3.13
 time_limit_ms: 1000
 memory_limit_mb: 256
 output_limit_bytes: 1048576

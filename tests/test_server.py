@@ -89,6 +89,58 @@ def test_ioai_manifest_controls_registration_and_scheduling(tmp_path: Path):
     assert submitted.json()["metadata"]["required_capabilities"] == ["gpu:true", "runtime:cuda", "runtime:docker"]
 
 
+def test_icpc_manifest_controls_runtime_scheduling_and_execution_budget(tmp_path: Path):
+    task = tmp_path / "task"
+    for directory in ("public", "private", "tests"):
+        (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "runtime: classic-python-v1\ntime_limit_ms: 1000\n"
+        "resource_class: gpu\nrequired_capabilities: gpu:true, runtime:classic\n"
+        "network: disabled\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "one.in").write_text("2\n", encoding="utf-8")
+    (task / "tests" / "one.ans").write_text("4\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+
+    registered = client.post(
+        "/v1/tasks",
+        json={
+            "task_ref": "classic/gpu-v1",
+            "path": str(task),
+            "runtime": "caller-cannot-override-classic-runtime",
+            "evaluator": "caller-cannot-override-classic-evaluator",
+            "required_capabilities": ["runtime:docker"],
+        },
+    )
+
+    assert registered.status_code == 201
+    manifest = registered.json()["manifest"]
+    assert manifest["runtime"] == "classic-python-v1"
+    assert manifest["evaluator"] == "grader.classic:run_classic"
+    assert manifest["resource_class"] == "gpu"
+    assert manifest["required_capabilities"] == ["gpu:true", "runtime:classic", "runtime:docker"]
+    assert manifest["execution_timeout_seconds"] == 36
+
+    submitted = client.post(
+        "/v1/evaluations",
+        json={
+            "task_ref": "classic/gpu-v1",
+            "submission_path": str(submission),
+            "idempotency_key": "classic-manifest-settings",
+            "resource_class": "cpu",
+            "timeout_seconds": 120,
+        },
+    )
+
+    assert submitted.status_code == 202
+    assert submitted.json()["resource_class"] == "gpu"
+    assert submitted.json()["metadata"]["required_capabilities"] == ["gpu:true", "runtime:classic", "runtime:docker"]
+
+
 def test_api_token_protects_control_plane(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_API_TOKEN", "secret")
     client = TestClient(create_app(tmp_path / "judge.db"))

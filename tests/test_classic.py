@@ -5,7 +5,7 @@ import pytest
 from brunost_judge.contracts import ExecutionRequest, TaskRecord
 from brunost_judge.store import JudgeStore
 from brunost_judge.task import validate_task
-from brunost_judge.worker import LocalWorker
+from brunost_judge.worker import LocalWorker, _execution_timeout
 from grader.classic import _sandbox_command, run_classic
 from grader.harness import run
 
@@ -225,6 +225,29 @@ def test_classic_runner_enforces_output_limit_after_clean_exit(tmp_path):
     assert result["metrics"]["tests"][0]["verdict"] == "OLE"
 
 
+def test_classic_runner_stops_unbounded_stderr(tmp_path):
+    task = _task(tmp_path)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "output_limit_bytes: 4194304\n",
+        encoding="utf-8",
+    )
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    (submission / "solution.py").write_text(
+        "import sys\n"
+        "sys.stderr.write('x' * 2_000_000)\n"
+        "print(int(input()) * 2)\n",
+        encoding="utf-8",
+    )
+
+    result = run_classic(str(submission), str(task))
+
+    assert result["status"] == "completed", result
+    assert result["score"] == 0.0
+    assert result["metrics"]["verdict"] == "OLE"
+
+
 def test_interactive_runner_dispatches_line_protocol(tmp_path):
     task = _interactive_task(tmp_path)
     submission = tmp_path / "submission"
@@ -284,6 +307,66 @@ def test_classic_task_validation_requires_test_answers(tmp_path):
 
     assert not result.valid
     assert any("missing .ans or .out" in error for error in result.errors)
+
+
+def test_classic_task_validation_rejects_ambiguous_answers_or_orphans(tmp_path):
+    task = _task(tmp_path)
+    (task / "tests" / "basic" / "one.out").write_text("4\n", encoding="utf-8")
+    (task / "tests" / "orphan.ans").write_text("unused\n", encoding="utf-8")
+
+    result = validate_task(task)
+
+    assert not result.valid
+    assert any("both .ans and .out" in error for error in result.errors)
+    assert any("orphan answer file" in error for error in result.errors)
+
+
+def test_classic_task_validation_keeps_reference_code_private_and_checks_checker(tmp_path):
+    task = _reference_task(tmp_path)
+    (task / "public" / "reference.py").write_text("def broken(:\n", encoding="utf-8")
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "answer_source: reference\nreference_entrypoint: public/reference.py\n"
+        "network: enabled\n",
+        encoding="utf-8",
+    )
+    (task / "checker.py").write_text("def wrong_name(): pass\n", encoding="utf-8")
+
+    result = validate_task(task)
+
+    assert not result.valid
+    assert "reference_entrypoint must be stored under private/" in result.errors
+    assert any("classic reference has invalid Python syntax" in error for error in result.errors)
+    assert "checker must define check()" in result.errors
+    assert "classic tasks must declare network: disabled when network is specified" in result.errors
+
+
+def test_classic_task_validation_bounds_the_execution_envelope(tmp_path):
+    task = _task(tmp_path)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "time_limit_ms: 60001\nmemory_limit_mb: 32\noutput_limit_bytes: 512\n",
+        encoding="utf-8",
+    )
+
+    result = validate_task(task)
+
+    assert not result.valid
+    assert "classic time_limit_ms must be between 100 and 60000" in result.errors
+    assert "classic memory_limit_mb must be between 64 and 4096" in result.errors
+    assert "classic output_limit_bytes must be between 1024 and 67108864" in result.errors
+
+
+def test_classic_task_settings_derive_a_whole_evaluation_timeout(tmp_path):
+    task = _task(tmp_path)
+
+    validation = validate_task(task)
+
+    assert validation.valid, validation.errors
+    # 5s setup + 30s compile + 2 one-second test runs.
+    assert validation.settings["execution_timeout_seconds"] == 37
+    assert _execution_timeout({"timeout_seconds": 120}, validation.settings) == 37
+    assert _execution_timeout({"timeout_seconds": 10}, validation.settings) == 10
 
 
 def test_classic_task_validation_requires_supported_manifest_version(tmp_path):

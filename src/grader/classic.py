@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 MAX_DIAGNOSTIC_CHARS = 4000
+MAX_STDERR_BYTES = 1 << 20
 DEFAULT_TIME_LIMIT_MS = 2000
 DEFAULT_MEMORY_LIMIT_MB = 512
 DEFAULT_OUTPUT_LIMIT_BYTES = 1 << 20
@@ -385,6 +386,7 @@ def _run_process(
             return ProcessOutcome("judge_error", 0.0, 0, str(exc))
         timed_out = False
         output_limited = False
+        stderr_limited = False
         while process.poll() is None:
             if (
                 stdout_path
@@ -395,6 +397,10 @@ def _run_process(
                 output_limited = True
                 _kill_process(process)
                 break
+            if os.fstat(stderr_file.fileno()).st_size > MAX_STDERR_BYTES:
+                stderr_limited = True
+                _kill_process(process)
+                break
             if (time.monotonic() - started) * 1000 > timeout_ms:
                 timed_out = True
                 _kill_process(process)
@@ -403,9 +409,14 @@ def _run_process(
         process.wait()
         elapsed_ms = (time.monotonic() - started) * 1000
         output_bytes = stdout_path.stat().st_size if stdout_path and stdout_path.exists() else 0
+        stderr_limited = stderr_limited or os.fstat(stderr_file.fileno()).st_size > MAX_STDERR_BYTES
         stderr_file.seek(0)
         stderr = stderr_file.read(MAX_DIAGNOSTIC_CHARS).decode("utf-8", errors="replace")
-        if output_limited or (
+        if stderr_limited:
+            verdict = "OLE"
+            marker = "\nstderr exceeded the diagnostic limit"
+            stderr = stderr[:MAX_DIAGNOSTIC_CHARS - len(marker)] + marker
+        elif output_limited or (
             stdout_path and output_limit_bytes is not None and output_bytes > output_limit_bytes
         ):
             verdict = "OLE"
@@ -442,7 +453,17 @@ def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list
     if config.language == "python":
         return [sys.executable, str(staged_source)], ""
     compiler_name = {"c": "gcc", "cpp": "g++", "rust": "rustc"}[config.language]
-    compiler = os.environ.get("BRUNOST_JUDGE_" + compiler_name.upper(), compiler_name)
+    compiler_setting = {
+        "c": "BRUNOST_JUDGE_C_COMPILER",
+        "cpp": "BRUNOST_JUDGE_CPP_COMPILER",
+        "rust": "BRUNOST_JUDGE_RUST_COMPILER",
+    }[config.language]
+    # Keep the original variable as a programmatic compatibility fallback.
+    # ``BRUNOST_JUDGE_G++`` cannot be exported from a POSIX shell, whereas the
+    # explicit ``CPP_COMPILER`` name can.
+    compiler = os.environ.get(compiler_setting) or os.environ.get(
+        "BRUNOST_JUDGE_" + compiler_name.upper(), compiler_name
+    )
     if not shutil.which(compiler):
         raise ClassicJudgeError(f"required compiler is unavailable: {compiler}")
     binary = build_dir / "program"

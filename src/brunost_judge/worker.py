@@ -137,15 +137,29 @@ def _validated_runner_result(raw: object) -> dict:
 
 
 def _execution_timeout(metadata: dict[str, Any], task_manifest: dict[str, Any]) -> int | None:
-    value = metadata.get("timeout_seconds")
-    if value is None and task_manifest.get("time_limit_ms") is not None:
-        value = (int(task_manifest["time_limit_ms"]) + 999) // 1000
-    if value is None:
-        return None
-    try:
-        return max(1, min(86400, int(value)))
-    except (TypeError, ValueError):
-        return None
+    """Return the strictest valid platform or task execution deadline.
+
+    A classic task's wall-time estimate covers compilation and every test, so
+    it must not be replaced by a longer client-supplied timeout. Older task
+    records retain their former single-test ``time_limit_ms`` fallback.
+    """
+
+    values = [metadata.get("timeout_seconds"), task_manifest.get("execution_timeout_seconds")]
+    if task_manifest.get("execution_timeout_seconds") is None:
+        legacy_limit = task_manifest.get("time_limit_ms")
+        try:
+            values.append((int(legacy_limit) + 999) // 1_000 if legacy_limit is not None else None)
+        except (TypeError, ValueError):
+            values.append(None)
+    limits: list[int] = []
+    for value in values:
+        if value is None:
+            continue
+        try:
+            limits.append(max(1, min(86_400, int(value))))
+        except (TypeError, ValueError):
+            continue
+    return min(limits) if limits else None
 
 
 def _configured_sandbox(runner: SandboxRunner, timeout_seconds: int | None) -> SandboxRunner:

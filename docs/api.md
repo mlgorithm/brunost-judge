@@ -66,6 +66,16 @@ request’s resource class, and declared capabilities are combined with any
 operator-supplied capabilities before worker selection. Feedback/leaderboard
 visibility is platform policy and is not a Judge task-manifest field.
 
+For `icpc` tasks, the package likewise owns `runtime`, `network`,
+`resource_class`, and `required_capabilities`. Registration records the classic
+runner evaluator plus the derived whole-evaluation timeout, which includes
+compilation and every private test; a request may shorten that deadline but
+cannot extend it. Classic package validation requires one answer key per input
+(`.ans` or `.out`), rejects stale/orphan answers, and requires a generated
+reference solution to remain under `private/`. See
+[`classic-tasks.md`](classic-tasks.md) for the manifest and trusted-checker
+contract.
+
 ## Common integration flow
 
 For a distributed deployment, use artifacts rather than `path` or

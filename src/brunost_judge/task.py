@@ -35,6 +35,19 @@ MIN_MODEL_TIME_MS = 1_000
 MAX_MODEL_TIME_MS = 3_600_000
 MIN_MODEL_MEMORY_MB = 64
 MAX_MODEL_MEMORY_MB = 16_384
+DEFAULT_CLASSIC_TIME_LIMIT_MS = 2_000
+DEFAULT_CLASSIC_MEMORY_MB = 512
+DEFAULT_CLASSIC_OUTPUT_LIMIT_BYTES = 1 << 20
+MAX_CLASSIC_TIME_LIMIT_MS = 60_000
+MAX_CLASSIC_MEMORY_MB = 4_096
+MAX_CLASSIC_OUTPUT_LIMIT_BYTES = 64 * 1024 * 1024
+MAX_CLASSIC_TESTS = 200
+MAX_CLASSIC_TEST_INPUT_BYTES = 32 * 1024 * 1024
+MAX_CLASSIC_TOTAL_TEST_BYTES = 512 * 1024 * 1024
+MAX_CLASSIC_CODE_BYTES = 1_000_000
+MAX_CLASSIC_WALL_TIME_MS = 3_600_000
+CLASSIC_COMPILE_BUDGET_MS = 30_000
+CLASSIC_SETUP_BUDGET_MS = 5_000
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
 
@@ -74,18 +87,29 @@ def _manifest_list(manifest: str, name: str) -> tuple[str, ...]:
     return tuple(item.strip().strip("\"'") for item in value.split(",") if item.strip())
 
 
-def _scorer_settings(manifest: str) -> dict[str, Any]:
-    """Return generic-scorer settings that affect registration or scheduling."""
+def _scheduling_settings(manifest: str, *, default_runtime: str | None = None) -> dict[str, Any]:
+    """Return task-owned settings that affect registration or worker selection."""
 
     settings: dict[str, Any] = {}
     for name in ("runtime", "scoring", "network", "resource_class"):
         value = _manifest_field(manifest, name)
         if value:
             settings[name] = value
+    if default_runtime and "runtime" not in settings:
+        settings["runtime"] = default_runtime
     capabilities = _manifest_list(manifest, "required_capabilities")
     if capabilities:
         settings["required_capabilities"] = capabilities
     return settings
+
+
+def _validate_scheduling_labels(manifest: str, errors: list[str]) -> None:
+    resource_class = _manifest_field(manifest, "resource_class")
+    if resource_class and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,49}", resource_class):
+        errors.append("resource_class must contain only letters, numbers, '.', '_', ':', or '-'")
+    capabilities = _manifest_list(manifest, "required_capabilities")
+    if len(capabilities) > 32 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", item) for item in capabilities):
+        errors.append("required_capabilities must contain at most 32 valid capability labels")
 
 
 def _validate_scorer_manifest(root: Path, manifest: str, errors: list[str]) -> dict[str, Any]:
@@ -111,13 +135,8 @@ def _validate_scorer_manifest(root: Path, manifest: str, errors: list[str]) -> d
     if _manifest_field(manifest, "feedback") is not None:
         errors.append("feedback is platform policy; do not declare it in a Judge task manifest")
 
-    resource_class = _manifest_field(manifest, "resource_class")
-    if resource_class and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,49}", resource_class):
-        errors.append("resource_class must contain only letters, numbers, '.', '_', ':', or '-'")
-    capabilities = _manifest_list(manifest, "required_capabilities")
-    if len(capabilities) > 32 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", item) for item in capabilities):
-        errors.append("required_capabilities must contain at most 32 valid capability labels")
-    return _scorer_settings(manifest)
+    _validate_scheduling_labels(manifest, errors)
+    return _scheduling_settings(manifest)
 
 
 def _validate_relative_path(value: str, label: str, errors: list[str]) -> None:
@@ -193,6 +212,130 @@ def _validate_positive_field(manifest: str, name: str, errors: list[str]) -> Non
             raise ValueError
     except ValueError:
         errors.append(f"{name} must be a positive integer")
+
+
+def _manifest_positive_int(manifest: str, name: str, default: int, errors: list[str]) -> int | None:
+    """Read a positive integer while retaining the validator's useful errors."""
+
+    value = _manifest_field(manifest, name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        errors.append(f"{name} must be a positive integer")
+        return None
+    if parsed < 1:
+        errors.append(f"{name} must be a positive integer")
+        return None
+    return parsed
+
+
+def _is_private_path(value: str) -> bool:
+    return Path(value).parts[:1] == ("private",)
+
+
+def _validate_classic_tests(
+    root: Path,
+    *,
+    answer_source: str,
+    output_limit_bytes: int | None,
+    errors: list[str],
+) -> tuple[Path, ...]:
+    """Validate answer pairing and bound the data a classic runner will read."""
+
+    tests_root = root / "tests"
+    inputs = tuple(sorted(tests_root.rglob("*.in"))) if tests_root.is_dir() else ()
+    if not inputs:
+        errors.append("classic tasks need tests/*.in files")
+        return ()
+    if len(inputs) > MAX_CLASSIC_TESTS:
+        errors.append(f"classic tasks support at most {MAX_CLASSIC_TESTS} test inputs")
+
+    total_bytes = 0
+    expected_outputs: set[Path] = set()
+    for input_path in inputs:
+        relative = input_path.relative_to(root)
+        try:
+            input_size = input_path.stat().st_size
+        except OSError as exc:
+            errors.append(f"could not inspect test {relative}: {exc}")
+            continue
+        total_bytes += input_size
+        if input_size > MAX_CLASSIC_TEST_INPUT_BYTES:
+            errors.append(f"classic input {relative} exceeds {MAX_CLASSIC_TEST_INPUT_BYTES} bytes")
+
+        answers = tuple(candidate for candidate in (input_path.with_suffix(".ans"), input_path.with_suffix(".out")) if candidate.is_file())
+        expected_outputs.update((input_path.with_suffix(".ans"), input_path.with_suffix(".out")))
+        if answer_source == "answer_key":
+            if not answers:
+                errors.append(f"test {relative} is missing .ans or .out")
+                continue
+            if len(answers) > 1:
+                errors.append(f"test {relative} has both .ans and .out; provide exactly one")
+                continue
+            answer_size = answers[0].stat().st_size
+            total_bytes += answer_size
+            if output_limit_bytes is not None and answer_size > output_limit_bytes:
+                errors.append(f"answer {answers[0].relative_to(root)} exceeds output_limit_bytes")
+        elif answers:
+            errors.append(f"reference task test {relative} must not include .ans or .out")
+
+    for answer_path in sorted(
+        item for suffix in ("*.ans", "*.out") for item in tests_root.rglob(suffix)
+    ):
+        if answer_path not in expected_outputs:
+            errors.append(f"orphan answer file {answer_path.relative_to(root)} has no matching .in")
+    if total_bytes > MAX_CLASSIC_TOTAL_TEST_BYTES:
+        errors.append(f"classic tests exceed {MAX_CLASSIC_TOTAL_TEST_BYTES} bytes in total")
+    return inputs
+
+
+def _classic_settings(root: Path, manifest: str, errors: list[str]) -> dict[str, Any]:
+    """Validate the ICPC execution envelope and return authoritative settings."""
+
+    settings = _scheduling_settings(manifest, default_runtime="python-3.13")
+    network = _manifest_field(manifest, "network")
+    if network and network.lower() != "disabled":
+        errors.append("classic tasks must declare network: disabled when network is specified")
+    settings["network"] = "disabled"
+    _validate_scheduling_labels(manifest, errors)
+
+    time_limit = _manifest_positive_int(manifest, "time_limit_ms", DEFAULT_CLASSIC_TIME_LIMIT_MS, errors)
+    memory_limit = _manifest_positive_int(manifest, "memory_limit_mb", DEFAULT_CLASSIC_MEMORY_MB, errors)
+    output_limit = _manifest_positive_int(manifest, "output_limit_bytes", DEFAULT_CLASSIC_OUTPUT_LIMIT_BYTES, errors)
+    if time_limit is not None and not 100 <= time_limit <= MAX_CLASSIC_TIME_LIMIT_MS:
+        errors.append(f"classic time_limit_ms must be between 100 and {MAX_CLASSIC_TIME_LIMIT_MS}")
+    if memory_limit is not None and not 64 <= memory_limit <= MAX_CLASSIC_MEMORY_MB:
+        errors.append(f"classic memory_limit_mb must be between 64 and {MAX_CLASSIC_MEMORY_MB}")
+    if output_limit is not None and not 1_024 <= output_limit <= MAX_CLASSIC_OUTPUT_LIMIT_BYTES:
+        errors.append(f"classic output_limit_bytes must be between 1024 and {MAX_CLASSIC_OUTPUT_LIMIT_BYTES}")
+
+    answer_source = (_manifest_field(manifest, "answer_source") or "answer_key").lower()
+    inputs = _validate_classic_tests(
+        root,
+        answer_source=answer_source,
+        output_limit_bytes=output_limit,
+        errors=errors,
+    )
+    if time_limit is not None and inputs:
+        reference_multiplier = 2 if answer_source == "reference" else 1
+        wall_time_ms = CLASSIC_SETUP_BUDGET_MS + CLASSIC_COMPILE_BUDGET_MS * reference_multiplier
+        wall_time_ms += len(inputs) * time_limit * reference_multiplier
+        if wall_time_ms > MAX_CLASSIC_WALL_TIME_MS:
+            errors.append(f"classic evaluation budget exceeds {MAX_CLASSIC_WALL_TIME_MS} ms")
+        else:
+            settings["execution_timeout_seconds"] = max(1, (wall_time_ms + 999) // 1_000)
+    if time_limit is not None:
+        settings["time_limit_ms"] = time_limit
+    if memory_limit is not None:
+        settings["memory_limit_mb"] = memory_limit
+    if output_limit is not None:
+        settings["output_limit_bytes"] = output_limit
+    settings["answer_source"] = answer_source
+    settings["scoring_mode"] = (_manifest_field(manifest, "scoring_mode") or "all_or_nothing").lower()
+    settings["evaluator"] = "grader.classic:run_classic"
+    return settings
 
 
 def _manifest_bool(manifest: str, name: str, default: bool = False) -> bool:
@@ -415,8 +558,6 @@ def validate_task(path: str | Path) -> TaskValidation:
         language = (_manifest_field(manifest_text, "language") or "").lower()
         if language not in CLASSIC_LANGUAGES:
             errors.append("classic tasks must declare language: python, c, cpp, or rust")
-        for field in ("time_limit_ms", "memory_limit_mb", "output_limit_bytes"):
-            _validate_positive_field(manifest_text, field, errors)
         answer_source = (_manifest_field(manifest_text, "answer_source") or "answer_key").lower()
         if answer_source not in {"answer_key", "reference"}:
             errors.append("answer_source must be answer_key or reference")
@@ -426,22 +567,32 @@ def validate_task(path: str | Path) -> TaskValidation:
                 errors.append("reference_language must be python, c, cpp, or rust")
             reference_entrypoint = _manifest_field(manifest_text, "reference_entrypoint") or "private/reference.py"
             _validate_relative_path(reference_entrypoint, "reference_entrypoint", errors)
-            if not (root / reference_entrypoint).is_file():
+            if not _is_private_path(reference_entrypoint):
+                errors.append("reference_entrypoint must be stored under private/")
+            reference_path = root / reference_entrypoint
+            if not reference_path.is_file():
                 errors.append(f"classic reference task needs {reference_entrypoint}")
+            elif reference_path.stat().st_size > MAX_CLASSIC_CODE_BYTES:
+                errors.append(f"classic reference exceeds {MAX_CLASSIC_CODE_BYTES} bytes")
+            elif reference_language in {"python", "py"}:
+                _validate_python_functions(root, reference_entrypoint, "classic reference", (), errors)
         entrypoint = _manifest_field(manifest_text, "entrypoint")
         if entrypoint:
             _validate_relative_path(entrypoint, "entrypoint", errors)
-        inputs = sorted((root / "tests").rglob("*.in")) if (root / "tests").is_dir() else []
-        if not inputs:
-            errors.append("classic tasks need tests/*.in files")
-        for input_path in inputs:
-            if answer_source == "answer_key" and not (input_path.with_suffix(".ans").is_file() or input_path.with_suffix(".out").is_file()):
-                errors.append(f"test {input_path.relative_to(root)} is missing .ans or .out")
         scoring_mode = (_manifest_field(manifest_text, "scoring_mode") or "all_or_nothing").lower()
         if scoring_mode not in {"all_or_nothing", "percentage"}:
             errors.append("scoring_mode must be all_or_nothing or percentage")
         if (root / "subtasks.json").is_file():
             errors.append("subtasks.json is not supported; choose scoring_mode: percentage instead")
+        checker_path = root / "checker.py"
+        if checker_path.exists() and not checker_path.is_file():
+            errors.append("checker.py must be a regular file")
+        elif checker_path.is_file():
+            if checker_path.stat().st_size > MAX_CLASSIC_CODE_BYTES:
+                errors.append(f"checker exceeds {MAX_CLASSIC_CODE_BYTES} bytes")
+            else:
+                _validate_python_functions(root, "checker.py", "checker", ("check",), errors)
+        settings = _classic_settings(root, manifest_text, errors)
     elif kind in INTERACTIVE_KINDS:
         if _manifest_field(manifest_text, "runner") not in {None, "classic"}:
             errors.append("interactive tasks must declare runner: classic")
@@ -517,7 +668,7 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
     (root / "tests").mkdir(parents=True, exist_ok=True)
     if normalized_kind in CLASSIC_KINDS:
         manifest = (
-            f"""# Brunost Judge classic task manifest\nversion: 1\nkind: {normalized_kind}\nrunner: classic\nlanguage: python\ntime_limit_ms: 2000\nmemory_limit_mb: 512\noutput_limit_bytes: 1048576\nnetwork: disabled\n"""
+            f"""# Brunost Judge classic task manifest\nversion: 1\nkind: {normalized_kind}\nrunner: classic\nlanguage: python\nruntime: python-3.13\ntime_limit_ms: 2000\nmemory_limit_mb: 512\noutput_limit_bytes: 1048576\nnetwork: disabled\nscoring_mode: all_or_nothing\n"""
         )
         (root / "judge.yaml").write_text(manifest, encoding="utf-8")
         (root / "tests" / "README.md").write_text(

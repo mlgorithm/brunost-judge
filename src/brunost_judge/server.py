@@ -595,12 +595,21 @@ def create_app(database: str | Path | None = None):
             "kind": requested_kind,
             "version": request.version,
             "runtime": task_settings.get("runtime") or request.runtime,
-            "evaluator": request.evaluator or task_settings.get("scoring"),
+            "evaluator": task_settings.get("evaluator") or task_settings.get("scoring") or request.evaluator,
             "resource_profile": request.resource_profile,
             "required_capabilities": required_capabilities,
             "digest": digest,
         }
-        for key in ("network", "resource_class"):
+        for key in (
+            "network",
+            "resource_class",
+            "time_limit_ms",
+            "memory_limit_mb",
+            "output_limit_bytes",
+            "execution_timeout_seconds",
+            "answer_source",
+            "scoring_mode",
+        ):
             if task_settings.get(key):
                 manifest[key] = task_settings[key]
         if artifact_identifier:
