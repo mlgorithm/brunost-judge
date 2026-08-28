@@ -14,6 +14,17 @@ services:
       - judge-postgres-data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # API and worker containers run read-only as an unprivileged user. Initialize
+  # the shared artifact volume once so both can safely create immutable bundles.
+  artifact-init:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /artifacts && chown -R 10001:10001 /artifacts"]
+    user: "0:0"
+    volumes:
+      - judge-artifacts:/artifacts
+    restart: "no"
+
   judge-api:
     build: .
     command: ["server", "--host", "0.0.0.0", "--port", "8787"]
@@ -24,6 +35,7 @@ services:
       BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN: "true"
       BRUNOST_JUDGE_CLUSTER_ID: ${BRUNOST_JUDGE_CLUSTER_ID:-local}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
+      BRUNOST_JUDGE_ARTIFACT_ROOT: /artifacts
     ports:
       - "8787:8787"
     healthcheck:
@@ -34,12 +46,15 @@ services:
     volumes:
       - ./examples:/tasks:ro
       - ./local-submissions:/submissions
+      - judge-artifacts:/artifacts
     read_only: true
     tmpfs:
       - /tmp
     depends_on:
       judge-postgres:
         condition: service_healthy
+      artifact-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   judge-worker:
@@ -48,16 +63,21 @@ services:
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
+      BRUNOST_JUDGE_ARTIFACT_ROOT: /artifacts
     volumes:
       - ./examples:/tasks:ro
       - ./local-submissions:/submissions
+      - judge-artifacts:/artifacts
     read_only: true
     tmpfs:
       - /tmp
     depends_on:
       judge-postgres:
         condition: service_healthy
+      artifact-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
   judge-postgres-data:
+  judge-artifacts:

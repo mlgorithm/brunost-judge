@@ -85,6 +85,34 @@ def test_evaluation_alias_and_capabilities(tmp_path: Path, monkeypatch):
     assert client.get("/v1/workers/capabilities").json()["capabilities"] == ["gpu:true", "runtime:docker"]
 
 
+def test_interactive_evaluation_kind_is_accepted_for_interactive_tasks(tmp_path: Path):
+    task = tmp_path / "task"
+    for directory in ("public", "private", "tests"):
+        (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: interactive\nrunner: classic\nlanguage: python\ntime_limit_ms: 1000\nmemory_limit_mb: 64\noutput_limit_bytes: 1024\n",
+        encoding="utf-8",
+    )
+    (task / "interactor.py").write_text("print('interactive')\n", encoding="utf-8")
+    (task / "tests" / "sample.in").write_text("input\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+
+    assert client.post("/v1/tasks", json={"task_ref": "interactive/v1", "path": str(task)}).status_code == 201
+    response = client.post(
+        "/v1/evaluations",
+        json={
+            "task_ref": "interactive/v1",
+            "submission_path": str(submission),
+            "idempotency_key": "interactive-1",
+            "evaluation_kind": "interactive",
+        },
+    )
+    assert response.status_code == 202
+    assert response.json()["metadata"]["evaluation_kind"] == "interactive"
+
+
 def test_worker_registration_heartbeat_and_drain(tmp_path: Path):
     client = TestClient(create_app(tmp_path / "judge.db"))
     registered = client.post(

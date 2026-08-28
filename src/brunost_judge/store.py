@@ -7,6 +7,7 @@ public execution contracts.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import json
 import sqlite3
@@ -42,6 +43,24 @@ def create_store(database: str | Path = "judge.db"):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _request_fingerprint(request: ExecutionRequest) -> str:
+    """Hash the immutable request shape protected by an idempotency key."""
+
+    payload = {
+        "task_ref": request.task_ref,
+        "submission_path": request.submission_path,
+        "callback_url": request.callback_url,
+        "callback_token": request.callback_token,
+        "metadata": request.metadata,
+        "queue": request.queue,
+        "resource_class": request.resource_class,
+        "priority": request.priority,
+        "timeout_seconds": request.timeout_seconds,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class JudgeStore:
@@ -88,6 +107,7 @@ class JudgeStore:
                     submission_path TEXT NOT NULL,
                     callback_url TEXT,
                     callback_token TEXT,
+                    request_fingerprint TEXT NOT NULL DEFAULT '',
                     metadata_json TEXT NOT NULL,
                     status TEXT NOT NULL,
                     score REAL,
@@ -190,6 +210,7 @@ class JudgeStore:
                 ("scores_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("winner", "TEXT"),
                 ("artifacts_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("request_fingerprint", "TEXT NOT NULL DEFAULT ''"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE executions ADD COLUMN {name} {definition}")
@@ -491,15 +512,19 @@ class JudgeStore:
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id = str(uuid.uuid4())
         now = _now()
+        fingerprint = _request_fingerprint(request)
         with self._lock, self._connect() as db:
+            task_row = db.execute("SELECT * FROM tasks WHERE task_ref = ?", (request.task_ref,)).fetchone()
+            if task_row is None:
+                raise KeyError(f"unknown task_ref: {request.task_ref}")
             existing = db.execute(
                 "SELECT * FROM executions WHERE idempotency_key = ?", (request.idempotency_key,)
             ).fetchone()
             if existing is not None:
+                existing_fingerprint = str(existing["request_fingerprint"] or "")
+                if existing_fingerprint and not hmac.compare_digest(existing_fingerprint, fingerprint):
+                    raise ValueError("idempotency key is already used for a different request")
                 return self._result(existing)
-            task_row = db.execute("SELECT * FROM tasks WHERE task_ref = ?", (request.task_ref,)).fetchone()
-            if task_row is None:
-                raise KeyError(f"unknown task_ref: {request.task_ref}")
             manifest = json.loads(task_row["manifest_json"])
             metadata = dict(request.metadata)
             metadata["task_digest"] = manifest.get("digest")
@@ -511,9 +536,9 @@ class JudgeStore:
             db.execute(
                 """INSERT INTO executions(
                     execution_id,idempotency_key,task_ref,submission_path,callback_url,
-                    callback_token,metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at
+                    callback_token,request_fingerprint,metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at
                     ,queue,resource_class,priority
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     execution_id,
                     request.idempotency_key,
@@ -521,6 +546,7 @@ class JudgeStore:
                     request.submission_path,
                     request.callback_url,
                     request.callback_token,
+                    fingerprint,
                     json.dumps(metadata, sort_keys=True),
                     "queued",
                     "{}",
@@ -598,6 +624,7 @@ class JudgeStore:
             "submission_path": row["submission_path"],
             "queue": row["queue"],
             "resource_class": row["resource_class"],
+            "lease_seconds": max(1, lease_seconds),
         }
 
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
@@ -605,9 +632,16 @@ class JudgeStore:
             raise ValueError("worker_id is required to finish an execution")
         with self._lock, self._connect() as db:
             cursor = db.execute(
-                """UPDATE executions SET status=?,score=?,metrics_json=?,scores_json=?,winner=?,artifacts_json=?,failure_reason=?,
-                   metadata_json=?,worker_id=NULL,lease_expires_at=NULL,updated_at=?
-                   WHERE execution_id=? AND worker_id=?""",
+                """UPDATE executions SET
+                   status=CASE WHEN cancel_requested=1 THEN 'canceled' ELSE ? END,
+                   score=CASE WHEN cancel_requested=1 THEN NULL ELSE ? END,
+                   metrics_json=CASE WHEN cancel_requested=1 THEN '{}' ELSE ? END,
+                   scores_json=CASE WHEN cancel_requested=1 THEN '{}' ELSE ? END,
+                   winner=CASE WHEN cancel_requested=1 THEN NULL ELSE ? END,
+                   artifacts_json=CASE WHEN cancel_requested=1 THEN '{}' ELSE ? END,
+                   failure_reason=CASE WHEN cancel_requested=1 THEN 'execution canceled while running' ELSE ? END,
+                   worker_id=NULL,lease_expires_at=NULL,updated_at=?
+                   WHERE execution_id=? AND worker_id=? AND status='running'""",
                 (
                     result.status,
                     result.score,
@@ -616,7 +650,6 @@ class JudgeStore:
                     result.winner,
                     json.dumps(result.artifacts, sort_keys=True),
                     result.failure_reason,
-                    json.dumps(result.metadata, sort_keys=True),
                     _now(),
                     execution_id,
                     worker_id,
@@ -625,6 +658,23 @@ class JudgeStore:
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
+
+    def renew_lease(self, execution_id: str, worker_id: str, *, lease_seconds: int = 300) -> bool:
+        """Extend a live worker lease without allowing canceled work to revive."""
+
+        now = datetime.now(UTC)
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE executions SET lease_expires_at=?,updated_at=?
+                   WHERE execution_id=? AND worker_id=? AND status='running' AND cancel_requested=0""",
+                (
+                    (now + timedelta(seconds=max(1, lease_seconds))).isoformat(),
+                    now.isoformat(),
+                    execution_id,
+                    worker_id,
+                ),
+            )
+        return cursor.rowcount == 1
 
     def enqueue_callback(self, execution_id: str, callback_url: str, callback_token: str | None = None) -> None:
         with self._lock, self._connect() as db:
@@ -640,7 +690,8 @@ class JudgeStore:
             rows = db.execute(
                 """SELECT c.*, e.status, e.task_ref, e.score, e.metrics_json, e.failure_reason,
                    e.metadata_json FROM callback_deliveries c JOIN executions e USING(execution_id)
-                   WHERE c.delivered_at IS NULL AND c.next_attempt_at <= ? ORDER BY c.next_attempt_at LIMIT ?""",
+                   WHERE c.delivered_at IS NULL AND e.status IN ('completed','failed','canceled')
+                   AND c.next_attempt_at <= ? ORDER BY c.next_attempt_at LIMIT ?""",
                 (_now(), limit),
             ).fetchall()
         return [dict(row) for row in rows]

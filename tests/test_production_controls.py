@@ -87,6 +87,38 @@ def test_expired_canceled_leases_are_not_requeued(tmp_path: Path):
     assert store.get_execution(execution.execution_id).status == "canceled"
 
 
+def test_lease_renewal_keeps_the_current_owner(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "renew-lease"))
+    assert store.claim_next(worker_id="worker-a", lease_seconds=1) is not None
+    assert store.renew_lease(execution.execution_id, "worker-a", lease_seconds=60)
+    assert not store.renew_lease(execution.execution_id, "worker-b", lease_seconds=60)
+    time.sleep(1.1)
+    assert store.claim_next(worker_id="worker-b") is None
+
+
+def test_idempotency_key_rejects_a_different_request(tmp_path: Path):
+    store = _store(tmp_path)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    store.submit(ExecutionRequest("demo/v1", str(first), "same-key"))
+    with pytest.raises(ValueError, match="different request"):
+        store.submit(ExecutionRequest("demo/v1", str(second), "same-key"))
+
+
+def test_callbacks_are_held_until_the_execution_is_terminal(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(ExecutionRequest("demo/v1", str(submission), "queued-callback"))
+    store.enqueue_callback(execution.execution_id, "https://callback.example.test/result")
+    assert store.pending_callbacks() == []
+
+
 def test_callback_delivery_has_single_active_owner(tmp_path: Path):
     store = _store(tmp_path)
     submission = tmp_path / "submission"

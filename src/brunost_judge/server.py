@@ -129,8 +129,11 @@ def create_app(database: str | Path | None = None):
     class NodeEnrollmentModel(BaseModel):
         join_token: str = Field(min_length=20, max_length=500)
         hostname: str | None = Field(default=None, max_length=255)
-        capabilities: list[str] = Field(default_factory=list, max_length=128)
-        resource_classes: list[str] = Field(default_factory=list, max_length=32)
+        # ``None`` preserves compatibility with older nodes that did not report
+        # an inventory. An explicitly supplied list, including an empty list,
+        # is the node's authoritative inventory and is stored as such.
+        capabilities: list[str] | None = Field(default=None, max_length=128)
+        resource_classes: list[str] | None = Field(default=None, max_length=32)
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     class ServiceCredentialRequestModel(BaseModel):
@@ -148,7 +151,11 @@ def create_app(database: str | Path | None = None):
         winner: str | None = None
         artifacts: dict[str, dict[str, Any]] = Field(default_factory=dict)
         failure_reason: str | None = None
-        metadata: dict[str, Any] = Field(default_factory=dict)
+        metadata: dict[str, Any] = Field(
+            default_factory=dict,
+            description="Deprecated and ignored on completion; execution metadata is controlled by the judge.",
+            json_schema_extra={"deprecated": True},
+        )
         result_version: int = Field(default=1, ge=1)
         judge_version: str = "local"
         queue: str = "default"
@@ -496,24 +503,28 @@ def create_app(database: str | Path | None = None):
         metadata.update(request.metadata)
         if request.hostname:
             metadata["hostname"] = request.hostname
-        if request.capabilities:
+        if request.capabilities is not None:
             metadata["detected_capabilities"] = sorted(set(request.capabilities))
         from brunost_judge.contracts import WorkerRecord
 
         approved_capabilities = set(payload.get("capabilities") or ())
-        detected_capabilities = set(request.capabilities)
+        detected_capabilities = set(request.capabilities or ())
         if not detected_capabilities.issubset(approved_capabilities):
             raise HTTPException(status_code=422, detail="node capabilities exceed the enrollment token")
         approved_resource_classes = set(payload.get("resource_classes") or ("cpu",))
-        detected_resource_classes = set(request.resource_classes)
+        detected_resource_classes = set(request.resource_classes or ())
         if not detected_resource_classes.issubset(approved_resource_classes):
             raise HTTPException(status_code=422, detail="node resource classes exceed the enrollment token")
         consumed = store.consume_enrollment_token(request.join_token)
         if consumed is None:
             raise HTTPException(status_code=409, detail="enrollment token was already consumed")
         payload = consumed
-        capabilities = tuple(sorted(approved_capabilities))
-        resource_classes = tuple(sorted(approved_resource_classes))
+        capabilities = tuple(sorted(
+            approved_capabilities if request.capabilities is None else detected_capabilities
+        ))
+        resource_classes = tuple(sorted(
+            approved_resource_classes if request.resource_classes is None else detected_resource_classes
+        ))
         worker = WorkerRecord(
             worker_id=worker_id,
             capabilities=capabilities,
@@ -619,8 +630,8 @@ def create_app(database: str | Path | None = None):
         payload["callback_url"] = _validate_callback_url(payload.get("callback_url"))
         metadata = dict(payload.pop("metadata", {}) or {})
         evaluation_kind = payload.pop("evaluation_kind", "batch")
-        if evaluation_kind not in {"batch", "agent", "match"}:
-            raise HTTPException(status_code=422, detail="evaluation_kind must be batch, agent, or match")
+        if evaluation_kind not in {"batch", "interactive", "agent", "match"}:
+            raise HTTPException(status_code=422, detail="evaluation_kind must be batch, interactive, agent, or match")
         agent_refs = payload.pop("agent_refs", []) or []
         game_ref = payload.pop("game_ref", None)
         seed = payload.pop("seed", None)
@@ -628,10 +639,26 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=422, detail="agent tasks require evaluation_kind=agent")
         if task.kind == "game" and evaluation_kind != "match":
             raise HTTPException(status_code=422, detail="game tasks require evaluation_kind=match")
+        if task.kind == "interactive" and evaluation_kind == "batch":
+            # Batch was the original implicit representation for interactive
+            # tasks. Normalize it so existing clients remain compatible.
+            evaluation_kind = "interactive"
+        if task.kind == "interactive" and evaluation_kind != "interactive":
+            raise HTTPException(status_code=422, detail="interactive tasks require evaluation_kind=interactive")
+        if evaluation_kind == "agent" and task.kind != "agent":
+            raise HTTPException(status_code=422, detail="evaluation_kind=agent requires an agent task")
+        if evaluation_kind == "match" and task.kind != "game":
+            raise HTTPException(status_code=422, detail="evaluation_kind=match requires a game task")
+        if evaluation_kind == "interactive" and task.kind != "interactive":
+            raise HTTPException(status_code=422, detail="evaluation_kind=interactive requires an interactive task")
         if evaluation_kind == "agent" and not agent_refs:
             raise HTTPException(status_code=422, detail="agent evaluations require at least one agent_ref")
         if evaluation_kind == "match" and not game_ref:
             raise HTTPException(status_code=422, detail="match evaluations require game_ref")
+        if agent_refs and evaluation_kind not in {"agent", "match"}:
+            raise HTTPException(status_code=422, detail="agent_refs are only valid for agent or match evaluations")
+        if game_ref and evaluation_kind != "match":
+            raise HTTPException(status_code=422, detail="game_ref is only valid for match evaluations")
         agent_definitions: list[dict[str, Any]] = []
         for agent_ref in agent_refs:
             definition = store.get_definition("agent", str(agent_ref))
@@ -668,6 +695,8 @@ def create_app(database: str | Path | None = None):
             result = store.submit(ExecutionRequest(**payload))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return result.as_dict()
 
     @app.post("/v1/executions", status_code=202, dependencies=[Depends(require_api_token)])
@@ -733,8 +762,11 @@ def create_app(database: str | Path | None = None):
 
     @app.post("/v1/games", status_code=201, dependencies=[Depends(require_api_token)])
     def register_game(request: GameDefinitionModel) -> dict[str, Any]:
-        if store.get_task(request.task_ref) is None:
+        task = store.get_task(request.task_ref)
+        if task is None:
             raise HTTPException(status_code=404, detail=f"unknown task_ref: {request.task_ref}")
+        if task.kind != "game":
+            raise HTTPException(status_code=422, detail="games must reference a task with kind=game")
         try:
             return store.register_definition("game", request.game_id, request.model_dump())
         except ValueError as exc:
@@ -818,6 +850,15 @@ def create_app(database: str | Path | None = None):
         if store.get_execution(execution_id) is None:
             raise HTTPException(status_code=404, detail="execution not found")
         return {"execution_id": execution_id, "cancel_requested": store.is_cancel_requested(execution_id)}
+
+    @app.post("/v1/workers/{worker_id}/executions/{execution_id}/lease", dependencies=[Depends(require_worker_token)])
+    def renew_execution_lease(worker_id: str, execution_id: str) -> dict[str, Any]:
+        if store.get_worker(worker_id) is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        lease_seconds = int_environment("BRUNOST_JUDGE_LEASE_SECONDS", 300)
+        if not store.renew_lease(execution_id, worker_id, lease_seconds=lease_seconds):
+            raise HTTPException(status_code=409, detail="execution is not leased to this worker")
+        return {"execution_id": execution_id, "lease_seconds": lease_seconds, "renewed": True}
 
     @app.post("/v1/workers/{worker_id}/claim", response_model=None, dependencies=[Depends(require_worker_token)])
     def claim_worker(worker_id: str) -> dict[str, Any] | Response:
@@ -917,7 +958,8 @@ def create_app(database: str | Path | None = None):
         async function registerTask(){try{const d=await api('/v1/tasks',{method:'POST',body:JSON.stringify({task_ref:document.querySelector('#task-ref').value,path:document.querySelector('#task-path').value})});document.querySelector('#task-message').textContent=JSON.stringify(d,null,2);refresh()}catch(e){document.querySelector('#task-message').textContent=e}}
         async function issueNodeToken(){try{const node=document.querySelector('#node-id').value;const d=await api('/v1/nodes/enrollment-tokens',{method:'POST',body:JSON.stringify({node_id:node,worker_id:document.querySelector('#node-worker-id').value||null,region:document.querySelector('#node-region').value||null})});document.querySelector('#node-message').textContent='Copy this one-time token to the node:\n'+d.join_token+'\n\nRun: brunost node join --url '+location.origin+' --join-token <token>'}catch(e){document.querySelector('#node-message').textContent=e}}
         async function submitExecution(){try{const d=await api('/v1/executions',{method:'POST',body:JSON.stringify({task_ref:document.querySelector('#exec-task').value,submission_path:document.querySelector('#submission-path').value,idempotency_key:document.querySelector('#idempotency').value})});document.querySelector('#exec-message').textContent=JSON.stringify(d,null,2)}catch(e){document.querySelector('#exec-message').textContent=e}}
-        async function refresh(){try{const [rows,executions,stats,cluster,workers]=await Promise.all([api('/v1/tasks'),api('/v1/executions?limit=50'),api('/v1/stats'),api('/v1/cluster'),api('/v1/workers')]);document.querySelector('#tasks').innerHTML=rows.map(t=>`<tr><td>${t.task_ref}</td><td>${t.kind}</td><td>${t.path}</td></tr>`).join('');document.querySelector('#executions').innerHTML=executions.map(e=>`<tr><td>${e.execution_id.slice(0,8)}</td><td>${e.task_ref}</td><td>${e.status}</td><td>${e.score??'—'}</td></tr>`).join('');document.querySelector('#workers').innerHTML=workers.map(w=>`<tr><td>${w.worker_id}</td><td>${w.region??'—'}</td><td>${w.resource_classes.join(', ')}</td><td>${w.capabilities.join(', ')}</td><td>${w.draining?'draining':w.status}</td></tr>`).join('');document.querySelector('#cluster').textContent=JSON.stringify(cluster,null,2);document.querySelector('#stats').textContent=JSON.stringify(stats,null,2)}catch(e){document.querySelector('#tasks').innerHTML='<tr><td colspan=3>'+e+'</td></tr>'}}
+        function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]))}
+        async function refresh(){try{const [rows,executions,stats,cluster,workers]=await Promise.all([api('/v1/tasks'),api('/v1/executions?limit=50'),api('/v1/stats'),api('/v1/cluster'),api('/v1/workers')]);document.querySelector('#tasks').innerHTML=rows.map(t=>`<tr><td>${escapeHtml(t.task_ref)}</td><td>${escapeHtml(t.kind)}</td><td>${escapeHtml(t.path)}</td></tr>`).join('');document.querySelector('#executions').innerHTML=executions.map(e=>`<tr><td>${escapeHtml(String(e.execution_id).slice(0,8))}</td><td>${escapeHtml(e.task_ref)}</td><td>${escapeHtml(e.status)}</td><td>${escapeHtml(e.score??'—')}</td></tr>`).join('');document.querySelector('#workers').innerHTML=workers.map(w=>`<tr><td>${escapeHtml(w.worker_id)}</td><td>${escapeHtml(w.region??'—')}</td><td>${escapeHtml((w.resource_classes||[]).join(', '))}</td><td>${escapeHtml((w.capabilities||[]).join(', '))}</td><td>${escapeHtml(w.draining?'draining':w.status)}</td></tr>`).join('');document.querySelector('#cluster').textContent=JSON.stringify(cluster,null,2);document.querySelector('#stats').textContent=JSON.stringify(stats,null,2)}catch(e){document.querySelector('#tasks').innerHTML='<tr><td colspan=3>'+escapeHtml(e)+'</td></tr>'}}
         refresh();
         </script></body></html>"""
 

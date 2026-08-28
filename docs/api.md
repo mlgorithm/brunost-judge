@@ -19,9 +19,15 @@ machine-readable schema at `/openapi.json` and interactive documentation at
 | Authentication/audit | `/v1/auth/*`, `/v1/audit` | Judge operator/service integration |
 
 All mutating evaluation requests require an idempotency key. A repeated key
-returns the original evaluation instead of creating duplicate work. Evaluation
-responses expose both `evaluation_id` (canonical) and `execution_id` (legacy
-compatibility).
+with the same request returns the original evaluation instead of creating
+duplicate work; reusing it for different task, submission, callback, or queue
+parameters returns `409 Conflict`. Evaluation responses expose both
+`evaluation_id` (canonical) and `execution_id` (legacy compatibility).
+
+`evaluation_kind` must match the registered task: `batch` for ordinary batch
+tasks, `interactive` for interactive tasks, `agent` for agent tasks, and
+`match` for game tasks. `agent_refs` are valid only for agent/match evaluations,
+and games can reference only `kind: game` tasks.
 
 Result payloads use stable `result_version: 1` semantics: terminal `status`,
 numeric or null `score`, optional per-seat `scores`, optional `winner`, object
@@ -120,7 +126,18 @@ POST /v1/workers/{worker_id}/drain?draining=true
 POST /v1/workers/{worker_id}/claim
 POST /v1/workers/{worker_id}/finish
 GET /v1/workers/{worker_id}/executions/{execution_id}/cancel-requested
+POST /v1/workers/{worker_id}/executions/{execution_id}/lease
 ```
+
+Workers renew an active execution lease while the sandbox is running. A lease
+cannot be renewed after cancellation. Worker result metadata cannot replace the
+control-plane metadata that binds the task digest, evaluator, runtime, and
+callback event ID; integrations should retain the values returned in the claim.
+
+When a node enrollment request includes `capabilities` or `resource_classes`,
+the registered worker uses that reported subset (which must be within the
+operator-approved enrollment token). Older nodes that omit an inventory retain
+the token's approved inventory for compatibility.
 
 The scheduler must never infer a GPU or runtime capability from a hostname. A
 worker advertises capabilities such as `gpu:true`, `runtime:kubernetes`, and

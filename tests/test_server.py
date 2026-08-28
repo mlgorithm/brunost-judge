@@ -62,6 +62,74 @@ def test_operator_console_is_available(tmp_path: Path):
     response = TestClient(create_app(tmp_path / "judge.db")).get("/console")
     assert response.status_code == 200
     assert "Register task" in response.text
+    assert "function escapeHtml" in response.text
+    assert "${escapeHtml(t.task_ref)}" in response.text
+
+
+def test_api_rejects_evaluation_modes_that_do_not_match_the_task(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+
+    assert client.post("/v1/tasks", json={"task_ref": "ioai/v1", "path": str(task)}).status_code == 201
+    assert client.post(
+        "/v1/games",
+        json={"game_id": "wrong-game", "name": "Wrong game", "task_ref": "ioai/v1"},
+    ).status_code == 422
+    agent_response = client.post(
+        "/v1/evaluations",
+        json={
+            "task_ref": "ioai/v1",
+            "submission_path": str(submission),
+            "idempotency_key": "wrong-agent-mode",
+            "evaluation_kind": "agent",
+            "agent_refs": ["unused"],
+        },
+    )
+    assert agent_response.status_code == 422
+    assert "requires an agent task" in agent_response.json()["detail"]
+    interactive_response = client.post(
+        "/v1/evaluations",
+        json={
+            "task_ref": "ioai/v1",
+            "submission_path": str(submission),
+            "idempotency_key": "wrong-interactive-mode",
+            "evaluation_kind": "interactive",
+        },
+    )
+    assert interactive_response.status_code == 422
+
+
+def test_api_rejects_reusing_an_idempotency_key_for_a_different_request(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (second / "submission.py").write_text("print('different')\n", encoding="utf-8")
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    assert client.post("/v1/tasks", json={"task_ref": "ioai/v1", "path": str(task)}).status_code == 201
+    assert client.post(
+        "/v1/evaluations",
+        json={"task_ref": "ioai/v1", "submission_path": str(first), "idempotency_key": "same-key"},
+    ).status_code == 202
+    conflict = client.post(
+        "/v1/evaluations",
+        json={"task_ref": "ioai/v1", "submission_path": str(second), "idempotency_key": "same-key"},
+    )
+    assert conflict.status_code == 409
+    assert "different request" in conflict.json()["detail"]
 
 
 def test_production_allows_only_explicit_allowlisted_internal_http_callback(tmp_path: Path, monkeypatch):

@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -154,6 +155,31 @@ def _configured_sandbox(runner: SandboxRunner, timeout_seconds: int | None) -> S
     return runner
 
 
+@contextmanager
+def _renew_execution_lease(renew, lease_seconds: int):  # type: ignore[no-untyped-def]
+    """Keep a claimed execution alive while a blocking sandbox run is active."""
+
+    stop = threading.Event()
+    interval = max(0.25, min(30.0, max(1, lease_seconds) / 3))
+
+    def heartbeat() -> None:
+        while not stop.wait(interval):
+            try:
+                if not renew():
+                    return
+            except Exception as exc:  # noqa: BLE001 - the finish guard remains authoritative
+                LOGGER.warning("could not renew execution lease: %s", exc)
+                return
+
+    thread = threading.Thread(target=heartbeat, name="brunost-lease-renewer", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=max(1.0, min(5.0, interval)))
+
+
 def _persist_result_artifacts(payloads: object, put_artifact) -> dict[str, dict[str, Any]]:  # type: ignore[no-untyped-def]
     if not isinstance(payloads, dict):
         return {}
@@ -271,7 +297,14 @@ class LocalWorker:
                             materialize=lambda value: self._materialize(value, stack),
                         )
                     runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(execution.metadata, task.manifest))
-                    with _evaluation_profile_environment(execution.metadata):
+                    with _renew_execution_lease(
+                        lambda: self.store.renew_lease(
+                            execution.execution_id,
+                            self.worker_id,
+                            lease_seconds=int(context.get("lease_seconds", self.lease_seconds)),
+                        ),
+                        int(context.get("lease_seconds", self.lease_seconds)),
+                    ), _evaluation_profile_environment(execution.metadata):
                         raw = runner.run(submission, task_path, execution.execution_id)
                     if self.store.is_cancel_requested(execution.execution_id):
                         raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
@@ -316,7 +349,7 @@ class LocalWorker:
             )
         finished = self.store.finish(execution.execution_id, result, worker_id=self.worker_id)
         callback_url = context.get("callback_url")
-        if callback_url:
+        if finished is not None and callback_url:
             self.store.enqueue_callback(execution.execution_id, callback_url, context.get("callback_token"))
             self.deliver_callbacks()
         return finished
@@ -474,7 +507,14 @@ class RemoteWorker:
                             materialize=lambda value: self._materialize(value, stack),
                         )
                     runner = _configured_sandbox(self.sandbox_runner, _execution_timeout(metadata, task_manifest))
-                    with _evaluation_profile_environment(metadata):
+                    lease_seconds = int(context.get("lease_seconds", 300))
+                    with _renew_execution_lease(
+                        lambda: self.client.renew_execution_lease(
+                            self.worker_id,
+                            execution_id,
+                        ),
+                        lease_seconds,
+                    ), _evaluation_profile_environment(metadata):
                         raw = runner.run(submission, task_path, execution_id)
                     if self.client.execution_cancel_requested(self.worker_id, execution_id):
                         raw = {"status": "canceled", "score": 0.0, "metrics": {}, "failure_reason": "execution canceled while running"}
@@ -522,7 +562,7 @@ class RemoteWorker:
             )
         finished = self.client.finish_worker(self.worker_id, result.as_dict())
         callback_url = context.get("callback_url")
-        if callback_url:
+        if finished and callback_url:
             self._send_callback(callback_url, context.get("callback_token"), finished)
         return result
 

@@ -20,6 +20,7 @@ from brunost_judge.contracts import (
     WorkerRecord,
 )
 from brunost_judge.enrollment import digest_secret, is_expired
+from brunost_judge.store import _request_fingerprint
 
 
 def _now() -> str:
@@ -51,7 +52,7 @@ class PostgresJudgeStore:
                 CREATE TABLE IF NOT EXISTS executions (
                     execution_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
                     task_ref TEXT NOT NULL REFERENCES tasks(task_ref), submission_path TEXT NOT NULL,
-                    callback_url TEXT, callback_token TEXT, metadata_json JSONB NOT NULL,
+                    callback_url TEXT, callback_token TEXT, request_fingerprint TEXT NOT NULL DEFAULT '', metadata_json JSONB NOT NULL,
                     status TEXT NOT NULL, score DOUBLE PRECISION, metrics_json JSONB NOT NULL,
                     scores_json JSONB NOT NULL DEFAULT '{}'::jsonb, winner TEXT,
                     artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -125,7 +126,8 @@ class PostgresJudgeStore:
                     ON audit_events(created_at DESC);
                 ALTER TABLE executions ADD COLUMN IF NOT EXISTS scores_json JSONB NOT NULL DEFAULT '{}'::jsonb;
                 ALTER TABLE executions ADD COLUMN IF NOT EXISTS winner TEXT;
-                ALTER TABLE executions ADD COLUMN IF NOT EXISTS artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb;"""
+                ALTER TABLE executions ADD COLUMN IF NOT EXISTS artifacts_json JSONB NOT NULL DEFAULT '{}'::jsonb;
+                ALTER TABLE executions ADD COLUMN IF NOT EXISTS request_fingerprint TEXT NOT NULL DEFAULT '';"""
             )
             db.execute("ALTER TABLE callback_deliveries ADD COLUMN IF NOT EXISTS lease_owner TEXT")
             db.execute("ALTER TABLE callback_deliveries ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ")
@@ -402,6 +404,7 @@ class PostgresJudgeStore:
 
     def submit(self, request: ExecutionRequest) -> ExecutionResult:
         execution_id, now = str(uuid.uuid4()), _now()
+        fingerprint = _request_fingerprint(request)
         with self._connect() as db:
             task_row = db.execute("SELECT * FROM tasks WHERE task_ref=%s", (request.task_ref,)).fetchone()
             if not task_row:
@@ -416,18 +419,21 @@ class PostgresJudgeStore:
                 metadata["timeout_seconds"] = request.timeout_seconds
             inserted = db.execute(
                 """INSERT INTO executions(execution_id,idempotency_key,task_ref,submission_path,callback_url,callback_token,
-                   metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at,queue,resource_class,priority)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   request_fingerprint,metadata_json,status,metrics_json,scores_json,artifacts_json,created_at,updated_at,queue,resource_class,priority)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                    ON CONFLICT(idempotency_key) DO NOTHING
                    RETURNING *""",
                 (execution_id, request.idempotency_key, request.task_ref, request.submission_path, request.callback_url,
-                 request.callback_token, json.dumps(metadata, sort_keys=True), "queued", json.dumps({}), json.dumps({}), json.dumps({}), now, now,
+                 request.callback_token, fingerprint, json.dumps(metadata, sort_keys=True), "queued", json.dumps({}), json.dumps({}), json.dumps({}), now, now,
                  request.queue, request.resource_class, request.priority),
             ).fetchone()
             if inserted:
                 return self._result(inserted)
             existing = db.execute("SELECT * FROM executions WHERE idempotency_key=%s", (request.idempotency_key,)).fetchone()
             if existing:
+                existing_fingerprint = str(existing["request_fingerprint"] or "")
+                if existing_fingerprint and not hmac.compare_digest(existing_fingerprint, fingerprint):
+                    raise ValueError("idempotency key is already used for a different request")
                 return self._result(existing)
             raise RuntimeError("idempotent execution insert was lost before it could be read")
 
@@ -462,16 +468,58 @@ class PostgresJudgeStore:
             task_row = db.execute("SELECT * FROM tasks WHERE task_ref=%s", (row["task_ref"],)).fetchone()
         if not task_row:
             return None
-        return self.get_execution(row["execution_id"]), self._task(task_row), {"callback_url": row["callback_url"], "callback_token": row["callback_token"], "submission_path": row["submission_path"], "queue": row["queue"], "resource_class": row["resource_class"]}
+        return self.get_execution(row["execution_id"]), self._task(task_row), {
+            "callback_url": row["callback_url"],
+            "callback_token": row["callback_token"],
+            "submission_path": row["submission_path"],
+            "queue": row["queue"],
+            "resource_class": row["resource_class"],
+            "lease_seconds": max(1, lease_seconds),
+        }
 
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
         if not worker_id.strip():
             raise ValueError("worker_id is required to finish an execution")
         with self._connect() as db:
-            cursor = db.execute("UPDATE executions SET status=%s,score=%s,metrics_json=%s,scores_json=%s,winner=%s,artifacts_json=%s,failure_reason=%s,metadata_json=%s,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE execution_id=%s AND worker_id=%s", (result.status, result.score, json.dumps(result.metrics), json.dumps(result.scores), result.winner, json.dumps(result.artifacts), result.failure_reason, json.dumps(result.metadata), _now(), execution_id, worker_id))
+            cursor = db.execute(
+                """UPDATE executions SET
+                   status=CASE WHEN cancel_requested THEN 'canceled' ELSE %s END,
+                   score=CASE WHEN cancel_requested THEN NULL ELSE %s END,
+                   metrics_json=CASE WHEN cancel_requested THEN '{}'::jsonb ELSE %s::jsonb END,
+                   scores_json=CASE WHEN cancel_requested THEN '{}'::jsonb ELSE %s::jsonb END,
+                   winner=CASE WHEN cancel_requested THEN NULL ELSE %s END,
+                   artifacts_json=CASE WHEN cancel_requested THEN '{}'::jsonb ELSE %s::jsonb END,
+                   failure_reason=CASE WHEN cancel_requested THEN 'execution canceled while running' ELSE %s END,
+                   worker_id=NULL,lease_expires_at=NULL,updated_at=%s
+                   WHERE execution_id=%s AND worker_id=%s AND status='running'""",
+                (
+                    result.status,
+                    result.score,
+                    json.dumps(result.metrics),
+                    json.dumps(result.scores),
+                    result.winner,
+                    json.dumps(result.artifacts),
+                    result.failure_reason,
+                    _now(),
+                    execution_id,
+                    worker_id,
+                ),
+            )
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
+
+    def renew_lease(self, execution_id: str, worker_id: str, *, lease_seconds: int = 300) -> bool:
+        """Extend a live worker lease without allowing canceled work to revive."""
+
+        now = datetime.now(UTC)
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE executions SET lease_expires_at=%s,updated_at=%s
+                   WHERE execution_id=%s AND worker_id=%s AND status='running' AND cancel_requested=FALSE""",
+                (now + timedelta(seconds=max(1, lease_seconds)), now, execution_id, worker_id),
+            )
+        return cursor.rowcount == 1
 
     def enqueue_callback(self, execution_id: str, callback_url: str, callback_token: str | None = None) -> None:
         with self._connect() as db:
@@ -479,7 +527,7 @@ class PostgresJudgeStore:
 
     def pending_callbacks(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as db:
-            rows = db.execute("SELECT c.*,e.status,e.task_ref,e.score,e.metrics_json,e.failure_reason,e.metadata_json FROM callback_deliveries c JOIN executions e USING(execution_id) WHERE c.delivered_at IS NULL AND c.next_attempt_at<=%s ORDER BY c.next_attempt_at LIMIT %s", (_now(), limit)).fetchall()
+            rows = db.execute("SELECT c.*,e.status,e.task_ref,e.score,e.metrics_json,e.failure_reason,e.metadata_json FROM callback_deliveries c JOIN executions e USING(execution_id) WHERE c.delivered_at IS NULL AND e.status IN ('completed','failed','canceled') AND c.next_attempt_at<=%s ORDER BY c.next_attempt_at LIMIT %s", (_now(), limit)).fetchall()
         return [dict(row) for row in rows]
 
     def claim_callback(self, execution_id: str, worker_id: str, *, lease_seconds: int = 60) -> bool:

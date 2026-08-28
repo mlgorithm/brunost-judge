@@ -253,13 +253,16 @@ class JudgeClient:
         resource_classes: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._request("POST", "/v1/nodes/enroll", {
+        payload: dict[str, Any] = {
             "join_token": join_token,
             "hostname": hostname,
-            "capabilities": capabilities or [],
-            "resource_classes": resource_classes or [],
             "metadata": metadata or {},
-        })
+        }
+        if capabilities is not None:
+            payload["capabilities"] = capabilities
+        if resource_classes is not None:
+            payload["resource_classes"] = resource_classes
+        return self._request("POST", "/v1/nodes/enroll", payload)
 
     def heartbeat_worker(self, worker_id: str, *, status: str = "ready") -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/heartbeat?status={status}")
@@ -270,6 +273,10 @@ class JudgeClient:
     def execution_cancel_requested(self, worker_id: str, execution_id: str) -> bool:
         payload = self._request("GET", f"/v1/workers/{worker_id}/executions/{execution_id}/cancel-requested")
         return bool(payload.get("cancel_requested"))
+
+    def renew_execution_lease(self, worker_id: str, execution_id: str) -> bool:
+        payload = self._request("POST", f"/v1/workers/{worker_id}/executions/{execution_id}/lease")
+        return bool(payload.get("renewed"))
 
     def claim_worker(self, worker_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/claim")
