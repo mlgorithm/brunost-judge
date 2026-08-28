@@ -21,7 +21,7 @@ can run it in its own infrastructure.
 
 ## Smoke test
 
-1. Run `scripts/canary.sh` against one ICPC/CPU task. The command uploads the
+1. Run `scripts/canary.sh` against one deterministic coding/CPU task. The command uploads the
    task and submission as immutable artifacts, registers the task by digest,
    submits twice with one idempotency key, and waits for a completed result.
 2. Confirm the canary output reports `immutable_task_artifact`,

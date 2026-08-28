@@ -161,7 +161,7 @@ class EvaluationRequest:
 
     ``evaluation_kind`` is one of ``batch``, ``interactive``, ``agent``, or
     ``match``. The built-in distribution executes scorer-backed batch tasks,
-    classic ICPC tasks, line-oriented interactive tasks, and versioned
+    deterministic coding tasks, line-oriented interactive tasks, and versioned
     agent/game runner plugins. Unsupported future kinds fail closed instead of
     silently being treated as batch scores.
     """

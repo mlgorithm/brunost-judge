@@ -28,7 +28,12 @@ from brunost_judge.auth import (
 from brunost_judge.contracts import TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
-from brunost_judge.task import BUILTIN_KINDS, task_digest, validate_task
+from brunost_judge.task import (
+    BUILTIN_KINDS,
+    is_browser_only_runtime,
+    task_digest,
+    validate_task,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -600,6 +605,11 @@ def create_app(database: str | Path | None = None):
             "required_capabilities": required_capabilities,
             "digest": digest,
         }
+        if is_browser_only_runtime(str(manifest["runtime"])):
+            raise HTTPException(
+                status_code=422,
+                detail="browser-only runtimes must remain in Premium Lab and cannot be Judge task runtimes",
+            )
         for key in (
             "network",
             "resource_class",

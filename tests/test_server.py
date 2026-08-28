@@ -43,6 +43,22 @@ def test_task_kind_override_must_match_manifest(tmp_path: Path):
     assert "match" in response.json()["detail"]
 
 
+def test_browser_only_runtime_cannot_be_registered_as_a_judge_task(tmp_path: Path):
+    task = tmp_path / "task"
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\nnetwork: disabled\n", encoding="utf-8")
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+
+    response = TestClient(create_app(tmp_path / "judge.db")).post(
+        "/v1/tasks",
+        json={"task_ref": "browser-runtime/v1", "path": str(task), "runtime": "pyodide"},
+    )
+
+    assert response.status_code == 422
+    assert "browser-only runtimes" in response.json()["detail"]
+
+
 def test_ioai_manifest_controls_registration_and_scheduling(tmp_path: Path):
     task = tmp_path / "task"
     task.mkdir()
@@ -89,12 +105,12 @@ def test_ioai_manifest_controls_registration_and_scheduling(tmp_path: Path):
     assert submitted.json()["metadata"]["required_capabilities"] == ["gpu:true", "runtime:cuda", "runtime:docker"]
 
 
-def test_icpc_manifest_controls_runtime_scheduling_and_execution_budget(tmp_path: Path):
+def test_coding_manifest_controls_runtime_scheduling_and_execution_budget(tmp_path: Path):
     task = tmp_path / "task"
     for directory in ("public", "private", "tests"):
         (task / directory).mkdir(parents=True, exist_ok=True)
     (task / "judge.yaml").write_text(
-        "version: 1\nkind: icpc\nrunner: classic\nlanguage: python\n"
+        "version: 1\nkind: coding\nrunner: classic\nlanguage: python\n"
         "runtime: classic-python-v1\ntime_limit_ms: 1000\n"
         "resource_class: gpu\nrequired_capabilities: gpu:true, runtime:classic\n"
         "network: disabled\n",

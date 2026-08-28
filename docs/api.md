@@ -44,7 +44,7 @@ finished-after-cancel run as `canceled`.
 use the v2 train/model/predict contract documented in
 [`model-tasks.md`](model-tasks.md). `optimization` tasks use the trusted
 feasibility/objective evaluator documented in
-[`optimization-tasks.md`](optimization-tasks.md). `icpc` tasks use the classic batch runner
+[`optimization-tasks.md`](optimization-tasks.md). `coding` tasks use the classic batch runner
 and return structured compile, test, scoring,
 verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
@@ -54,6 +54,13 @@ Trusted game runners can use the bundled dependency-free `AgentRuntime` to
 launch one bounded JSONL process per seat with deterministic turn ordering;
 see the [runner-plugin protocol](plugins.md#agent-protocol) for the wire
 contract and resource limits.
+
+`icpc` remains a legacy alias for existing coding task packages; integrations
+should register new deterministic programming tasks as `coding`.
+
+Premium Lab runtimes such as Pyodide, C/C++ WASM, and CheerpX are browser-only.
+Judge rejects them as task runtimes; an official browser-originated submission
+is instead re-executed with its registered contest task runtime.
 
 For IOAI/output-only tasks, the registered package is authoritative for
 `runtime`, `scoring`, `resource_class`, and `required_capabilities`.
@@ -66,7 +73,7 @@ request’s resource class, and declared capabilities are combined with any
 operator-supplied capabilities before worker selection. Feedback/leaderboard
 visibility is platform policy and is not a Judge task-manifest field.
 
-For `icpc` tasks, the package likewise owns `runtime`, `network`,
+For `coding` tasks, the package likewise owns `runtime`, `network`,
 `resource_class`, and `required_capabilities`. Registration records the classic
 runner evaluator plus the derived whole-evaluation timeout, which includes
 compilation and every private test; a request may shorten that deadline but
@@ -95,7 +102,7 @@ brunost artifact upload ./submissions/alice-1 --url "$BRUNOST_JUDGE_URL" --token
 curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/tasks" \
   -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"task_ref":"sum/v1","artifact_id":"<task-artifact-id>","kind":"icpc"}'
+  -d '{"task_ref":"sum/v1","artifact_id":"<task-artifact-id>","kind":"coding"}'
 
 curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/evaluations" \
   -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \

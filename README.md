@@ -3,7 +3,7 @@
 Current release: `1.3.0` — local match execution, formal agent protocols, portable artifacts, worker credentials, scoped service authentication, secret-file loading, audit logging, rate limiting, signed callbacks, capability scheduling, provider adapters, deterministic game contracts, and replay artifact results.
 
 Brunost Judge is the platform-independent judging layer for scorer-backed IOAI
-and output-only tasks, plus versioned model, optimization, ICPC, interactive, and agent
+and output-only tasks, plus versioned model, optimization, coding, interactive, and agent
 runners. Model tasks use the dedicated `train_predict_v2` lifecycle. It is intentionally separate from the NOKI/Brunost education
 platform: task authors can use the core and CLI directly, while an LMS or contest
 platform integrates through the SDK/API boundary. The built-in runtime fails
@@ -186,14 +186,15 @@ post-competition leaderboard using new training and test data. See
 [`docs/model-tasks.md`](docs/model-tasks.md) for the manifest, phase boundaries,
 runtime, and complete submission contract.
 
-### Classic batch tasks
+### Deterministic coding tasks
 
-`icpc` task packages use the built-in classic runner. A minimal
+`coding` task packages use the built-in classic runner. `icpc` remains a
+legacy alias for existing packages. A minimal
 manifest is flat and dependency-free:
 
 ```yaml
 version: 1
-kind: icpc
+kind: coding
 runner: classic
 language: cpp
 runtime: python-3.13
@@ -232,7 +233,7 @@ are authoritative at registration; callers cannot replace them when creating
 an evaluation. `brunost task validate` also rejects ambiguous answer keys,
 orphan answer files, oversized test sets, and reference solutions outside
 `private/`. See [`docs/classic-tasks.md`](docs/classic-tasks.md) for the full
-ICPC package, checker, reference-solution, and CI contract.
+coding package, checker, reference-solution, and CI contract.
 
 `interactive` task packages use the same manifest and `tests/**/*.in` layout,
 but provide an `interactor.py` with `interact(session, input_path)`. The

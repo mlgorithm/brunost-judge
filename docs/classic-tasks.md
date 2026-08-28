@@ -1,10 +1,10 @@
-# Classic ICPC tasks
+# Deterministic coding tasks
 
-`kind: icpc` is Brunost Judge's deterministic batch-programming format. The
+`kind: coding` is Brunost Judge's deterministic batch-programming format. The
 classic runner compiles one submitted source file, executes it once for each
 private input, and checks its stdout. It is the right format for ordinary
 algorithmic problems whose result is determined only by the input and
-submission.
+submission. `kind: icpc` remains accepted as a legacy alias.
 
 The complete runnable reference package is
 [`examples/deterministic-sum`](../examples/deterministic-sum).
@@ -40,7 +40,7 @@ Use a flat YAML manifest. This is a complete CPU task:
 
 ```yaml
 version: 1
-kind: icpc
+kind: coding
 runner: classic
 language: cpp
 runtime: python-3.13

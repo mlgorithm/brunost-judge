@@ -83,7 +83,7 @@ The submitted `evaluation_kind` is validated against the registered task:
 
 | Task kind | Required evaluation kind | Extra fields |
 | --- | --- | --- |
-| `ioai`, `output-only`, `icpc`, `model`, `optimization` | `batch` | None |
+| `ioai`, `output-only`, `coding` (or legacy `icpc`), `model`, `optimization` | `batch` | None |
 | `interactive` | `interactive` | None |
 | `agent` | `agent` | One or more `agent_refs` |
 | `game` | `match` | `game_ref` and the game’s seats in `agent_refs` |

@@ -12,12 +12,13 @@ def test_task_scaffold_and_validation(tmp_path: Path, capsys):
     assert "valid task" in capsys.readouterr().out
 
 
-def test_classic_task_scaffold_declares_an_explicit_runtime_and_limits(tmp_path: Path):
-    task = tmp_path / "classic-task"
+def test_coding_task_scaffold_declares_an_explicit_runtime_and_limits(tmp_path: Path):
+    task = tmp_path / "coding-task"
 
-    assert main(["task", "new", "icpc", str(task)]) == 0
+    assert main(["task", "new", "coding", str(task)]) == 0
 
     manifest = (task / "judge.yaml").read_text(encoding="utf-8")
+    assert "kind: coding" in manifest
     assert "runtime: python-3.13" in manifest
     assert "network: disabled" in manifest
     assert "scoring_mode: all_or_nothing" in manifest

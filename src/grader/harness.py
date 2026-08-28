@@ -723,7 +723,7 @@ def run(submission_path: str, assets_path: str) -> dict[str, Any]:
     """
     try:
         kind = _task_kind(assets_path)
-        if kind in {"icpc", "interactive"}:
+        if kind in {"coding", "icpc", "interactive"}:
             from grader.classic import run_classic, run_interactive
 
             runner = run_interactive if kind == "interactive" else run_classic

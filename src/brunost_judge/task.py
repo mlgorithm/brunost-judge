@@ -16,12 +16,16 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
-SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only"})
+SUPPORTED_KINDS = frozenset(
+    {"agent", "coding", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only"}
+)
 # These are the task kinds executed by the built-in scorer sandbox.
 SCORER_KINDS = frozenset({"ioai", "output-only"})
 MODEL_KINDS = frozenset({"model"})
 OPTIMIZATION_KINDS = frozenset({"optimization"})
-CLASSIC_KINDS = frozenset({"icpc"})
+# ``icpc`` is retained for existing packages. New integrations should use the
+# task-family name rather than a contest-format label.
+CLASSIC_KINDS = frozenset({"coding", "icpc"})
 INTERACTIVE_KINDS = frozenset({"interactive"})
 PLUGIN_KINDS = frozenset({"agent", "game"})
 BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | OPTIMIZATION_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
@@ -48,6 +52,7 @@ MAX_CLASSIC_CODE_BYTES = 1_000_000
 MAX_CLASSIC_WALL_TIME_MS = 3_600_000
 CLASSIC_COMPILE_BUDGET_MS = 30_000
 CLASSIC_SETUP_BUDGET_MS = 5_000
+BROWSER_ONLY_RUNTIME_MARKERS = ("browser", "cheerpx", "pyodide", "wasm", "webassembly")
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
 
@@ -87,6 +92,13 @@ def _manifest_list(manifest: str, name: str) -> tuple[str, ...]:
     return tuple(item.strip().strip("\"'") for item in value.split(",") if item.strip())
 
 
+def is_browser_only_runtime(runtime: str) -> bool:
+    """Return whether a runtime belongs to Premium's local browser Lab."""
+
+    normalized = runtime.strip().lower()
+    return any(marker in normalized for marker in BROWSER_ONLY_RUNTIME_MARKERS)
+
+
 def _scheduling_settings(manifest: str, *, default_runtime: str | None = None) -> dict[str, Any]:
     """Return task-owned settings that affect registration or worker selection."""
 
@@ -104,6 +116,9 @@ def _scheduling_settings(manifest: str, *, default_runtime: str | None = None) -
 
 
 def _validate_scheduling_labels(manifest: str, errors: list[str]) -> None:
+    runtime = _manifest_field(manifest, "runtime")
+    if runtime and is_browser_only_runtime(runtime):
+        errors.append("browser-only runtimes must remain in Premium Lab and cannot be Judge task runtimes")
     resource_class = _manifest_field(manifest, "resource_class")
     if resource_class and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,49}", resource_class):
         errors.append("resource_class must contain only letters, numbers, '.', '_', ':', or '-'")
@@ -292,7 +307,7 @@ def _validate_classic_tests(
 
 
 def _classic_settings(root: Path, manifest: str, errors: list[str]) -> dict[str, Any]:
-    """Validate the ICPC execution envelope and return authoritative settings."""
+    """Validate the deterministic coding execution envelope and settings."""
 
     settings = _scheduling_settings(manifest, default_runtime="python-3.13")
     network = _manifest_field(manifest, "network")

@@ -70,6 +70,12 @@ def _reference_task(root):
 
 def test_classic_python_runner_dispatches_and_awards_percentage_score(tmp_path):
     task = _task(tmp_path)
+    (task / "judge.yaml").write_text(
+        (task / "judge.yaml").read_text(encoding="utf-8").replace("kind: icpc", "kind: coding"),
+        encoding="utf-8",
+    )
+    validation = validate_task(task)
+    assert validation.valid, validation.errors
     submission = tmp_path / "submission"
     submission.mkdir()
     (submission / "solution.py").write_text(

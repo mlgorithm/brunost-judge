@@ -138,7 +138,7 @@ def _positive_int(value: str | None, default: int, name: str) -> int:
 def _config(task: Path) -> ClassicConfig:
     values = _manifest(task)
     kind = values.get("kind", "").lower()
-    if kind not in {"icpc", "interactive"}:
+    if kind not in {"coding", "icpc", "interactive"}:
         raise ClassicJudgeError(f"classic runner does not support task kind {kind!r}")
     if values.get("version") != "1":
         raise ClassicJudgeError("classic tasks must declare version: 1")
