@@ -585,16 +585,24 @@ def create_app(database: str | Path | None = None):
         requested_kind = request.kind.lower() if request.kind else manifest_kind
         if requested_kind != manifest_kind:
             raise HTTPException(status_code=422, detail="request kind must match judge.yaml kind")
+        task_settings = validation.settings
+        required_capabilities = sorted({
+            *request.required_capabilities,
+            *(task_settings.get("required_capabilities") or ()),
+        })
         manifest = {
             **request.metadata,
             "kind": requested_kind,
             "version": request.version,
-            "runtime": request.runtime,
-            "evaluator": request.evaluator,
+            "runtime": task_settings.get("runtime") or request.runtime,
+            "evaluator": request.evaluator or task_settings.get("scoring"),
             "resource_profile": request.resource_profile,
-            "required_capabilities": request.required_capabilities,
+            "required_capabilities": required_capabilities,
             "digest": digest,
         }
+        for key in ("network", "resource_class"):
+            if task_settings.get(key):
+                manifest[key] = task_settings[key]
         if artifact_identifier:
             manifest["artifact_id"] = artifact_identifier
         try:
@@ -619,6 +627,8 @@ def create_app(database: str | Path | None = None):
                 status_code=501,
                 detail=f"task kind '{task.kind}' requires an installed evaluator runner plugin",
             )
+        if task.manifest.get("resource_class"):
+            payload["resource_class"] = str(task.manifest["resource_class"])
         submission_path = payload.pop("submission_path", None)
         submission_artifact_id = payload.pop("submission_artifact_id", None)
         if bool(submission_path) == bool(submission_artifact_id):

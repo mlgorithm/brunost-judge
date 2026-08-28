@@ -43,6 +43,52 @@ def test_task_kind_override_must_match_manifest(tmp_path: Path):
     assert "match" in response.json()["detail"]
 
 
+def test_ioai_manifest_controls_registration_and_scheduling(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: ioai\nruntime: python-3.13-cpu\n"
+        "scoring: scorer.metrics:evaluate\nresource_class: gpu\nnetwork: disabled\n"
+        "required_capabilities: gpu:true, runtime:cuda\n",
+        encoding="utf-8",
+    )
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+
+    registered = client.post(
+        "/v1/tasks",
+        json={
+            "task_ref": "ioai/gpu-v1",
+            "path": str(task),
+            "runtime": "caller-cannot-override-task-runtime",
+            "required_capabilities": ["runtime:docker"],
+        },
+    )
+    assert registered.status_code == 201
+    manifest = registered.json()["manifest"]
+    assert manifest["runtime"] == "python-3.13-cpu"
+    assert manifest["evaluator"] == "scorer.metrics:evaluate"
+    assert manifest["resource_class"] == "gpu"
+    assert manifest["required_capabilities"] == ["gpu:true", "runtime:cuda", "runtime:docker"]
+
+    submitted = client.post(
+        "/v1/evaluations",
+        json={
+            "task_ref": "ioai/gpu-v1",
+            "submission_path": str(submission),
+            "idempotency_key": "ioai-manifest-settings",
+            "resource_class": "cpu",
+        },
+    )
+    assert submitted.status_code == 202
+    assert submitted.json()["resource_class"] == "gpu"
+    assert submitted.json()["metadata"]["required_capabilities"] == ["gpu:true", "runtime:cuda", "runtime:docker"]
+
+
 def test_api_token_protects_control_plane(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_API_TOKEN", "secret")
     client = TestClient(create_app(tmp_path / "judge.db"))

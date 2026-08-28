@@ -55,6 +55,17 @@ launch one bounded JSONL process per seat with deterministic turn ordering;
 see the [runner-plugin protocol](plugins.md#agent-protocol) for the wire
 contract and resource limits.
 
+For IOAI/output-only tasks, the registered package is authoritative for
+`runtime`, `scoring`, `resource_class`, and `required_capabilities`.
+When declared, `scoring` must name the packaged scorer
+(`scorer.metrics:evaluate`) or the legacy root scorer (`metrics:evaluate`);
+older packages may infer this from their scorer location. Every scorer must define
+`evaluate(submission_path, assets_path)`. Generic scorer tasks must declare
+`network: disabled`. A task-level `resource_class` overrides the evaluation
+request’s resource class, and declared capabilities are combined with any
+operator-supplied capabilities before worker selection. Feedback/leaderboard
+visibility is platform policy and is not a Judge task-manifest field.
+
 ## Common integration flow
 
 For a distributed deployment, use artifacts rather than `path` or

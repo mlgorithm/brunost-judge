@@ -165,6 +165,18 @@ def evaluate(submission_path: str, assets_path: str) -> dict | float:
 - Any error (missing file, bad shape, scorer exception) → `{"status": "failed", "score": 0.0,
   "failure_reason": "..."}` — the harness never crashes the sandbox.
 
+An IOAI/output-only package should declare either `scorer/metrics.py` with
+`scoring: scorer.metrics:evaluate`, or the supported legacy root `metrics.py`
+with `scoring: metrics:evaluate` (older packages may omit the field and infer
+it from their scorer location). The scorer must define
+`evaluate(submission_path, assets_path)`. Generic scorer tasks are always
+network-disabled. Set `resource_class` (for example `cpu` or `gpu`) in
+`judge.yaml` when the task must run on a particular worker pool, and optionally
+add a comma-separated `required_capabilities` value such as
+`runtime:docker,gpu:true`. The task’s declared resource class and capabilities
+are applied at registration and cannot be weakened by an evaluation request.
+Feedback visibility belongs to the integrating platform, not a Judge manifest.
+
 ### Model and ML tasks
 
 Model tasks use a separate v2 contract: `train()` writes a model artifact,

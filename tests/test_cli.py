@@ -2,6 +2,7 @@ from pathlib import Path
 
 from brunost_judge.cli import main
 from brunost_judge.deployment import render_country_bundle
+from brunost_judge.task import validate_task
 
 
 def test_task_scaffold_and_validation(tmp_path: Path, capsys):
@@ -27,6 +28,25 @@ def test_task_validation_reports_missing_files(tmp_path: Path, capsys):
     task.mkdir()
     assert main(["task", "validate", str(task)]) == 2
     assert "missing judge.yaml" in capsys.readouterr().err
+
+
+def test_ioai_validation_checks_the_declared_scorer_contract(tmp_path: Path):
+    task = tmp_path / "task"
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir(parents=True, exist_ok=True)
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: ioai\nscoring: other.module:evaluate\nnetwork: enabled\nfeedback: validation\n",
+        encoding="utf-8",
+    )
+    (task / "scorer" / "metrics.py").write_text("def wrong_name(): pass\n", encoding="utf-8")
+
+    validation = validate_task(task)
+
+    assert not validation.valid
+    assert "scoring must be scorer.metrics:evaluate" in validation.errors
+    assert "scorer must define evaluate()" in validation.errors
+    assert "generic scorer tasks must declare network: disabled" in validation.errors
+    assert "feedback is platform policy; do not declare it in a Judge task manifest" in validation.errors
 
 
 def test_cluster_init_generates_private_operator_environment(tmp_path: Path, capsys):

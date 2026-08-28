@@ -12,7 +12,9 @@ import ast
 import hashlib
 import re
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
+from typing import Any
 
 SUPPORTED_KINDS = frozenset({"agent", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only"})
 # These are the task kinds executed by the built-in scorer sandbox.
@@ -42,6 +44,7 @@ class TaskValidation:
     path: Path
     kind: str | None
     errors: tuple[str, ...]
+    settings: dict[str, Any] = dataclass_field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -58,6 +61,63 @@ def _manifest_field(manifest: str, name: str) -> str | None:
         if match.group(1).lower() == name.lower():
             return match.group(2).strip().strip('"').strip("'")
     return None
+
+
+def _manifest_list(manifest: str, name: str) -> tuple[str, ...]:
+    """Read a small YAML scalar/list field without a YAML dependency."""
+
+    value = _manifest_field(manifest, name)
+    if not value:
+        return ()
+    if value.startswith("[") and value.endswith("]"):
+        value = value[1:-1]
+    return tuple(item.strip().strip("\"'") for item in value.split(",") if item.strip())
+
+
+def _scorer_settings(manifest: str) -> dict[str, Any]:
+    """Return generic-scorer settings that affect registration or scheduling."""
+
+    settings: dict[str, Any] = {}
+    for name in ("runtime", "scoring", "network", "resource_class"):
+        value = _manifest_field(manifest, name)
+        if value:
+            settings[name] = value
+    capabilities = _manifest_list(manifest, "required_capabilities")
+    if capabilities:
+        settings["required_capabilities"] = capabilities
+    return settings
+
+
+def _validate_scorer_manifest(root: Path, manifest: str, errors: list[str]) -> dict[str, Any]:
+    """Validate the executable and scheduling contract for IOAI/output tasks."""
+
+    packaged = root / "scorer" / "metrics.py"
+    legacy = root / "metrics.py"
+    if packaged.is_file() and legacy.is_file():
+        errors.append("provide either scorer/metrics.py or legacy metrics.py, not both")
+    elif not packaged.is_file() and not legacy.is_file():
+        errors.append("missing scorer/metrics.py (or legacy root metrics.py)")
+    else:
+        scorer_path = "scorer/metrics.py" if packaged.is_file() else "metrics.py"
+        expected_entrypoint = "scorer.metrics:evaluate" if packaged.is_file() else "metrics:evaluate"
+        declared_entrypoint = _manifest_field(manifest, "scoring")
+        if declared_entrypoint and declared_entrypoint != expected_entrypoint:
+            errors.append(f"scoring must be {expected_entrypoint}")
+        _validate_python_functions(root, scorer_path, "scorer", ("evaluate",), errors)
+
+    network = _manifest_field(manifest, "network")
+    if network and network.lower() != "disabled":
+        errors.append("generic scorer tasks must declare network: disabled")
+    if _manifest_field(manifest, "feedback") is not None:
+        errors.append("feedback is platform policy; do not declare it in a Judge task manifest")
+
+    resource_class = _manifest_field(manifest, "resource_class")
+    if resource_class and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,49}", resource_class):
+        errors.append("resource_class must contain only letters, numbers, '.', '_', ':', or '-'")
+    capabilities = _manifest_list(manifest, "required_capabilities")
+    if len(capabilities) > 32 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,99}", item) for item in capabilities):
+        errors.append("required_capabilities must contain at most 32 valid capability labels")
+    return _scorer_settings(manifest)
 
 
 def _validate_relative_path(value: str, label: str, errors: list[str]) -> None:
@@ -328,6 +388,7 @@ def validate_task(path: str | Path) -> TaskValidation:
     errors: list[str] = []
     manifest_path = root / "judge.yaml"
     kind: str | None = None
+    settings: dict[str, Any] = {}
 
     if not root.is_dir():
         return TaskValidation(root, None, (f"task directory does not exist: {root}",))
@@ -410,14 +471,14 @@ def validate_task(path: str | Path) -> TaskValidation:
             errors.append(f"model code evaluator.py exceeds {MAX_MODEL_CODE_BYTES} bytes")
         else:
             _validate_python_functions(root, "evaluator.py", "evaluator", ("evaluate",), errors)
-    elif not (root / "scorer" / "metrics.py").is_file() and not (root / "metrics.py").is_file():
-        errors.append("missing scorer/metrics.py (or legacy root metrics.py)")
+    elif kind in SCORER_KINDS:
+        settings = _validate_scorer_manifest(root, manifest_text, errors)
     if not (root / "public").is_dir():
         errors.append("missing public/ task-data directory")
     if not (root / "private").is_dir():
         errors.append("missing private/ hidden-assets directory")
 
-    return TaskValidation(root, kind, tuple(errors))
+    return TaskValidation(root, kind, tuple(errors), settings)
 
 
 def task_digest(path: str | Path) -> str:
@@ -569,7 +630,7 @@ def predict(model_path: str, test_dataset: str, predictions_path: str) -> None:
         (root / "scorer").mkdir(parents=True, exist_ok=True)
         runner = "\nrunner: python" if normalized_kind in PLUGIN_KINDS else ""
         (root / "judge.yaml").write_text(
-            f"""# Brunost Judge task manifest\nversion: 1\nkind: {normalized_kind}{runner}\nruntime: python-3.13\nscoring: scorer.metrics:evaluate\nnetwork: disabled\n\n# Add resource_profile and feedback policy before publishing an official task.\n""",
+            f"""# Brunost Judge task manifest\nversion: 1\nkind: {normalized_kind}{runner}\nruntime: python-3.13\nscoring: scorer.metrics:evaluate\nnetwork: disabled\n\n# Add resource_class and required_capabilities before publishing an official task.\n""",
             encoding="utf-8",
         )
         (root / "scorer" / "metrics.py").write_text(
