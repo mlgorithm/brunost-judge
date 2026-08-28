@@ -239,6 +239,10 @@ def run_optimization(submission_path: str, assets_path: str) -> dict[str, Any]:
         )
         with tempfile.TemporaryDirectory(prefix="brunost-optimization-") as temporary:
             root = Path(temporary)
+            # TemporaryDirectory is intentionally 0700.  The candidate is
+            # executed as UID 65533, so the evaluator workspace itself must
+            # be searchable even though its contents remain private.
+            root.chmod(0o755)
             candidate_dir = root / "candidate"
             candidate_dir.mkdir()
             source = _source_path(submission, judge_config)

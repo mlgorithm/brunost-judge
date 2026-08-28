@@ -589,6 +589,8 @@ def run_classic(submission_path: str, assets_path: str) -> dict[str, Any]:
             prefix="brunost-reference-"
         ) as reference_temporary:
             build_dir = Path(temporary)
+            build_dir.chmod(0o755)
+            Path(reference_temporary).chmod(0o755)
             cases = _reference_answers(task, config, cases, Path(reference_temporary))
             try:
                 command, compile_stderr = _compile(source, config, build_dir)
@@ -678,6 +680,7 @@ def run_interactive(submission_path: str, assets_path: str) -> dict[str, Any]:
         cases = _interactive_inputs(task)
         with tempfile.TemporaryDirectory(prefix="brunost-interactive-") as temporary:
             build_dir = Path(temporary)
+            build_dir.chmod(0o755)
             test_metrics: list[dict[str, Any]] = []
             for index, input_path in enumerate(cases):
                 result_path = build_dir / f"interactive-{index}.json"

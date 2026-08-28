@@ -508,6 +508,9 @@ def _run_model_submission_v2(submission_path: str, assets_path: str) -> dict[str
 
     with tempfile.TemporaryDirectory(prefix="brunost-model-v2-") as temporary:
         root = Path(temporary)
+        # Contestant code runs as the dedicated unprivileged UID.  Keep the
+        # temporary workspace searchable while individual files stay private.
+        root.chmod(0o755)
         deadline = time.monotonic() + budget_ms / 1000
 
         def phase_timeout(limit_ms: int, label: str) -> tuple[int | None, dict[str, Any] | None]:

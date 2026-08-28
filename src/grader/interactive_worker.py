@@ -136,6 +136,7 @@ def run(task_path: str, submission_path: str, input_path: str) -> dict[str, Any]
         source = _source_path(submission, config)
         with tempfile.TemporaryDirectory(prefix="brunost-interactive-worker-") as temporary:
             build_dir = Path(temporary)
+            build_dir.chmod(0o755)
             command, compile_stderr = _compile(source, config, build_dir)
             stderr_file = tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115 - closed below
             try:
