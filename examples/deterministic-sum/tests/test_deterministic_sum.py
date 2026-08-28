@@ -36,4 +36,3 @@ def test_example_rejects_an_incorrect_solution(tmp_path: Path):
     assert result["status"] == "completed", result
     assert result["score"] == 0.0
     assert result["metrics"]["verdict"] == "WA"
-
