@@ -33,6 +33,7 @@ CONTROL_PLANE_COMPOSE = """services:
       BRUNOST_JUDGE_ARTIFACT_ROOT: /var/lib/brunost/artifacts
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE:-}
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: \"true\"
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS: "true"
       # Keep this false for public callbacks.  An isolated service mesh may
@@ -51,6 +52,20 @@ CONTROL_PLANE_COMPOSE = """services:
       - judge-artifacts:/var/lib/brunost/artifacts
     depends_on:
       judge-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  callback-dispatcher:
+    image: ${BRUNOST_JUDGE_IMAGE}
+    command: [\"callback-dispatcher\", \"--poll-seconds\", \"1\"]
+    environment:
+      BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@judge-postgres:5432/${POSTGRES_DB}
+      BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET}
+      BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE:-}
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: \"true\"
+      BRUNOST_JUDGE_ENV: production
+    depends_on:
+      judge-api:
         condition: service_healthy
     restart: unless-stopped
 
@@ -89,6 +104,7 @@ WORKER_COMPOSE = """services:
       BRUNOST_JUDGE_SANDBOX_SECCOMP: ${BRUNOST_JUDGE_SANDBOX_SECCOMP:-/etc/docker/seccomp/brunost-seccomp.json}
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS: \"true\"
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: \"true\"
       DOCKER_HOST: tcp://docker-socket-proxy:2375
     depends_on:
       - docker-socket-proxy

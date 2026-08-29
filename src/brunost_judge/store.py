@@ -658,6 +658,22 @@ class JudgeStore:
                     now,
                 ),
             )
+            if cursor.rowcount == 1:
+                callback = db.execute(
+                    "SELECT callback_url,callback_token FROM executions WHERE execution_id=?",
+                    (execution_id,),
+                ).fetchone()
+                if callback is not None and callback["callback_url"]:
+                    # Finish and callback outbox insertion share one
+                    # transaction. A worker crash after finish therefore
+                    # cannot strand a result without a durable notification.
+                    db.execute(
+                        """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                           VALUES(?,?,?,?) ON CONFLICT(execution_id) DO UPDATE SET
+                           callback_url=excluded.callback_url,callback_token=excluded.callback_token
+                           WHERE callback_deliveries.delivered_at IS NULL""",
+                        (execution_id, callback["callback_url"], callback["callback_token"], _now()),
+                    )
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
@@ -715,6 +731,17 @@ class JudgeStore:
     def mark_callback_delivered(self, execution_id: str) -> None:
         with self._lock, self._connect() as db:
             db.execute("UPDATE callback_deliveries SET delivered_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=?", (_now(), execution_id))
+
+    def mark_callback_delivered_by_owner(self, execution_id: str, worker_id: str) -> bool:
+        """Acknowledge a callback only for the worker holding its delivery lease."""
+
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """UPDATE callback_deliveries SET delivered_at=?,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL
+                   WHERE execution_id=? AND delivered_at IS NULL AND lease_owner=?""",
+                (_now(), execution_id, worker_id),
+            )
+        return cursor.rowcount == 1
 
     def mark_callback_failed(self, execution_id: str, error: str) -> None:
         with self._lock, self._connect() as db:
@@ -800,4 +827,5 @@ class JudgeStore:
             status=row["status"],
             draining=bool(row["draining"]),
             metadata=json.loads(row["metadata_json"]),
+            last_seen=row["last_seen"],
         )

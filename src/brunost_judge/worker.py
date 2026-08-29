@@ -57,7 +57,8 @@ def _evaluation_profile_environment(metadata: dict[str, Any]):
 
 def _callback_secret_from_environment() -> str | None:
     secret = configured_secret("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
-    required = os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true"
+    production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
+    required = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true"
     if required and not secret:
         raise RuntimeError("signed callbacks are required but no callback signing secret is configured")
     return secret
@@ -223,7 +224,7 @@ _CALLBACK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.3"}
+    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.3.1"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:
@@ -237,6 +238,52 @@ def _notify(url: str, token: str | None, payload: dict, signing_secret: str | No
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     with _CALLBACK_OPENER.open(request, timeout=10):
         return
+
+
+def _deliver_callbacks(store: Any, worker_id: str, signing_secret: str | None, *, limit: int = 20) -> int:
+    """Deliver terminal-result callbacks from the durable outbox."""
+
+    delivered = 0
+    for row in store.pending_callbacks(limit=limit):
+        execution_id = str(row["execution_id"])
+        if not store.claim_callback(execution_id, worker_id):
+            continue
+        execution = store.get_execution(execution_id)
+        if execution is None:
+            continue
+        try:
+            _notify(row["callback_url"], row["callback_token"], execution.as_dict(), signing_secret)
+        except Exception as exc:  # noqa: BLE001 - retry delivery without re-execution
+            store.mark_callback_failed(execution_id, f"{type(exc).__name__}: {exc}")
+        else:
+            store.mark_callback_delivered_by_owner(execution_id, worker_id)
+            delivered += 1
+    return delivered
+
+
+class CallbackDispatcher:
+    """Durable callback delivery loop for the Judge control plane."""
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        poll_seconds: float = 1.0,
+        worker_id: str | None = None,
+        callback_signing_secret: str | None = None,
+    ) -> None:
+        self.store = store
+        self.poll_seconds = max(0.1, float(poll_seconds))
+        self.worker_id = worker_id or f"callback-dispatcher-{uuid.uuid4().hex[:12]}"
+        self.callback_signing_secret = callback_signing_secret or _callback_secret_from_environment()
+
+    def deliver_callbacks(self) -> int:
+        return _deliver_callbacks(self.store, self.worker_id, self.callback_signing_secret)
+
+    def run_forever(self) -> None:
+        while True:
+            if self.deliver_callbacks() == 0:
+                time.sleep(self.poll_seconds)
 
 
 class LocalWorker:
@@ -394,21 +441,7 @@ class LocalWorker:
         return task_path
 
     def deliver_callbacks(self) -> int:
-        delivered = 0
-        for row in self.store.pending_callbacks():
-            if not self.store.claim_callback(row["execution_id"], self.worker_id):
-                continue
-            execution = self.store.get_execution(row["execution_id"])
-            if execution is None:
-                continue
-            try:
-                _notify(row["callback_url"], row["callback_token"], execution.as_dict(), self.callback_signing_secret)
-            except Exception as exc:  # noqa: BLE001 - retry delivery without re-execution
-                self.store.mark_callback_failed(row["execution_id"], f"{type(exc).__name__}: {exc}")
-            else:
-                self.store.mark_callback_delivered(row["execution_id"])
-                delivered += 1
-        return delivered
+        return _deliver_callbacks(self.store, self.worker_id, self.callback_signing_secret)
 
     def run_forever(self) -> None:
         while True:
@@ -442,7 +475,7 @@ class RemoteWorker:
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.path_map = path_map
         self.callback_signing_secret = _callback_secret_from_environment()
-        self._pending_callbacks: list[tuple[str, str | None, dict, str | None]] = []
+        self._pending_callbacks: list[tuple[str, str | None, dict, str | None, str | None]] = []
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
             or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
@@ -577,27 +610,43 @@ class RemoteWorker:
         finished = self.client.finish_worker(self.worker_id, result.as_dict())
         callback_url = context.get("callback_url")
         if finished and callback_url:
-            self._send_callback(callback_url, context.get("callback_token"), finished)
+            try:
+                if self.client.claim_callback(self.worker_id, execution_id):
+                    self._send_callback(callback_url, context.get("callback_token"), finished, execution_id=execution_id)
+            except Exception as exc:  # noqa: BLE001 - the durable outbox will retry
+                LOGGER.warning("could not claim callback for %s: %s", execution_id, exc)
         return result
 
-    def _send_callback(self, callback_url: str, callback_token: str | None, payload: dict) -> None:
+    def _send_callback(self, callback_url: str, callback_token: str | None, payload: dict, *, execution_id: str | None = None) -> None:
         signing_secret = getattr(self, "callback_signing_secret", None)
         try:
             _notify(callback_url, callback_token, payload, signing_secret)
         except Exception as exc:  # noqa: BLE001 - retain the result and retry without crashing the worker
             LOGGER.warning("callback delivery failed for %s: %s", payload.get("execution_id"), exc)
-            self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret))
+            self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret, execution_id))
+        else:
+            if execution_id is not None:
+                try:
+                    self.client.acknowledge_callback(self.worker_id, execution_id)
+                except Exception as exc:  # noqa: BLE001 - delivery succeeded; lease expiry permits a safe retry
+                    LOGGER.warning("callback acknowledgement failed for %s: %s", payload.get("execution_id"), exc)
 
     def _deliver_pending_callbacks(self) -> None:
         if not self._pending_callbacks:
             return
         pending, self._pending_callbacks = self._pending_callbacks, []
-        for callback_url, callback_token, payload, signing_secret in pending:
+        for callback_url, callback_token, payload, signing_secret, execution_id in pending:
             try:
                 _notify(callback_url, callback_token, payload, signing_secret)
             except Exception as exc:  # noqa: BLE001 - leave the item queued for the next poll
                 LOGGER.warning("callback retry failed for %s: %s", payload.get("execution_id"), exc)
-                self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret))
+                self._pending_callbacks.append((callback_url, callback_token, payload, signing_secret, execution_id))
+            else:
+                if execution_id is not None:
+                    try:
+                        self.client.acknowledge_callback(self.worker_id, execution_id)
+                    except Exception as exc:  # noqa: BLE001 - delivery succeeded; lease expiry permits a safe retry
+                        LOGGER.warning("callback acknowledgement retry failed for %s: %s", payload.get("execution_id"), exc)
 
     def run_forever(self) -> None:
         while True:

@@ -130,6 +130,7 @@ class WorkerRecord:
     status: str = "ready"
     draining: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    last_seen: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)

@@ -506,6 +506,22 @@ class PostgresJudgeStore:
                     worker_id,
                 ),
             )
+            if cursor.rowcount == 1:
+                callback = db.execute(
+                    "SELECT callback_url,callback_token FROM executions WHERE execution_id=%s",
+                    (execution_id,),
+                ).fetchone()
+                if callback is not None and callback["callback_url"]:
+                    # Keep result persistence and callback enqueue atomic so a
+                    # remote worker crash cannot lose a terminal notification.
+                    db.execute(
+                        """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                           VALUES(%s,%s,%s,%s)
+                           ON CONFLICT(execution_id) DO UPDATE SET
+                           callback_url=EXCLUDED.callback_url,callback_token=EXCLUDED.callback_token
+                           WHERE callback_deliveries.delivered_at IS NULL""",
+                        (execution_id, callback["callback_url"], callback["callback_token"], _now()),
+                    )
         if cursor.rowcount == 0:
             return None
         return self.get_execution(execution_id)
@@ -545,6 +561,17 @@ class PostgresJudgeStore:
     def mark_callback_delivered(self, execution_id: str) -> None:
         with self._connect() as db:
             db.execute("UPDATE callback_deliveries SET delivered_at=%s,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=%s", (_now(), execution_id))
+
+    def mark_callback_delivered_by_owner(self, execution_id: str, worker_id: str) -> bool:
+        """Acknowledge a callback only for the worker holding its delivery lease."""
+
+        with self._connect() as db:
+            cursor = db.execute(
+                """UPDATE callback_deliveries SET delivered_at=%s,last_error=NULL,lease_owner=NULL,lease_expires_at=NULL
+                   WHERE execution_id=%s AND delivered_at IS NULL AND lease_owner=%s""",
+                (_now(), execution_id, worker_id),
+            )
+        return cursor.rowcount == 1
 
     def mark_callback_failed(self, execution_id: str, error: str) -> None:
         with self._connect() as db:
@@ -604,6 +631,9 @@ class PostgresJudgeStore:
             return tuple(json.loads(value))
 
         metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
+        last_seen = row.get("last_seen")
+        if hasattr(last_seen, "isoformat"):
+            last_seen = last_seen.isoformat()
         return WorkerRecord(
             worker_id=row["worker_id"],
             capabilities=_list(row["capabilities_json"]),
@@ -613,4 +643,5 @@ class PostgresJudgeStore:
             status=row["status"],
             draining=bool(row["draining"]),
             metadata=metadata,
+            last_seen=last_seen,
         )

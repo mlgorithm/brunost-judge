@@ -249,6 +249,8 @@ maintenance:
 ```text
 POST /v1/workers/register
 POST /v1/workers/{worker_id}/heartbeat?status=ready
+POST /v1/workers/{worker_id}/callbacks/{execution_id}/claim
+POST /v1/workers/{worker_id}/callbacks/{execution_id}/ack
 POST /v1/workers/{worker_id}/drain?draining=true
 POST /v1/workers/{worker_id}/claim
 POST /v1/workers/{worker_id}/finish
@@ -272,6 +274,11 @@ claimed execution includes its task, artifact references, callback context, and
 the cancellation endpoint while evaluating, and finish only with a terminal
 result. A finish or renewal after cancellation, lease expiry, or ownership
 change returns `409 Conflict`; the worker must discard that stale result.
+
+Terminal results with a callback URL are placed in the Judge callback outbox in
+the same transaction as the result. Remote workers claim and acknowledge their
+delivery lease after sending the callback; the control-plane callback
+dispatcher retries anything left behind after a worker or network failure.
 
 The scheduler must never infer a GPU or runtime capability from a hostname. A
 worker advertises capabilities such as `gpu:true`, `runtime:kubernetes`, and

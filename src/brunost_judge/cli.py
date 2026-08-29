@@ -170,6 +170,10 @@ def _parser() -> argparse.ArgumentParser:
     canary.add_argument("--resource-class", default="cpu")
     canary.add_argument("--callback-url", help="optional result callback URL to exercise")
     canary.add_argument("--callback-token", help="optional bearer token for the callback receiver")
+    dispatcher = subparsers.add_parser("callback-dispatcher", help="deliver durable result callbacks")
+    dispatcher.add_argument("--database", type=str)
+    dispatcher.add_argument("--poll-seconds", default=1.0, type=float)
+    dispatcher.add_argument("--worker-id")
     return parser
 
 
@@ -487,6 +491,21 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         os.environ["BRUNOST_JUDGE_IMPORT_APP"] = "false"
         uvicorn.run(create_app(args.database), host=args.host, port=args.port)
+        return 0
+    if args.command == "callback-dispatcher":
+        from brunost_judge.store import create_store
+        from brunost_judge.worker import CallbackDispatcher
+
+        try:
+            dispatcher = CallbackDispatcher(
+                create_store(args.database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")),
+                poll_seconds=args.poll_seconds,
+                worker_id=args.worker_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed with an actionable startup error
+            print(f"callback dispatcher failed to start: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+        dispatcher.run_forever()
         return 0
     if args.command == "auth" and args.auth_command == "rotate-admin-token":
         destination = args.output.expanduser().resolve()

@@ -250,6 +250,7 @@ def test_production_allows_only_explicit_allowlisted_internal_http_callback(tmp_
     monkeypatch.setenv("BRUNOST_JUDGE_ENV", "production")
     monkeypatch.setenv("BRUNOST_JUDGE_CALLBACK_HOSTS", "premium")
     monkeypatch.setenv("BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS", "true")
+    monkeypatch.setenv("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET", "internal-callback-secret")
     task = tmp_path / "task"
     task.mkdir()
     (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")

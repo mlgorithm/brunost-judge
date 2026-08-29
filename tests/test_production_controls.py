@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
+from brunost_judge.contracts import (
+    ExecutionRequest,
+    ExecutionResult,
+    TaskRecord,
+    WorkerRecord,
+)
 from brunost_judge.plugins import RunnerContext, RunnerRegistry
 from brunost_judge.security import callback_signature, verify_callback_signature
 from brunost_judge.store import JudgeStore
@@ -32,6 +37,14 @@ def test_priority_queue_and_worker_lease(tmp_path: Path):
     assert claimed[0].metadata["event_id"].startswith("execution:")
     assert claimed[2]["queue"] == "cpu"
     assert store.claim_next(worker_id="gpu-1", queues=("gpu",)) is None
+
+
+def test_worker_health_exposes_last_seen_timestamp(tmp_path: Path):
+    store = _store(tmp_path)
+    worker = store.register_worker(WorkerRecord("worker-health", capabilities=("resource:cpu",)))
+    assert worker.last_seen
+    assert store.heartbeat_worker("worker-health") is not None
+    assert store.get_worker("worker-health").last_seen  # type: ignore[union-attr]
 
 
 def test_worker_claim_filters_required_capabilities(tmp_path: Path):
@@ -144,6 +157,34 @@ def test_callback_delivery_has_single_active_owner(tmp_path: Path):
 
     assert store.claim_callback(execution.execution_id, "worker-a")
     assert not store.claim_callback(execution.execution_id, "worker-b")
+
+
+def test_finish_atomically_enqueues_callback_and_requires_delivery_owner(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(
+        ExecutionRequest(
+            "demo/v1",
+            str(submission),
+            "atomic-callback",
+            callback_url="https://callback.example.test/result",
+            callback_token="callback-token",
+        )
+    )
+    assert store.claim_next(worker_id="worker-a") is not None
+    assert store.finish(
+        execution.execution_id,
+        ExecutionResult(execution.execution_id, "demo/v1", "completed", score=1.0),
+        worker_id="worker-a",
+    ) is not None
+    pending = store.pending_callbacks()
+    assert len(pending) == 1
+    assert pending[0]["callback_token"] == "callback-token"
+    assert store.claim_callback(execution.execution_id, "worker-a")
+    assert not store.mark_callback_delivered_by_owner(execution.execution_id, "worker-b")
+    assert store.mark_callback_delivered_by_owner(execution.execution_id, "worker-a")
+    assert store.pending_callbacks() == []
 
 
 def test_production_agent_launch_is_bubblewrapped_and_drops_pythonpath(tmp_path: Path, monkeypatch):

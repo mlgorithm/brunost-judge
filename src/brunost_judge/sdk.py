@@ -267,6 +267,14 @@ class JudgeClient:
     def heartbeat_worker(self, worker_id: str, *, status: str = "ready") -> dict[str, Any]:
         return self._request("POST", f"/v1/workers/{worker_id}/heartbeat?status={status}")
 
+    def claim_callback(self, worker_id: str, execution_id: str) -> bool:
+        payload = self._request("POST", f"/v1/workers/{worker_id}/callbacks/{execution_id}/claim")
+        return bool(payload.get("claimed"))
+
+    def acknowledge_callback(self, worker_id: str, execution_id: str) -> bool:
+        payload = self._request("POST", f"/v1/workers/{worker_id}/callbacks/{execution_id}/ack")
+        return bool(payload.get("delivered"))
+
     def worker_status(self, worker_id: str) -> dict[str, Any]:
         return self._request("GET", f"/v1/workers/{worker_id}/status")
 

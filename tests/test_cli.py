@@ -82,6 +82,7 @@ def test_generated_bundle_respects_container_entrypoints(tmp_path: Path):
     assert 'command: ["server"' in control
     assert 'command: ["worker"' in worker
     assert 'command: ["brunost"' not in control + worker
+    assert 'command: ["callback-dispatcher"' in control
 
 
 def test_canary_uses_immutable_artifacts_and_checks_idempotency(tmp_path: Path, monkeypatch, capsys):

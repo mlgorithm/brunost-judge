@@ -32,12 +32,17 @@ Before an official contest, operators must provide:
   An isolated service mesh may set
   `BRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=true` for an allowlisted
   internal hostname only; public callbacks remain HTTPS-only;
+- a durable callback dispatcher (`brunost callback-dispatcher`) running on the
+  control plane. Terminal results and callback outbox rows are committed in
+  one database transaction, so worker loss after finishing an evaluation does
+  not lose the Premium notification;
 - one-time node enrollment with `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true` and
   a separate scoped credential per worker;
 - backups, monitoring, alerting, and a rehearsed restore/failover plan;
 - a second failure domain for multi-country availability.
 
-The base Compose profile uses PostgreSQL, read-only API/worker images,
+The base Compose profile uses PostgreSQL, a durable callback dispatcher,
+read-only API/worker images,
 queue/resource labels, and health-ordered startup. For an untrusted contest,
 use the hardened overlay:
 

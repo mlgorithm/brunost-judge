@@ -170,7 +170,7 @@ def create_app(database: str | Path | None = None):
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
-    app = FastAPI(title="Brunost Judge", version="1.3.0")
+    app = FastAPI(title="Brunost Judge", version="1.3.1")
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
     rate_limiter = RateLimiter()
 
@@ -271,7 +271,8 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=503, detail="BRUNOST_JUDGE_CALLBACK_HOSTS is required in production")
         if allowlist and (not parsed.hostname or parsed.hostname.lower() not in allowlist):
             raise HTTPException(status_code=422, detail="callback host is not allowed")
-        if os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true":
+        require_signed = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS", "false").lower() == "true"
+        if require_signed:
             try:
                 signing_secret = configured_secret("BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET")
             except RuntimeError as exc:
@@ -355,7 +356,7 @@ def create_app(database: str | Path | None = None):
         return {
             "status": "ok",
             "service": "brunost-judge",
-            "version": "1.3.0",
+            "version": "1.3.1",
             "database": type(store).__name__,
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
         }
@@ -427,7 +428,7 @@ def create_app(database: str | Path | None = None):
         return {
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
             "service": "brunost-judge",
-            "version": "1.3.0",
+            "version": "1.3.1",
             "workers": len(workers),
             "ready_workers": sum(1 for worker in workers if worker.status == "ready" and not worker.draining),
         }
@@ -864,6 +865,22 @@ def create_app(database: str | Path | None = None):
         if worker is None:
             raise HTTPException(status_code=404, detail="worker not found")
         return worker.as_dict()
+
+    @app.post("/v1/workers/{worker_id}/callbacks/{execution_id}/claim", dependencies=[Depends(require_worker_token)])
+    def claim_callback(worker_id: str, execution_id: str) -> dict[str, Any]:
+        if store.get_worker(worker_id) is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        if store.get_execution(execution_id) is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        return {"execution_id": execution_id, "claimed": store.claim_callback(execution_id, worker_id)}
+
+    @app.post("/v1/workers/{worker_id}/callbacks/{execution_id}/ack", dependencies=[Depends(require_worker_token)])
+    def acknowledge_callback(worker_id: str, execution_id: str) -> dict[str, Any]:
+        if store.get_worker(worker_id) is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        if not store.mark_callback_delivered_by_owner(execution_id, worker_id):
+            raise HTTPException(status_code=409, detail="callback is not leased to this worker")
+        return {"execution_id": execution_id, "delivered": True}
 
     @app.get("/v1/workers/{worker_id}/status", dependencies=[Depends(require_worker_token)])
     def worker_status(worker_id: str) -> dict[str, Any]:

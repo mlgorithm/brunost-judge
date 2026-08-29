@@ -6,6 +6,18 @@
 # required by the sandbox. Kubernetes/Kata/Firecracker executors are preferred
 # for larger deployments; this profile is the portable Docker-host fallback.
 services:
+  judge-api:
+    environment:
+      BRUNOST_JUDGE_ENV: production
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: "true"
+      BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS: "true"
+      BRUNOST_JUDGE_CALLBACK_HOSTS: ${BRUNOST_JUDGE_CALLBACK_HOSTS:?set an allowlisted callback hostname}
+
+  callback-dispatcher:
+    environment:
+      BRUNOST_JUDGE_ENV: production
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: "true"
+
   docker-socket-proxy:
     image: ${BRUNOST_DOCKER_SOCKET_PROXY_IMAGE:?set BRUNOST_DOCKER_SOCKET_PROXY_IMAGE to a digest-pinned proxy image}
     environment:
@@ -43,6 +55,7 @@ services:
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS: "true"
+      BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: "true"
     depends_on:
       - docker-socket-proxy
     volumes:
