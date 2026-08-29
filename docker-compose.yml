@@ -61,6 +61,10 @@ services:
   callback-dispatcher:
     build: .
     command: ["callback-dispatcher", "--poll-seconds", "1"]
+    # The shared image healthcheck targets the API; this service has no HTTP
+    # listener and should be supervised by its process/restart policy.
+    healthcheck:
+      disable: true
     environment:
       BRUNOST_JUDGE_DATABASE_URL: postgresql://${POSTGRES_USER:-brunost}:${POSTGRES_PASSWORD:-local-development-only}@judge-postgres:5432/${POSTGRES_DB:-brunost_judge}
       BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET: ${BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET:-change-me-before-exposure}
