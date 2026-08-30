@@ -108,6 +108,7 @@ curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/tasks" \
 
 curl --fail-with-body -X POST "$BRUNOST_JUDGE_URL/v1/evaluations" \
   -H "Authorization: Bearer $BRUNOST_JUDGE_API_TOKEN" \
+  -H 'Idempotency-Key: platform-submission-123' \
   -H 'Content-Type: application/json' \
   -d '{"task_ref":"sum/v1","submission_artifact_id":"<submission-artifact-id>","idempotency_key":"platform-submission-123","queue":"default","resource_class":"cpu"}'
 ```

@@ -149,6 +149,7 @@ Before starting a shared deployment, verify these settings are intentional.
 | --- | --- | --- |
 | `BRUNOST_JUDGE_DATABASE_URL` | PostgreSQL URL, supplied as a secret | SQLite has no multi-host durability or coordination guarantee |
 | `BRUNOST_JUDGE_API_TOKEN_FILE` | Mounted secret file; do not use Compose defaults | Protects every control-plane mutation |
+| `BRUNOST_JUDGE_REQUIRE_IDEMPOTENCY_HEADER` | `true` in production | Binds retry identity to the HTTP request, not only its JSON body |
 | `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN` | `true` | Limits claims, leases, and finishes to enrolled workers |
 | `BRUNOST_JUDGE_ARTIFACT_BACKEND` | Replicated object storage for multi-host deployments | Makes immutable task/submission bundles available to every worker |
 | `BRUNOST_JUDGE_SANDBOX_MODE` | `docker` with a certified runtime | Prevents a production fallback to the development process runner |
@@ -156,6 +157,12 @@ Before starting a shared deployment, verify these settings are intentional.
 | `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET_FILE` | Mounted secret file, with signed callbacks required | Enables callback authenticity and replay protection |
 | `BRUNOST_JUDGE_CALLBACK_HOSTS` | Explicit callback receiver allowlist | Prevents callback SSRF to arbitrary hosts |
 | `BRUNOST_JUDGE_LEASE_SECONDS` | Longer than normal renewal latency, shorter than recovery tolerance | Balances worker-loss recovery against long-running evaluations |
+
+HTTP clients should disable redirects for authenticated requests and enforce a
+bounded response size. The SDK and Platform Kit do this by default. For a
+private service mesh, clients may set `BRUNOST_JUDGE_CA_FILE` and the matching
+`BRUNOST_JUDGE_CLIENT_CERT_FILE` / `BRUNOST_JUDGE_CLIENT_KEY_FILE` to enable
+private-CA verification and mTLS without changing the Judge API contract.
 
 Use `docker compose ... config --quiet` with all required variables supplied
 before bringing up the hardened overlay. Never point a production service at

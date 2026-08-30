@@ -289,6 +289,44 @@ def test_api_rejects_reusing_an_idempotency_key_for_a_different_request(tmp_path
     assert "different request" in conflict.json()["detail"]
 
 
+def test_api_rejects_a_mismatched_idempotency_header(tmp_path: Path):
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    assert client.post("/v1/tasks", json={"task_ref": "header/v1", "path": str(task)}).status_code == 201
+
+    response = client.post(
+        "/v1/evaluations",
+        headers={"Idempotency-Key": "header-key-other"},
+        json={"task_ref": "header/v1", "submission_path": str(submission), "idempotency_key": "header-key"},
+    )
+    assert response.status_code == 400
+    assert "does not match" in response.json()["detail"]
+
+
+def test_api_can_require_an_idempotency_header(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_REQUIRE_IDEMPOTENCY_HEADER", "true")
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    assert client.post("/v1/tasks", json={"task_ref": "required-header/v1", "path": str(task)}).status_code == 201
+    body = {"task_ref": "required-header/v1", "submission_path": str(submission), "idempotency_key": "required-key"}
+    assert client.post("/v1/evaluations", json=body).status_code == 428
+    assert client.post("/v1/evaluations", headers={"Idempotency-Key": "required-key"}, json=body).status_code == 202
+
+
 def test_production_allows_only_explicit_allowlisted_internal_http_callback(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_ENV", "production")
     monkeypatch.setenv("BRUNOST_JUDGE_CALLBACK_HOSTS", "premium")

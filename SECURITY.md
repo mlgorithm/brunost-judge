@@ -15,6 +15,12 @@ with `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET`; receivers should verify the
 timestamp/signature pair using `brunost_judge.sdk.JudgeClient.verify_callback`
 and reject timestamps older than five minutes.
 
+Set `BRUNOST_JUDGE_REQUIRE_IDEMPOTENCY_HEADER=true` at the HTTP edge so the
+`Idempotency-Key` header must match the request body for evaluation submissions.
+The SDK and Platform Kit send that header automatically. Authenticated HTTP
+clients reject redirects and cap response bodies; private deployments may add
+CA and mTLS files with the `BRUNOST_JUDGE_*_FILE` transport settings.
+
 For distributed workers, also set `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true`.
 Create short-lived join tokens through the operator API or console, enroll each
 node once, and keep the returned worker credential in a mode-`0600` node

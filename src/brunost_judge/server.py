@@ -182,6 +182,7 @@ def create_app(database: str | Path | None = None):
     artifact_store = artifact_store_from_environment()
     app = FastAPI(title="Brunost Judge", version="1.3.1")
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
+    require_idempotency_header = os.environ.get("BRUNOST_JUDGE_REQUIRE_IDEMPOTENCY_HEADER", "false").lower() == "true"
     rate_limiter = RateLimiter()
 
     def _client_key(request: Request) -> str:
@@ -212,10 +213,23 @@ def create_app(database: str | Path | None = None):
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "rate limit exceeded"},
-                    headers={"Retry-After": str(retry_after)},
+                    headers={
+                        "Retry-After": str(retry_after),
+                        "Cache-Control": "no-store",
+                        "X-Content-Type-Options": "nosniff",
+                        "Referrer-Policy": "no-referrer",
+                    },
                 )
         request.state.auth_subject = "anonymous"
         response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if request.url.path.startswith("/v1") or request.url.path in {"/healthz", "/readyz"}:
+            response.headers.setdefault("Cache-Control", "no-store")
+        if os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}:
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         if request.url.path.startswith("/v1") and (
             request.method not in {"GET", "HEAD", "OPTIONS"}
             or request.url.path.startswith("/v1/auth")
@@ -650,10 +664,16 @@ def create_app(database: str | Path | None = None):
     def list_task_definitions() -> list[dict[str, Any]]:
         return [task.as_dict() for task in store.list_tasks()]
 
-    def _submit_execution(payload: dict[str, Any]) -> dict[str, Any]:
+    def _submit_execution(payload: dict[str, Any], idempotency_header: str | None = None) -> dict[str, Any]:
         from brunost_judge.contracts import ExecutionRequest
 
         payload = dict(payload)
+        body_idempotency_key = str(payload.get("idempotency_key") or "").strip()
+        header_idempotency_key = (idempotency_header or "").strip()
+        if header_idempotency_key and header_idempotency_key != body_idempotency_key:
+            raise HTTPException(status_code=400, detail="Idempotency-Key header does not match request body")
+        if require_idempotency_header and not header_idempotency_key:
+            raise HTTPException(status_code=428, detail="Idempotency-Key header is required")
         task = store.get_task(str(payload.get("task_ref") or ""))
         if task is None:
             raise HTTPException(status_code=404, detail=f"unknown task_ref: {payload.get('task_ref')}")
@@ -745,12 +765,18 @@ def create_app(database: str | Path | None = None):
         return result.as_dict()
 
     @app.post("/v1/executions", status_code=202, dependencies=[Depends(require_api_token)])
-    def submit(request: ExecutionRequestModel) -> dict[str, Any]:
-        return _submit_execution(request.model_dump())
+    def submit(
+        request: ExecutionRequestModel,
+        idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        return _submit_execution(request.model_dump(), idempotency_header)
 
     @app.post("/v1/evaluations", status_code=202, dependencies=[Depends(require_api_token)])
-    def submit_evaluation(request: ExecutionRequestModel) -> dict[str, Any]:
-        return _submit_execution(request.model_dump())
+    def submit_evaluation(
+        request: ExecutionRequestModel,
+        idempotency_header: str | None = Header(default=None, alias="Idempotency-Key"),
+    ) -> dict[str, Any]:
+        return _submit_execution(request.model_dump(), idempotency_header)
 
     @app.get("/v1/executions/{execution_id}", dependencies=[Depends(require_api_token)])
     def get_execution(execution_id: str) -> dict[str, Any]:
