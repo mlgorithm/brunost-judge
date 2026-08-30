@@ -2,7 +2,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from brunost_judge.contracts import ExecutionResult
 from brunost_judge.server import create_app
+from brunost_judge.store import JudgeStore
 
 
 def test_api_registers_and_submits(tmp_path: Path):
@@ -170,6 +172,47 @@ def test_api_is_closed_without_explicit_auth_configuration(tmp_path: Path, monke
     monkeypatch.delenv("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", raising=False)
     client = TestClient(create_app(tmp_path / "judge.db"))
     assert client.get("/v1/tasks").status_code == 503
+
+
+def test_callback_replay_endpoint_resets_a_delivered_callback(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    task = tmp_path / "task"
+    task.mkdir()
+    (task / "judge.yaml").write_text("version: 1\nkind: ioai\n", encoding="utf-8")
+    for directory in ("public", "private", "scorer"):
+        (task / directory).mkdir()
+    (task / "scorer" / "metrics.py").write_text("def evaluate(s, a): return 1.0\n", encoding="utf-8")
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    database = tmp_path / "judge.db"
+    client = TestClient(create_app(database))
+
+    assert client.post("/v1/tasks", json={"task_ref": "replay/v1", "path": str(task)}).status_code == 201
+    submitted = client.post(
+        "/v1/executions",
+        json={
+            "task_ref": "replay/v1",
+            "submission_path": str(submission),
+            "idempotency_key": "replay-api",
+            "callback_url": "https://callback.example.test/result",
+        },
+    )
+    assert submitted.status_code == 202
+    execution_id = submitted.json()["execution_id"]
+    store = JudgeStore(database)
+    assert store.claim_next(worker_id="worker-a") is not None
+    assert store.finish(
+        execution_id,
+        ExecutionResult(execution_id, "replay/v1", "completed", score=1.0),
+        worker_id="worker-a",
+    ) is not None
+    assert store.claim_callback(execution_id, "callback-worker")
+    assert store.mark_callback_delivered_by_owner(execution_id, "callback-worker")
+
+    replayed = client.post(f"/v1/executions/{execution_id}/callback/replay")
+    assert replayed.status_code == 200
+    assert replayed.json() == {"execution_id": execution_id, "replayed": True}
+    assert client.get("/v1/stats").json()["callbacks_pending"] == 1
 
 
 def test_operator_console_is_available(tmp_path: Path):

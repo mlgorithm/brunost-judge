@@ -208,3 +208,25 @@ def test_remote_callback_failure_does_not_crash_worker(monkeypatch):
     monkeypatch.setattr("brunost_judge.worker._notify", lambda *_args: None)
     worker._deliver_pending_callbacks()
     assert worker._pending_callbacks == []
+
+
+def test_callback_dispatcher_retries_after_a_transient_store_failure(monkeypatch):
+    dispatcher = CallbackDispatcher.__new__(CallbackDispatcher)
+    dispatcher.poll_seconds = 0.1
+    attempts = []
+    sleeps = []
+
+    def deliver_callbacks():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise OSError("database unavailable")
+        raise KeyboardInterrupt
+
+    dispatcher.deliver_callbacks = deliver_callbacks
+    monkeypatch.setattr("brunost_judge.worker.time.sleep", lambda seconds: sleeps.append(seconds))
+
+    with pytest.raises(KeyboardInterrupt):
+        dispatcher.run_forever()
+
+    assert len(attempts) == 2
+    assert sleeps == [0.5]

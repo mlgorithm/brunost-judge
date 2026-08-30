@@ -36,6 +36,9 @@ def test_conformance_rejects_non_finite_and_invalid_sandbox_results():
     assert "score must be finite" in validate_result_payload(
         {"evaluation_id": "eval-1", "task_ref": "task/v1", "status": "completed", "score": float("nan")}
     )
+    assert "score must be finite" in validate_result_payload(
+        {"evaluation_id": "eval-1", "task_ref": "task/v1", "status": "completed", "score": 10**1000}
+    )
     assert validate_runner_result_payload({"status": "completed", "score": 1.0, "metrics": {}}) == ()
     assert "sandbox result score must be numeric or null" in validate_runner_result_payload(
         {"status": "completed", "score": True, "metrics": {}}
@@ -53,6 +56,7 @@ def test_conformance_validates_match_scores_and_artifacts():
             "metrics": {},
         }
     ) == ()
+
     errors = validate_runner_result_payload(
         {
             "status": "completed",
@@ -75,3 +79,16 @@ def test_conformance_validates_match_scores_and_artifacts():
             "metrics": {},
         }
     ) == ()
+
+
+def test_conformance_rejects_oversized_metrics_and_non_content_addressed_artifacts():
+    errors = validate_result_payload({
+        "execution_id": "e-1",
+        "task_ref": "task/v1",
+        "status": "completed",
+        "metrics": {"trace": "x" * 1_000_001},
+        "artifacts": {"replay": {"artifact_id": "not-a-sha256"}},
+    })
+
+    assert "metrics exceeds 1000000 bytes" in errors
+    assert "artifacts.replay must declare an artifact_id" in errors

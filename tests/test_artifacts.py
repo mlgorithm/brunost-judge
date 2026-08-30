@@ -54,6 +54,52 @@ def test_artifact_store_rejects_archive_bombs(tmp_path: Path):
         raise AssertionError("oversized archive member was accepted")
 
 
+def test_artifact_store_rejects_symlink_destination(tmp_path: Path):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        info = tarfile.TarInfo("safe.txt")
+        info.size = 4
+        archive.addfile(info, io.BytesIO(b"safe"))
+    destination = tmp_path / "destination"
+    destination.symlink_to(tmp_path / "outside", target_is_directory=True)
+
+    try:
+        safe_extract(output.getvalue(), destination)
+    except ArtifactError as exc:
+        assert "destination" in str(exc)
+    else:
+        raise AssertionError("symlink extraction destination was accepted")
+
+
+def test_artifact_store_rejects_normalized_member_collisions(tmp_path: Path):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for name in ("safe.txt", "safe.txt/"):
+            info = tarfile.TarInfo(name)
+            info.size = 4
+            archive.addfile(info, io.BytesIO(b"safe"))
+
+    try:
+        safe_extract(output.getvalue(), tmp_path / "out")
+    except ArtifactError as exc:
+        assert "duplicate" in str(exc)
+    else:
+        raise AssertionError("normalized duplicate member names were accepted")
+
+
+def test_pack_directory_enforces_a_source_size_limit(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "payload.bin").write_bytes(b"12345678")
+
+    try:
+        pack_directory(source, max_bytes=4)
+    except ArtifactError as exc:
+        assert "exceeds 4 bytes" in str(exc)
+    else:
+        raise AssertionError("oversized artifact source was packed")
+
+
 def test_directory_bundle_is_deterministic(tmp_path: Path):
     task = _task(tmp_path)
     assert pack_directory(task) == pack_directory(task)

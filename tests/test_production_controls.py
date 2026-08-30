@@ -12,6 +12,7 @@ from brunost_judge.contracts import (
 from brunost_judge.plugins import RunnerContext, RunnerRegistry
 from brunost_judge.security import callback_signature, verify_callback_signature
 from brunost_judge.store import JudgeStore
+from brunost_judge.worker import CallbackDispatcher
 from grader.agent_runtime import _launch_command
 
 
@@ -98,6 +99,85 @@ def test_expired_canceled_leases_are_not_requeued(tmp_path: Path):
 
     assert store.claim_next(worker_id="worker-b") is None
     assert store.get_execution(execution.execution_id).status == "canceled"
+
+
+def test_expired_canceled_lease_replays_its_callback(tmp_path: Path, monkeypatch):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(
+        ExecutionRequest(
+            "demo/v1",
+            str(submission),
+            "cancelled-callback-lease",
+            callback_url="http://callback.invalid/result",
+        )
+    )
+    assert store.claim_next(worker_id="worker-a", lease_seconds=1) is not None
+    store.cancel(execution.execution_id)
+    time.sleep(1.1)
+
+    assert store.claim_next(worker_id="worker-b") is None
+    assert [row["execution_id"] for row in store.pending_callbacks()] == [execution.execution_id]
+    calls = []
+    monkeypatch.setattr("brunost_judge.worker._notify", lambda *args: calls.append(args))
+    assert CallbackDispatcher(store, worker_id="callback-worker").deliver_callbacks() == 1
+    assert calls[0][2]["status"] == "canceled"
+
+
+def test_finish_fences_result_identity_and_replay_resets_delivery(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(
+        ExecutionRequest(
+            "demo/v1",
+            str(submission),
+            "result-fence",
+            callback_url="https://callback.example.test/result",
+        )
+    )
+    assert store.claim_next(worker_id="worker-a") is not None
+    with pytest.raises(ValueError, match="claimed execution"):
+        store.finish(
+            execution.execution_id,
+            ExecutionResult("other-execution", "demo/v1", "completed", score=1.0),
+            worker_id="worker-a",
+        )
+    assert store.get_execution(execution.execution_id).status == "running"
+    assert store.finish(
+        execution.execution_id,
+        ExecutionResult(execution.execution_id, "demo/v1", "completed", score=1.0),
+        worker_id="worker-a",
+    ) is not None
+    assert store.claim_callback(execution.execution_id, "callback-worker")
+    assert store.mark_callback_delivered_by_owner(execution.execution_id, "callback-worker")
+    assert store.replay_callback(execution.execution_id)
+    assert store.pending_callbacks()[0]["execution_id"] == execution.execution_id
+
+
+def test_stats_expose_callback_backlog_and_failures(tmp_path: Path):
+    store = _store(tmp_path)
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    execution = store.submit(
+        ExecutionRequest(
+            "demo/v1",
+            str(submission),
+            "callback-stats",
+            callback_url="https://callback.example.test/result",
+        )
+    )
+    assert store.claim_next(worker_id="worker-a") is not None
+    assert store.finish(
+        execution.execution_id,
+        ExecutionResult(execution.execution_id, "demo/v1", "completed", score=1.0),
+        worker_id="worker-a",
+    ) is not None
+    assert store.mark_callback_failed(execution.execution_id, "receiver unavailable")
+    stats = store.stats()
+    assert stats["callbacks_pending"] == 1
+    assert stats["callbacks_failed"] == 1
 
 
 def test_lease_renewal_keeps_the_current_owner(tmp_path: Path):

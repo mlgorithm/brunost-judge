@@ -256,6 +256,7 @@ POST /v1/workers/{worker_id}/claim
 POST /v1/workers/{worker_id}/finish
 GET /v1/workers/{worker_id}/executions/{execution_id}/cancel-requested
 POST /v1/workers/{worker_id}/executions/{execution_id}/lease
+POST /v1/executions/{execution_id}/callback/replay
 ```
 
 Workers renew an active execution lease while the sandbox is running. A lease
@@ -279,6 +280,10 @@ Terminal results with a callback URL are placed in the Judge callback outbox in
 the same transaction as the result. Remote workers claim and acknowledge their
 delivery lease after sending the callback; the control-plane callback
 dispatcher retries anything left behind after a worker or network failure.
+An administrator can reset a terminal callback for delivery with the replay
+endpoint. Replay preserves the stable event ID, so callback receivers must
+continue to deduplicate events. `GET /v1/stats` exposes pending, in-flight, and
+previously failed callback counts for operational monitoring.
 
 The scheduler must never infer a GPU or runtime capability from a hostname. A
 worker advertises capabilities such as `gpu:true`, `runtime:kubernetes`, and

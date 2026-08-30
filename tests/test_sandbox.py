@@ -122,6 +122,43 @@ def test_docker_runner_rejects_invalid_result_payload(tmp_path: Path, monkeypatc
     assert "invalid sandbox result" in result["failure_reason"]
 
 
+def test_docker_runner_rejects_an_oversized_result_file(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    task.mkdir()
+    submission.mkdir()
+    monkeypatch.setattr("brunost_judge.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+
+    def fake_run(command, **kwargs):
+        volume_args = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--volume"]
+        output_mount = next(value for value in volume_args if value.endswith(":/workspace/output:rw"))
+        Path(output_mount.rsplit(":/workspace/output:rw", 1)[0]).joinpath("results.json").write_text(
+            '{"status":"completed","score":1,"metrics":{"trace":"' + "x" * 1_000_000 + '"}}',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("brunost_judge.sandbox.subprocess.run", fake_run)
+    result = DockerSandboxRunner("judge@sha256:" + "a" * 64, "runsc").run(submission, task, "exec-oversized")
+
+    assert result["status"] == "failed"
+    assert "exceeds the output limit" in result["failure_reason"]
+
+
+def test_docker_runner_contains_docker_start_failures(tmp_path: Path, monkeypatch):
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    task.mkdir()
+    submission.mkdir()
+    monkeypatch.setattr("brunost_judge.sandbox.shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("brunost_judge.sandbox.subprocess.run", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("daemon unavailable")))
+
+    result = DockerSandboxRunner("judge@sha256:" + "a" * 64, "runsc").run(submission, task, "exec-start-failure")
+
+    assert result["status"] == "failed"
+    assert "could not start" in result["failure_reason"]
+
+
 def test_docker_mode_requires_image_and_runtime(monkeypatch):
     monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_MODE", "docker")
     monkeypatch.delenv("BRUNOST_JUDGE_SANDBOX_IMAGE", raising=False)
