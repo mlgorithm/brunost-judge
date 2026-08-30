@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -17,18 +18,19 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_KINDS = frozenset(
-    {"agent", "coding", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only"}
+    {"agent", "coding", "game", "icpc", "interactive", "ioai", "model", "optimization", "output-only", "quiz"}
 )
 # These are the task kinds executed by the built-in scorer sandbox.
 SCORER_KINDS = frozenset({"ioai", "output-only"})
 MODEL_KINDS = frozenset({"model"})
 OPTIMIZATION_KINDS = frozenset({"optimization"})
+QUIZ_KINDS = frozenset({"quiz"})
 # ``icpc`` is retained for existing packages. New integrations should use the
 # task-family name rather than a contest-format label.
 CLASSIC_KINDS = frozenset({"coding", "icpc"})
 INTERACTIVE_KINDS = frozenset({"interactive"})
 PLUGIN_KINDS = frozenset({"agent", "game"})
-BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | OPTIMIZATION_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
+BUILTIN_KINDS = SCORER_KINDS | MODEL_KINDS | OPTIMIZATION_KINDS | QUIZ_KINDS | CLASSIC_KINDS | INTERACTIVE_KINDS | PLUGIN_KINDS
 MANIFEST_VERSION = 1
 MODEL_MANIFEST_VERSION = 2
 CLASSIC_LANGUAGES = frozenset({"python", "py", "c", "cpp", "c++", "c++17", "gnu++17", "g++", "rust", "rs"})
@@ -52,6 +54,19 @@ MAX_CLASSIC_CODE_BYTES = 1_000_000
 MAX_CLASSIC_WALL_TIME_MS = 3_600_000
 CLASSIC_COMPILE_BUDGET_MS = 30_000
 CLASSIC_SETUP_BUDGET_MS = 5_000
+MAX_QUIZ_QUESTIONS = 500
+MAX_QUIZ_CHOICES = 100
+MAX_QUIZ_ID_CHARS = 64
+MAX_QUIZ_TEXT_CHARS = 20_000
+MAX_QUIZ_ANSWER_CHARS = 4_096
+MAX_QUIZ_ANSWERS_PER_TEXT = 100
+MAX_QUIZ_POINTS = 1_000_000
+MAX_QUIZ_KEY_BYTES = 4 * 1024 * 1024
+MAX_QUIZ_SUBMISSION_BYTES = 1 * 1024 * 1024
+QUIZ_TYPES = frozenset({"single_choice", "multiple_choice", "free_text"})
+QUIZ_TEXT_NORMALIZATIONS = frozenset(
+    {"exact", "trim", "casefold_trim", "collapse_whitespace", "casefold_collapse_whitespace"}
+)
 BROWSER_ONLY_RUNTIME_MARKERS = ("browser", "cheerpx", "pyodide", "wasm", "webassembly")
 _KIND_RE = re.compile(r"^\s*kind\s*:\s*([A-Za-z0-9_-]+)\s*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*:\s*(.*?)\s*$", re.MULTILINE)
@@ -478,6 +493,194 @@ def _validate_model_manifest(root: Path, manifest: str, errors: list[str]) -> No
         pass
 
 
+def _load_bounded_json(path: Path, label: str, max_bytes: int, errors: list[str]) -> Any | None:
+    """Load task-authored JSON without accepting oversized or non-finite data."""
+
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        errors.append(f"could not inspect {label}: {exc}")
+        return None
+    if size > max_bytes:
+        errors.append(f"{label} exceeds {max_bytes} bytes")
+        return None
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        raw = path.read_bytes()
+        if len(raw) > max_bytes:
+            errors.append(f"{label} exceeds {max_bytes} bytes")
+            return None
+        return json.loads(
+            raw.decode("utf-8"), parse_constant=reject_constant, object_pairs_hook=reject_duplicates
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+        errors.append(f"{label} is not valid JSON: {exc}")
+        return None
+
+
+def _validate_quiz_manifest(root: Path, manifest: str, errors: list[str]) -> dict[str, Any]:
+    """Validate the private answer-key contract for deterministic quiz tasks."""
+
+    if _manifest_field(manifest, "runner") != "quiz":
+        errors.append("quiz tasks must declare runner: quiz")
+
+    scoring_mode = (_manifest_field(manifest, "scoring_mode") or "weighted").lower()
+    if scoring_mode not in {"weighted", "all_or_nothing"}:
+        errors.append("quiz scoring_mode must be weighted or all_or_nothing")
+    text_normalization = (_manifest_field(manifest, "free_text_normalization") or "casefold_trim").lower()
+    if text_normalization not in QUIZ_TEXT_NORMALIZATIONS:
+        errors.append(
+            "free_text_normalization must be exact, trim, casefold_trim, collapse_whitespace, "
+            "or casefold_collapse_whitespace"
+        )
+
+    answer_key = _manifest_field(manifest, "answer_key") or "private/questions.json"
+    _validate_relative_path(answer_key, "answer_key", errors)
+    if not _is_private_path(answer_key):
+        errors.append("answer_key must be stored under private/")
+    answer_key_path = (root / answer_key).resolve()
+    task_root = root.resolve()
+    private_root = (root / "private").resolve()
+    if answer_key_path == task_root or task_root not in answer_key_path.parents:
+        errors.append("answer_key must stay inside the task directory")
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+    if private_root != answer_key_path and private_root not in answer_key_path.parents:
+        errors.append("answer_key must stay under private/")
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+    if not answer_key_path.is_file():
+        errors.append(f"quiz tasks need {answer_key}")
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+
+    payload = _load_bounded_json(answer_key_path, "quiz answer_key", MAX_QUIZ_KEY_BYTES, errors)
+    if payload is None:
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+    if not isinstance(payload, dict) or set(payload) - {"questions", "title", "description"}:
+        errors.append("quiz answer_key must be an object containing only questions, title, and description")
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+    questions = payload.get("questions")
+    if not isinstance(questions, list) or not 1 <= len(questions) <= MAX_QUIZ_QUESTIONS:
+        errors.append(f"quiz answer_key questions must contain 1 to {MAX_QUIZ_QUESTIONS} items")
+        return _quiz_settings(manifest, scoring_mode, text_normalization)
+    if isinstance(payload.get("title"), str) and len(payload["title"]) > MAX_QUIZ_TEXT_CHARS:
+        errors.append(f"quiz title exceeds {MAX_QUIZ_TEXT_CHARS} characters")
+    if isinstance(payload.get("description"), str) and len(payload["description"]) > MAX_QUIZ_TEXT_CHARS:
+        errors.append(f"quiz description exceeds {MAX_QUIZ_TEXT_CHARS} characters")
+
+    ids: set[str] = set()
+    total_points = 0.0
+    allowed_question_fields = {"id", "type", "prompt", "choices", "points", "answer", "accepted_answers"}
+    for index, question in enumerate(questions, start=1):
+        prefix = f"quiz question {index}"
+        if not isinstance(question, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        if set(question) - allowed_question_fields:
+            errors.append(f"{prefix} contains unsupported fields")
+        question_id = question.get("id")
+        if not isinstance(question_id, str) or not re.fullmatch(
+            rf"[A-Za-z0-9][A-Za-z0-9_.:-]{{0,{MAX_QUIZ_ID_CHARS - 1}}}", question_id
+        ):
+            errors.append(f"{prefix} id must be a unique safe string of at most {MAX_QUIZ_ID_CHARS} characters")
+        elif question_id in ids:
+            errors.append(f"duplicate quiz question id {question_id!r}")
+        else:
+            ids.add(question_id)
+        question_type = question.get("type")
+        if question_type not in QUIZ_TYPES:
+            errors.append(f"{prefix} type must be single_choice, multiple_choice, or free_text")
+        if "prompt" in question and (not isinstance(question["prompt"], str) or len(question["prompt"]) > MAX_QUIZ_TEXT_CHARS):
+            errors.append(f"{prefix} prompt must be text of at most {MAX_QUIZ_TEXT_CHARS} characters")
+        points = question.get("points", 1)
+        if isinstance(points, bool) or not isinstance(points, (int, float)) or not 0 < points <= MAX_QUIZ_POINTS:
+            errors.append(f"{prefix} points must be a finite number in (0, {MAX_QUIZ_POINTS}]")
+        else:
+            total_points += float(points)
+
+        choices = question.get("choices")
+        choice_ids: set[str] = set()
+        if question_type in {"single_choice", "multiple_choice"}:
+            if not isinstance(choices, list) or not 2 <= len(choices) <= MAX_QUIZ_CHOICES:
+                errors.append(f"{prefix} choices must contain 2 to {MAX_QUIZ_CHOICES} items")
+            else:
+                for choice_index, choice in enumerate(choices, start=1):
+                    if not isinstance(choice, dict) or set(choice) - {"id", "text"}:
+                        errors.append(f"{prefix} choice {choice_index} must contain only id and text")
+                        continue
+                    choice_id = choice.get("id")
+                    if not isinstance(choice_id, str) or not re.fullmatch(
+                        rf"[A-Za-z0-9][A-Za-z0-9_.:-]{{0,{MAX_QUIZ_ID_CHARS - 1}}}", choice_id
+                    ):
+                        errors.append(f"{prefix} choice ids must be safe strings")
+                    elif choice_id in choice_ids:
+                        errors.append(f"{prefix} contains duplicate choice id {choice_id!r}")
+                    else:
+                        choice_ids.add(choice_id)
+                    if not isinstance(choice.get("text"), str) or len(choice["text"]) > MAX_QUIZ_TEXT_CHARS:
+                        errors.append(f"{prefix} choice text must be at most {MAX_QUIZ_TEXT_CHARS} characters")
+        elif choices is not None:
+            errors.append(f"{prefix} free_text questions must not declare choices")
+
+        if question_type == "single_choice":
+            if "accepted_answers" in question:
+                errors.append(f"{prefix} single_choice questions must use answer")
+            answer = question.get("answer")
+            if not isinstance(answer, str) or answer not in choice_ids:
+                errors.append(f"{prefix} answer must name one of its choices")
+        elif question_type == "multiple_choice":
+            if "accepted_answers" in question:
+                errors.append(f"{prefix} multiple_choice questions must use answer")
+            answer = question.get("answer")
+            if (
+                not isinstance(answer, list)
+                or not answer
+                or len(answer) > MAX_QUIZ_CHOICES
+                or any(not isinstance(item, str) or item not in choice_ids for item in answer)
+                or len(set(answer)) != len(answer)
+            ):
+                errors.append(f"{prefix} answer must be a non-empty list of unique choice ids")
+        elif question_type == "free_text":
+            if "answer" in question and "accepted_answers" in question:
+                errors.append(f"{prefix} free_text questions must use either answer or accepted_answers, not both")
+            accepted = question.get("accepted_answers", question.get("answer"))
+            if isinstance(accepted, str):
+                accepted = [accepted]
+            if (
+                not isinstance(accepted, list)
+                or not 1 <= len(accepted) <= MAX_QUIZ_ANSWERS_PER_TEXT
+                or any(not isinstance(item, str) or len(item) > MAX_QUIZ_ANSWER_CHARS for item in accepted)
+            ):
+                errors.append(
+                    f"{prefix} accepted_answers must contain 1 to {MAX_QUIZ_ANSWERS_PER_TEXT} short text answers"
+                )
+    if total_points > MAX_QUIZ_POINTS:
+        errors.append(f"quiz points total exceeds {MAX_QUIZ_POINTS}")
+    return _quiz_settings(manifest, scoring_mode, text_normalization)
+
+
+def _quiz_settings(manifest: str, scoring_mode: str, text_normalization: str) -> dict[str, Any]:
+    settings = _scheduling_settings(manifest, default_runtime="python-3.13")
+    settings.update(
+        {
+            "network": "disabled",
+            "scoring_mode": scoring_mode,
+            "free_text_normalization": text_normalization,
+            "evaluator": "grader.quiz:run_quiz",
+        }
+    )
+    return settings
+
+
 def _validate_optimization_manifest(root: Path, manifest: str, errors: list[str]) -> None:
     """Validate the bounded code-plus-objective optimization contract."""
 
@@ -572,6 +775,8 @@ def validate_task(path: str | Path) -> TaskValidation:
         errors.append(f"unsupported judge.yaml version {version!r}; choose {expected_version}")
     if kind in OPTIMIZATION_KINDS:
         _validate_optimization_manifest(root, manifest_text, errors)
+    elif kind in QUIZ_KINDS:
+        settings = _validate_quiz_manifest(root, manifest_text, errors)
     elif kind in CLASSIC_KINDS:
         if _manifest_field(manifest_text, "runner") not in {None, "classic"}:
             errors.append("classic tasks must declare runner: classic")
@@ -697,6 +902,42 @@ def scaffold_task(path: str | Path, kind: str, *, force: bool = False) -> Path:
         (root / "judge.yaml").write_text(manifest, encoding="utf-8")
         (root / "tests" / "README.md").write_text(
             "Add matching .in/.ans files here, then choose scoring_mode: all_or_nothing or percentage.\n",
+            encoding="utf-8",
+        )
+    elif normalized_kind in QUIZ_KINDS:
+        (root / "judge.yaml").write_text(
+            """# Brunost Judge quiz task manifest
+version: 1
+kind: quiz
+runner: quiz
+answer_key: private/questions.json
+scoring_mode: weighted
+free_text_normalization: casefold_trim
+network: disabled
+""",
+            encoding="utf-8",
+        )
+        (root / "private" / "questions.json").write_text(
+            """{
+  "questions": [
+    {
+      "id": "example",
+      "type": "single_choice",
+      "prompt": "Replace this example question.",
+      "choices": [
+        {"id": "a", "text": "First answer"},
+        {"id": "b", "text": "Second answer"}
+      ],
+      "answer": "a",
+      "points": 1
+    }
+  ]
+}
+""",
+            encoding="utf-8",
+        )
+        (root / "public" / "README.md").write_text(
+            "Publish question text and choices here if contestants should see them. Keep answers in private/questions.json.\n",
             encoding="utf-8",
         )
     elif normalized_kind in OPTIMIZATION_KINDS:

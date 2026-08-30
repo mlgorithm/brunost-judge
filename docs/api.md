@@ -44,7 +44,9 @@ finished-after-cancel run as `canceled`.
 use the v2 train/model/predict contract documented in
 [`model-tasks.md`](model-tasks.md). `optimization` tasks use the trusted
 feasibility/objective evaluator documented in
-[`optimization-tasks.md`](optimization-tasks.md). `coding` tasks use the classic batch runner
+[`optimization-tasks.md`](optimization-tasks.md). `quiz` tasks use the
+private answer-key runner documented in [`quiz-tasks.md`](quiz-tasks.md).
+`coding` tasks use the classic batch runner
 and return structured compile, test, scoring,
 verdict, time, and output metrics. `interactive` tasks use the
 line-oriented interactor runner. `agent` and `game` tasks use the versioned
