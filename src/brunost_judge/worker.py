@@ -517,18 +517,24 @@ class RemoteWorker:
         poll_seconds: float = 1.0,
         sandbox_runner: SandboxRunner | None = None,
         path_map: tuple[tuple[str, str], ...] = (),
+        capabilities: tuple[str, ...] = (),
     ) -> None:
         self.client = JudgeClient(api_url, token=token, timeout=30)
         self.worker_id = worker_id
         self.poll_seconds = poll_seconds
         self.sandbox_runner = sandbox_runner or sandbox_from_environment()
         self.path_map = path_map
+        self.capabilities = tuple(dict.fromkeys((*capabilities, *_runtime_capabilities_from_environment())))
         self.callback_signing_secret = _callback_secret_from_environment()
         self._pending_callbacks: list[tuple[str, str | None, dict, str | None, str | None]] = []
         self.require_immutable_artifacts = (
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
             or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         )
+        # Enrollment establishes the worker identity. Refresh only the runtime
+        # capability inventory here so ML jobs are routed to workers that have
+        # the ML sandbox, while queues/resources remain operator-controlled.
+        self.client.advertise_worker_capabilities(self.worker_id, list(self.capabilities))
 
     def _local_path(self, value: str) -> Path:
         source = Path(value).expanduser()

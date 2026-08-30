@@ -120,6 +120,16 @@ def create_app(database: str | Path | None = None):
         draining: bool = False
         metadata: dict[str, Any] = Field(default_factory=dict)
 
+    class WorkerCapabilityAdvertisementModel(BaseModel):
+        """Runtime capabilities reported by an enrolled worker agent.
+
+        The worker credential is scoped to the worker id in the URL, so this
+        endpoint lets a node refresh its runtime inventory without granting it
+        control-plane registration privileges or changing its queues/resources.
+        """
+
+        capabilities: list[str] = Field(default_factory=list, max_length=128)
+
     class EnrollmentTokenRequestModel(BaseModel):
         node_id: str = Field(min_length=1, max_length=200)
         worker_id: str | None = Field(default=None, max_length=200)
@@ -867,6 +877,31 @@ def create_app(database: str | Path | None = None):
             metadata=request.metadata,
         )
         return store.register_worker(worker).as_dict()
+
+    @app.post("/v1/workers/{worker_id}/capabilities", dependencies=[Depends(require_worker_token)])
+    def advertise_worker_capabilities(
+        worker_id: str,
+        request: WorkerCapabilityAdvertisementModel,
+    ) -> dict[str, Any]:
+        """Refresh the authenticated worker's runtime capability inventory."""
+
+        from brunost_judge.contracts import WorkerRecord
+
+        worker = store.get_worker(worker_id)
+        if worker is None:
+            raise HTTPException(status_code=404, detail="worker not found")
+        capabilities = tuple(dict.fromkeys(item.strip() for item in request.capabilities if item.strip()))
+        updated = WorkerRecord(
+            worker_id=worker.worker_id,
+            capabilities=capabilities,
+            queues=worker.queues,
+            resource_classes=worker.resource_classes,
+            region=worker.region,
+            status=worker.status,
+            draining=worker.draining,
+            metadata=worker.metadata,
+        )
+        return store.register_worker(updated).as_dict()
 
     @app.get("/v1/workers", dependencies=[Depends(require_api_token)])
     def list_workers() -> list[dict[str, Any]]:

@@ -124,3 +124,37 @@ def test_worker_registration_heartbeat_and_drain(tmp_path: Path):
     assert client.post("/v1/workers/gpu-1/heartbeat?status=busy").json()["status"] == "busy"
     assert client.post("/v1/workers/gpu-1/drain").json()["draining"] is True
     assert client.get("/v1/workers/capabilities").json()["workers"][0]["capabilities"] == ["gpu:true"]
+
+
+def test_enrolled_worker_can_refresh_runtime_capabilities_without_re_registering(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_API_TOKEN", "admin-secret")
+    monkeypatch.setenv("BRUNOST_JUDGE_REQUIRE_API_TOKEN", "true")
+    client = TestClient(create_app(tmp_path / "judge.db"))
+    admin = {"Authorization": "Bearer admin-secret"}
+    issued = client.post(
+        "/v1/nodes/enrollment-tokens",
+        headers=admin,
+        json={
+            "node_id": "node-runtime",
+            "worker_id": "runtime-worker",
+            "capabilities": ["runtime:python-3.13", "runtime:python-3.13-ml-v1"],
+        },
+    )
+    enrolled = client.post(
+        "/v1/nodes/enroll",
+        json={"join_token": issued.json()["join_token"], "capabilities": ["runtime:python-3.13"]},
+    )
+    worker_headers = {"Authorization": f"Bearer {enrolled.json()['worker_token']}"}
+    updated = client.post(
+        "/v1/workers/runtime-worker/capabilities",
+        headers=worker_headers,
+        json={"capabilities": ["runtime:python-3.13", "runtime:python-3.13-ml-v1", "runtime:python-3.13"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["capabilities"] == ["runtime:python-3.13", "runtime:python-3.13-ml-v1"]
+    assert updated.json()["queues"] == ["default"]
+    assert client.post(
+        "/v1/workers/runtime-worker/capabilities",
+        headers={"Authorization": "Bearer wrong"},
+        json={"capabilities": ["runtime:python-3.13-ml-v1"]},
+    ).status_code == 401

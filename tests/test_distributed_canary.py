@@ -135,6 +135,7 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
             worker_token,
             worker_id,
             sandbox_runner=ProcessSandboxRunner(),
+            capabilities=("runtime:python-3.13",),
         )
         result = worker.process_one()
         assert result is not None

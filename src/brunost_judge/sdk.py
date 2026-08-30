@@ -216,6 +216,19 @@ class JudgeClient:
             "metadata": metadata or {},
         })
 
+    def advertise_worker_capabilities(
+        self,
+        worker_id: str,
+        capabilities: list[str],
+    ) -> dict[str, Any]:
+        """Refresh the runtime inventory for this worker's scoped credential."""
+
+        return self._request(
+            "POST",
+            f"/v1/workers/{worker_id}/capabilities",
+            {"capabilities": list(dict.fromkeys(capabilities))},
+        )
+
     def list_workers(self) -> list[dict[str, Any]]:
         return self._request("GET", "/v1/workers")  # type: ignore[return-value]
 

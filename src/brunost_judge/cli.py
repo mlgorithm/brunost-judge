@@ -534,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
                     config["worker_id"],
                     poll_seconds=args.poll_seconds,
                     path_map=tuple((str(item[0]), str(item[1])) for item in mappings),
+                    capabilities=tuple(str(item) for item in config.get("capabilities", [])),
                 )
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 print(f"invalid node configuration: {exc}", file=sys.stderr)
