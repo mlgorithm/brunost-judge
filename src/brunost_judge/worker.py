@@ -45,6 +45,27 @@ def _worker_retry_delay(poll_seconds: float) -> float:
     return max(0.5, min(30.0, float(poll_seconds)))
 
 
+def _runtime_capabilities_from_environment() -> tuple[str, ...]:
+    """Advertise only sandbox runtimes actually configured on this worker."""
+
+    runtimes: list[str] = []
+    if os.environ.get("BRUNOST_JUDGE_SANDBOX_IMAGE", "").strip():
+        runtimes.append("runtime:python-3.13")
+    raw_images = os.environ.get("BRUNOST_JUDGE_SANDBOX_IMAGES", "").strip()
+    if raw_images:
+        try:
+            parsed_images = json.loads(raw_images)
+        except json.JSONDecodeError:
+            parsed_images = {}
+        if isinstance(parsed_images, dict):
+            runtimes.extend(
+                f"runtime:{str(name).strip()}"
+                for name in parsed_images
+                if str(name).strip()
+            )
+    return tuple(dict.fromkeys(runtimes))
+
+
 @contextmanager
 def _evaluation_profile_environment(metadata: dict[str, Any]):
     """Pass the selected ML evaluation profile into local or Docker sandboxes."""
@@ -324,9 +345,10 @@ class LocalWorker:
             os.environ.get("BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS", "false").lower() == "true"
             or os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         )
-        advertised_capabilities = capabilities or tuple(
+        configured_capabilities = capabilities or tuple(
             value.strip() for value in os.environ.get("BRUNOST_JUDGE_CAPABILITIES", "runtime:local,resource:cpu").split(",") if value.strip()
         )
+        advertised_capabilities = tuple(dict.fromkeys((*configured_capabilities, *_runtime_capabilities_from_environment())))
         self.capabilities = advertised_capabilities
         self.store.register_worker(WorkerRecord(
             worker_id=self.worker_id,

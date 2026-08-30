@@ -67,6 +67,8 @@ def _model_task(root: Path, *, baseline: bool = False, post: bool = False) -> Pa
 def test_validate_model_training_contract_without_baseline(tmp_path: Path):
     result = validate_task(_model_task(tmp_path / "task"))
     assert result.valid, result.errors
+    assert result.settings["runtime"] == "python-3.13-ml-v1"
+    assert result.settings["required_capabilities"] == ["runtime:python-3.13-ml-v1"]
 
 
 def test_validate_model_training_contract_with_baseline_and_post_profile(tmp_path: Path):

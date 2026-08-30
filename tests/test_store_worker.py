@@ -6,7 +6,12 @@ import pytest
 
 from brunost_judge.contracts import ExecutionRequest, ExecutionResult, TaskRecord
 from brunost_judge.store import JudgeStore
-from brunost_judge.worker import CallbackDispatcher, LocalWorker, RemoteWorker
+from brunost_judge.worker import (
+    CallbackDispatcher,
+    LocalWorker,
+    RemoteWorker,
+    _runtime_capabilities_from_environment,
+)
 
 
 def _store(tmp_path: Path) -> JudgeStore:
@@ -18,6 +23,18 @@ def _store(tmp_path: Path) -> JudgeStore:
     store = JudgeStore(tmp_path / "judge.db")
     store.register_task(TaskRecord("demo/v1", str(task), "ioai"))
     return store
+
+
+def test_worker_advertises_configured_ml_runtime(monkeypatch):
+    monkeypatch.setenv("BRUNOST_JUDGE_SANDBOX_IMAGE", "standard@sha256:" + "a" * 64)
+    monkeypatch.setenv(
+        "BRUNOST_JUDGE_SANDBOX_IMAGES",
+        '{"python-3.13":"standard@sha256:' + "a" * 64 + '","python-3.13-ml-v1":"ml@sha256:' + "b" * 64 + '"}',
+    )
+    assert _runtime_capabilities_from_environment() == (
+        "runtime:python-3.13",
+        "runtime:python-3.13-ml-v1",
+    )
 
 
 def test_idempotent_execution_and_local_worker(tmp_path: Path):

@@ -109,9 +109,14 @@ def _scheduling_settings(manifest: str, *, default_runtime: str | None = None) -
             settings[name] = value
     if default_runtime and "runtime" not in settings:
         settings["runtime"] = default_runtime
-    capabilities = _manifest_list(manifest, "required_capabilities")
+    capabilities = list(_manifest_list(manifest, "required_capabilities"))
+    if settings.get("runtime") == "python-3.13-ml-v1":
+        # ML jobs must only land on workers that have the ML runtime image.
+        # Older workers do not advertise this capability and therefore remain
+        # eligible for classic Python tasks without becoming unsafe fallbacks.
+        capabilities.append("runtime:python-3.13-ml-v1")
     if capabilities:
-        settings["required_capabilities"] = capabilities
+        settings["required_capabilities"] = list(dict.fromkeys(capabilities))
     return settings
 
 
@@ -631,6 +636,10 @@ def validate_task(path: str | Path) -> TaskValidation:
             errors.append(f"{kind} tasks need {entrypoint}")
     elif kind == "model":
         _validate_model_manifest(root, manifest_text, errors)
+        # Model tasks must retain their ML runtime when registered through the
+        # artifact API.  Without this, the server falls back to the classic
+        # Python runtime and the worker cannot execute train/predict safely.
+        settings = _scheduling_settings(manifest_text, default_runtime="python-3.13-ml-v1")
         if not (root / "evaluator.py").is_file():
             errors.append("missing evaluator.py")
         elif (root / "evaluator.py").stat().st_size > MAX_MODEL_CODE_BYTES:
