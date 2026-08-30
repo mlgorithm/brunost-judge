@@ -363,3 +363,7 @@ class JudgeClient:
 
     def cancel(self, execution_id: str) -> dict[str, Any]:
         return self._request("POST", f"/v1/executions/{execution_id}/cancel")
+
+    def replay_callback(self, execution_id: str) -> dict[str, Any]:
+        """Ask the durable callback dispatcher to send a terminal result again."""
+        return self._request("POST", f"/v1/executions/{execution_id}/callback/replay")

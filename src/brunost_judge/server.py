@@ -59,12 +59,12 @@ def create_app(database: str | Path | None = None):
         metadata: dict[str, Any] = Field(default_factory=dict)
 
     class ExecutionRequestModel(BaseModel):
-        task_ref: str
-        submission_path: str | None = None
+        task_ref: str = Field(min_length=1, max_length=200)
+        submission_path: str | None = Field(default=None, max_length=4096)
         submission_artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         idempotency_key: str = Field(min_length=1, max_length=255)
-        callback_url: str | None = None
-        callback_token: str | None = None
+        callback_url: str | None = Field(default=None, max_length=2048)
+        callback_token: str | None = Field(default=None, max_length=4096)
         metadata: dict[str, Any] = Field(default_factory=dict)
         queue: str = Field(default="default", min_length=1, max_length=100)
         resource_class: str = Field(default="cpu", min_length=1, max_length=50)
@@ -99,7 +99,7 @@ def create_app(database: str | Path | None = None):
 
     class MatchRequestModel(BaseModel):
         agent_refs: list[str] = Field(min_length=2, max_length=64)
-        submission_path: str | None = Field(default=None, min_length=1)
+        submission_path: str | None = Field(default=None, min_length=1, max_length=4096)
         submission_artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         idempotency_key: str = Field(min_length=1, max_length=255)
         seed: int | None = None
@@ -247,7 +247,7 @@ def create_app(database: str | Path | None = None):
         if not path.is_dir():
             raise HTTPException(status_code=422, detail=f"path is not a directory: {path}")
         try:
-            stored = artifact_store.put(pack_directory(path))
+            stored = artifact_store.put(pack_directory(path, max_bytes=artifact_store.max_bytes))
         except (ArtifactError, OSError) as exc:
             raise HTTPException(status_code=422, detail=f"could not snapshot directory: {exc}") from exc
         return f"artifact://{stored['artifact_id']}", str(stored["artifact_id"])
@@ -258,6 +258,11 @@ def create_app(database: str | Path | None = None):
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.fragment:
             raise HTTPException(status_code=422, detail="callback_url must be an absolute http(s) URL")
+        try:
+            if parsed.port is not None and not 1 <= parsed.port <= 65_535:
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="callback_url has an invalid port") from exc
         production = os.environ.get("BRUNOST_JUDGE_ENV", "").lower() in {"prod", "production", "staging"}
         require_https = production or os.environ.get("BRUNOST_JUDGE_REQUIRE_HTTPS_CALLBACKS", "false").lower() == "true"
         if require_https and parsed.scheme != "https":
@@ -285,7 +290,7 @@ def create_app(database: str | Path | None = None):
         path = request.url.path
         if (
             path.startswith(("/v1/auth", "/v1/audit", "/v1/nodes", "/v1/workers/register"))
-            or path.endswith(("/drain", "/credential/revoke"))
+            or path.endswith(("/drain", "/credential/revoke", "/callback/replay"))
         ):
             return "judge:admin"
         return "judge:read" if request.method in {"GET", "HEAD"} else "judge:write"
@@ -563,7 +568,7 @@ def create_app(database: str | Path | None = None):
         if request.path:
             task_path = _allowed_path(request.path, "BRUNOST_TASK_ROOT")
             try:
-                stored = artifact_store.put(pack_directory(task_path))
+                stored = artifact_store.put(pack_directory(task_path, max_bytes=artifact_store.max_bytes))
                 artifact_identifier = str(stored["artifact_id"])
                 materialized, temporary = artifact_store.materialize(artifact_identifier)
                 validation = validate_task(materialized)
@@ -763,6 +768,14 @@ def create_app(database: str | Path | None = None):
             raise HTTPException(status_code=404, detail="execution not found")
         return result.as_dict()
 
+    @app.post("/v1/executions/{execution_id}/callback/replay", dependencies=[Depends(require_api_token)])
+    def replay_callback(execution_id: str) -> dict[str, Any]:
+        if store.get_execution(execution_id) is None:
+            raise HTTPException(status_code=404, detail="execution not found")
+        if not store.replay_callback(execution_id):
+            raise HTTPException(status_code=409, detail="execution has no terminal callback to replay")
+        return {"execution_id": execution_id, "replayed": True}
+
     @app.post("/v1/agents", status_code=201, dependencies=[Depends(require_api_token)])
     def register_agent(request: AgentDefinitionModel) -> dict[str, Any]:
         payload = request.model_dump()
@@ -948,27 +961,30 @@ def create_app(database: str | Path | None = None):
         if result_errors:
             raise HTTPException(status_code=422, detail="invalid worker result: " + "; ".join(result_errors))
 
-        result = store.finish(
-            request.execution_id,
-            ExecutionResult(
-                execution_id=request.execution_id,
-                task_ref=request.task_ref,
-                status=request.status,
-                score=request.score,
-                metrics=request.metrics,
-                scores=request.scores,
-                winner=request.winner,
-                artifacts=request.artifacts,
-                failure_reason=request.failure_reason,
-                metadata=request.metadata,
-                result_version=request.result_version,
-                judge_version=request.judge_version,
-                queue=request.queue,
-                resource_class=request.resource_class,
-                priority=request.priority,
-            ),
-            worker_id=worker_id,
-        )
+        try:
+            result = store.finish(
+                request.execution_id,
+                ExecutionResult(
+                    execution_id=request.execution_id,
+                    task_ref=request.task_ref,
+                    status=request.status,
+                    score=request.score,
+                    metrics=request.metrics,
+                    scores=request.scores,
+                    winner=request.winner,
+                    artifacts=request.artifacts,
+                    failure_reason=request.failure_reason,
+                    metadata=request.metadata,
+                    result_version=request.result_version,
+                    judge_version=request.judge_version,
+                    queue=request.queue,
+                    resource_class=request.resource_class,
+                    priority=request.priority,
+                ),
+                worker_id=worker_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if result is None:
             raise HTTPException(status_code=409, detail="execution is not leased to this worker")
         return result.as_dict()

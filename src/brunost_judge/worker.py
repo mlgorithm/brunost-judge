@@ -39,6 +39,12 @@ from brunost_judge.task import task_digest
 LOGGER = logging.getLogger(__name__)
 
 
+def _worker_retry_delay(poll_seconds: float) -> float:
+    """Avoid a hot loop when the database or API is temporarily unavailable."""
+
+    return max(0.5, min(30.0, float(poll_seconds)))
+
+
 @contextmanager
 def _evaluation_profile_environment(metadata: dict[str, Any]):
     """Pass the selected ML evaluation profile into local or Docker sandboxes."""
@@ -282,8 +288,12 @@ class CallbackDispatcher:
 
     def run_forever(self) -> None:
         while True:
-            if self.deliver_callbacks() == 0:
-                time.sleep(self.poll_seconds)
+            try:
+                if self.deliver_callbacks() == 0:
+                    time.sleep(self.poll_seconds)
+            except Exception:
+                LOGGER.exception("callback dispatcher iteration failed; retrying")
+                time.sleep(_worker_retry_delay(self.poll_seconds))
 
 
 class LocalWorker:
@@ -338,6 +348,13 @@ class LocalWorker:
         if claimed is None:
             return None
         execution, task, context = claimed
+        LOGGER.info(
+            "execution claimed execution_id=%s worker_id=%s queue=%s resource_class=%s",
+            execution.execution_id,
+            self.worker_id,
+            execution.queue,
+            execution.resource_class,
+        )
         try:
             with ExitStack() as stack:
                 if self.store.is_cancel_requested(execution.execution_id):
@@ -409,6 +426,12 @@ class LocalWorker:
                 event_id=execution.event_id,
             )
         finished = self.store.finish(execution.execution_id, result, worker_id=self.worker_id)
+        LOGGER.info(
+            "execution finished execution_id=%s worker_id=%s status=%s",
+            execution.execution_id,
+            self.worker_id,
+            finished.status if finished is not None else "stale",
+        )
         callback_url = context.get("callback_url")
         if finished is not None and callback_url:
             self.store.enqueue_callback(execution.execution_id, callback_url, context.get("callback_token"))
@@ -445,9 +468,13 @@ class LocalWorker:
 
     def run_forever(self) -> None:
         while True:
-            self.deliver_callbacks()
-            if self.process_one() is None:
-                time.sleep(self.poll_seconds)
+            try:
+                self.deliver_callbacks()
+                if self.process_one() is None:
+                    time.sleep(self.poll_seconds)
+            except Exception:
+                LOGGER.exception("local worker iteration failed; retrying")
+                time.sleep(_worker_retry_delay(self.poll_seconds))
 
 
 class RemoteWorker:
@@ -650,5 +677,9 @@ class RemoteWorker:
 
     def run_forever(self) -> None:
         while True:
-            if self.process_one() is None:
-                time.sleep(self.poll_seconds)
+            try:
+                if self.process_one() is None:
+                    time.sleep(self.poll_seconds)
+            except Exception:
+                LOGGER.exception("remote worker iteration failed; retrying")
+                time.sleep(_worker_retry_delay(self.poll_seconds))

@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from brunost_judge.conformance import validate_result_payload
 from brunost_judge.contracts import (
     TERMINAL_STATUSES,
     ExecutionRequest,
@@ -62,6 +63,18 @@ def _request_fingerprint(request: ExecutionRequest) -> str:
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_finish_result(execution_id: str, task_ref: str, result: ExecutionResult) -> None:
+    """Validate worker output again at the durable ownership boundary."""
+
+    if result.execution_id != execution_id:
+        raise ValueError("execution result does not match the claimed execution")
+    if result.task_ref != task_ref:
+        raise ValueError("execution result does not match the claimed task")
+    errors = validate_result_payload(result.as_dict())
+    if errors:
+        raise ValueError("invalid execution result: " + "; ".join(errors))
 
 
 class JudgeStore:
@@ -574,12 +587,27 @@ class JudgeStore:
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             now = datetime.now(UTC)
+            expired = db.execute(
+                """SELECT execution_id,callback_url,callback_token FROM executions
+                   WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                   AND cancel_requested=1""",
+                (now.isoformat(),),
+            ).fetchall()
             db.execute(
                 """UPDATE executions SET status=CASE WHEN cancel_requested=1 THEN 'canceled' ELSE 'queued' END,
                    worker_id=NULL, lease_expires_at=NULL, updated_at=?
                    WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?""",
                 (now.isoformat(), now.isoformat()),
             )
+            for row in expired:
+                if row["callback_url"]:
+                    db.execute(
+                        """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                           VALUES(?,?,?,?) ON CONFLICT(execution_id) DO UPDATE SET
+                           callback_url=excluded.callback_url,callback_token=excluded.callback_token
+                           WHERE callback_deliveries.delivered_at IS NULL""",
+                        (row["execution_id"], row["callback_url"], row["callback_token"], now.isoformat()),
+                    )
             clauses = ["e.status = 'queued'", "e.cancel_requested = 0"]
             params: list[Any] = []
             if queues:
@@ -635,6 +663,13 @@ class JudgeStore:
             raise ValueError("execution results must be terminal")
         now = _now()
         with self._lock, self._connect() as db:
+            existing = db.execute(
+                "SELECT task_ref FROM executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+            _validate_finish_result(execution_id, str(existing["task_ref"]), result)
             cursor = db.execute(
                 """UPDATE executions SET
                    status=CASE WHEN cancel_requested=1 THEN 'canceled' ELSE ? END,
@@ -761,6 +796,28 @@ class JudgeStore:
             )
             return cursor.rowcount == 1
 
+    def replay_callback(self, execution_id: str) -> bool:
+        """Reset a terminal callback outbox row for an explicit replay."""
+
+        now = _now()
+        with self._lock, self._connect() as db:
+            execution = db.execute(
+                "SELECT status,callback_url,callback_token FROM executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if execution is None or execution["status"] not in TERMINAL_STATUSES or not execution["callback_url"]:
+                return False
+            db.execute(
+                """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                   VALUES(?,?,?,?) ON CONFLICT(execution_id) DO UPDATE SET
+                   callback_url=excluded.callback_url,callback_token=excluded.callback_token,
+                   next_attempt_at=excluded.next_attempt_at,delivered_at=NULL,last_error=NULL,
+                   lease_owner=NULL,lease_expires_at=NULL
+                """,
+                (execution_id, execution["callback_url"], execution["callback_token"], now),
+            )
+        return True
+
     @staticmethod
     def _callback_attempts(db: sqlite3.Connection, execution_id: str) -> int:
         row = db.execute("SELECT attempts FROM callback_deliveries WHERE execution_id=?", (execution_id,)).fetchone()
@@ -813,8 +870,21 @@ class JudgeStore:
     def stats(self) -> dict[str, int]:
         with self._connect() as db:
             rows = db.execute("SELECT status, COUNT(*) AS count FROM executions GROUP BY status").fetchall()
+            callback_counts = db.execute(
+                """SELECT
+                   COUNT(*) AS pending,
+                   SUM(CASE WHEN c.lease_owner IS NOT NULL THEN 1 ELSE 0 END) AS in_flight,
+                   SUM(CASE WHEN c.attempts > 0 THEN 1 ELSE 0 END) AS failed
+                   FROM callback_deliveries c JOIN executions e USING(execution_id)
+                   WHERE c.delivered_at IS NULL AND e.status IN ('completed','failed','canceled')""",
+            ).fetchone()
         result = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "canceled": 0}
         result.update({str(row["status"]): int(row["count"]) for row in rows})
+        result.update({
+            "callbacks_pending": int(callback_counts["pending"] or 0),
+            "callbacks_in_flight": int(callback_counts["in_flight"] or 0),
+            "callbacks_failed": int(callback_counts["failed"] or 0),
+        })
         return result
 
     def _result(self, row: sqlite3.Row) -> ExecutionResult:

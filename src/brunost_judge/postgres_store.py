@@ -21,7 +21,7 @@ from brunost_judge.contracts import (
     WorkerRecord,
 )
 from brunost_judge.enrollment import digest_secret, is_expired
-from brunost_judge.store import _request_fingerprint
+from brunost_judge.store import _request_fingerprint, _validate_finish_result
 
 
 def _now() -> str:
@@ -443,7 +443,23 @@ class PostgresJudgeStore:
                    lease_seconds: int = 300):
         with self._connect() as db:
             now = datetime.now(UTC)
+            expired = db.execute(
+                """UPDATE executions SET status='canceled',worker_id=NULL,lease_expires_at=NULL,updated_at=%s
+                   WHERE status='running' AND cancel_requested=TRUE AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at<=%s
+                   RETURNING execution_id,callback_url,callback_token""",
+                (now, now),
+            ).fetchall()
             db.execute("UPDATE executions SET status=CASE WHEN cancel_requested THEN 'canceled' ELSE 'queued' END,worker_id=NULL,lease_expires_at=NULL,updated_at=%s WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at<=%s", (now, now))
+            for row in expired:
+                if row["callback_url"]:
+                    db.execute(
+                        """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                           VALUES(%s,%s,%s,%s) ON CONFLICT(execution_id) DO UPDATE SET
+                           callback_url=EXCLUDED.callback_url,callback_token=EXCLUDED.callback_token
+                           WHERE callback_deliveries.delivered_at IS NULL""",
+                        (row["execution_id"], row["callback_url"], row["callback_token"], now),
+                    )
             clauses, params = ["status='queued'", "cancel_requested=FALSE"], []
             if queues:
                 clauses.append("queue = ANY(%s)")
@@ -484,6 +500,13 @@ class PostgresJudgeStore:
         if result.status not in TERMINAL_STATUSES:
             raise ValueError("execution results must be terminal")
         with self._connect() as db:
+            existing = db.execute(
+                "SELECT task_ref FROM executions WHERE execution_id=%s",
+                (execution_id,),
+            ).fetchone()
+            if existing is None:
+                return None
+            _validate_finish_result(execution_id, str(existing["task_ref"]), result)
             cursor = db.execute(
                 """UPDATE executions SET
                    status=CASE WHEN cancel_requested THEN 'canceled' ELSE %s END,
@@ -592,6 +615,27 @@ class PostgresJudgeStore:
             )
             return cursor.rowcount == 1
 
+    def replay_callback(self, execution_id: str) -> bool:
+        """Reset a terminal callback outbox row for an explicit replay."""
+
+        now = _now()
+        with self._connect() as db:
+            execution = db.execute(
+                "SELECT status,callback_url,callback_token FROM executions WHERE execution_id=%s",
+                (execution_id,),
+            ).fetchone()
+            if execution is None or execution["status"] not in TERMINAL_STATUSES or not execution["callback_url"]:
+                return False
+            db.execute(
+                """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                   VALUES(%s,%s,%s,%s) ON CONFLICT(execution_id) DO UPDATE SET
+                   callback_url=EXCLUDED.callback_url,callback_token=EXCLUDED.callback_token,
+                   next_attempt_at=EXCLUDED.next_attempt_at,delivered_at=NULL,last_error=NULL,
+                   lease_owner=NULL,lease_expires_at=NULL""",
+                (execution_id, execution["callback_url"], execution["callback_token"], now),
+            )
+        return True
+
     def cancel(self, execution_id: str) -> ExecutionResult | None:
         with self._connect() as db:
             existing = db.execute(
@@ -634,8 +678,20 @@ class PostgresJudgeStore:
     def stats(self) -> dict[str, int]:
         with self._connect() as db:
             rows = db.execute("SELECT status,COUNT(*) AS count FROM executions GROUP BY status").fetchall()
+            callback_counts = db.execute(
+                """SELECT COUNT(*) AS pending,
+                          COUNT(*) FILTER (WHERE c.lease_owner IS NOT NULL) AS in_flight,
+                          COUNT(*) FILTER (WHERE c.attempts > 0) AS failed
+                   FROM callback_deliveries c JOIN executions e USING(execution_id)
+                   WHERE c.delivered_at IS NULL AND e.status IN ('completed','failed','canceled')""",
+            ).fetchone()
         result = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "canceled": 0}
         result.update({str(row["status"]): int(row["count"]) for row in rows})
+        result.update({
+            "callbacks_pending": int(callback_counts["pending"] or 0),
+            "callbacks_in_flight": int(callback_counts["in_flight"] or 0),
+            "callbacks_failed": int(callback_counts["failed"] or 0),
+        })
         return result
 
     @staticmethod

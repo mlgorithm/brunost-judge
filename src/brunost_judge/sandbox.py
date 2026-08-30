@@ -24,6 +24,8 @@ from brunost_judge.artifacts import pack_directory
 from brunost_judge.conformance import validate_runner_result_payload
 from grader.harness import run
 
+_MAX_SANDBOX_RESULT_BYTES = 1_000_000
+
 
 class SandboxRunner(Protocol):
     def run(self, submission: Path, task: Path, execution_id: str) -> dict[str, Any]: ...
@@ -36,12 +38,21 @@ def _artifact_limit() -> int:
         return 64 * 1024 * 1024
 
 
+def _task_bundle_limit() -> int:
+    try:
+        return max(1, int(os.environ.get("BRUNOST_JUDGE_TASK_BUNDLE_MAX_BYTES", str(512 * 1024 * 1024))))
+    except ValueError:
+        return 512 * 1024 * 1024
+
+
 def collect_result_artifacts(result: dict[str, Any], output_root: Path) -> dict[str, Any]:
     """Package runner-declared files for the worker's content-addressed store."""
 
     declarations = result.get("artifacts") or {}
     if not declarations:
         return result
+    if not isinstance(declarations, dict):
+        return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": "result artifacts must be an object"}
     artifact_root = (output_root / "artifacts").resolve()
     payloads: dict[str, dict[str, Any]] = {}
     total_bytes = 0
@@ -72,7 +83,7 @@ def collect_result_artifacts(result: dict[str, Any], output_root: Path) -> dict[
             if total_bytes > _artifact_limit() * 4:
                 return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": "result artifacts exceed configured total size limit"}
             payloads[name] = {
-                "data": pack_directory(package_root),
+                "data": pack_directory(package_root, max_bytes=_artifact_limit()),
                 "media_type": descriptor.get("media_type") if isinstance(descriptor, dict) else None,
                 "kind": descriptor.get("kind") if isinstance(descriptor, dict) else None,
                 "filename": filename,
@@ -131,6 +142,11 @@ class ProcessSandboxRunner:
                     os.environ.pop("RESULT_ARTIFACTS_PATH", None)
                 else:
                     os.environ["RESULT_ARTIFACTS_PATH"] = previous
+            if not isinstance(result, dict):
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": "sandbox returned a non-object result"}
+            errors = validate_runner_result_payload(result)
+            if errors:
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": "invalid sandbox result: " + "; ".join(errors)}
             return collect_result_artifacts(result, Path(output_dir))
 
 
@@ -180,7 +196,7 @@ class DockerSandboxRunner:
 
         with tempfile.TemporaryDirectory(prefix="brunost-judge-output-") as output_dir:
             try:
-                task_bundle = pack_directory(task)
+                task_bundle = pack_directory(task, max_bytes=_task_bundle_limit())
                 image = self._image_for_task(task)
             except (OSError, ValueError) as exc:
                 return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": str(exc)}
@@ -237,9 +253,18 @@ class DockerSandboxRunner:
             except subprocess.TimeoutExpired:
                 self._cleanup(label)
                 return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"sandbox timed out after {self.timeout_seconds}s"}
+            except OSError as exc:
+                return {"status": "failed", "score": 0.0, "metrics": {}, "failure_reason": f"sandbox could not start: {exc}"}
             result_path = output / "results.json"
             if result_path.is_file():
                 try:
+                    if result_path.stat().st_size > _MAX_SANDBOX_RESULT_BYTES:
+                        return {
+                            "status": "failed",
+                            "score": 0.0,
+                            "metrics": {},
+                            "failure_reason": "sandbox result exceeds the output limit",
+                        }
                     result = json.loads(result_path.read_text(encoding="utf-8"))
                     if isinstance(result, dict):
                         errors = validate_runner_result_payload(result)
@@ -276,9 +301,25 @@ class DockerSandboxRunner:
 
     @staticmethod
     def _cleanup(label: str) -> None:
-        containers = subprocess.run(["docker", "ps", "-aq", "--filter", f"label={label}"], check=False, capture_output=True, text=True).stdout.split()
-        if containers:
-            subprocess.run(["docker", "rm", "-f", *containers], check=False, capture_output=True)
+        try:
+            containers = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", f"label={label}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.split()
+            if containers:
+                subprocess.run(
+                    ["docker", "rm", "-f", *containers],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            # The original timeout is the authoritative execution result. A
+            # daemon/API outage must not strand the worker in cleanup forever.
+            return
 
 
 def sandbox_from_environment() -> SandboxRunner:

@@ -7,20 +7,30 @@ authoring environments.
 
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from brunost_judge.contracts import RESULT_SCHEMA_VERSION, TERMINAL_STATUSES
 
+MAX_RESULT_METRICS_BYTES = 1_000_000
+MAX_RESULT_FAILURE_REASON_CHARS = 2_000
+MAX_RESULT_ARTIFACTS = 32
+MAX_RESULT_SCORES = 64
+_ARTIFACT_ID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
 
 def validate_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
     """Return actionable errors for a canonical evaluation result."""
     errors: list[str] = []
-    if not payload.get("execution_id") and not payload.get("evaluation_id"):
+    execution_id = payload.get("execution_id") or payload.get("evaluation_id")
+    if not isinstance(execution_id, str) or not execution_id:
         errors.append("missing evaluation_id")
-    if not payload.get("task_ref"):
+    task_ref = payload.get("task_ref")
+    if not isinstance(task_ref, str) or not task_ref:
         errors.append("missing task_ref")
     status = payload.get("status")
     if status not in {*TERMINAL_STATUSES, "queued", "running"}:
@@ -28,15 +38,23 @@ def validate_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:
     score = payload.get("score")
     if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
         errors.append("score must be numeric or null")
-    elif score is not None and not math.isfinite(float(score)):
+    elif score is not None and not _is_finite_number(score):
         errors.append("score must be finite")
-    if not isinstance(payload.get("metrics", {}), Mapping):
+    metrics = payload.get("metrics", {})
+    if not isinstance(metrics, Mapping):
         errors.append("metrics must be an object")
+    else:
+        _validate_json_size(metrics, errors, "metrics")
     _validate_scores(payload.get("scores"), errors, prefix="scores")
     winner = payload.get("winner")
     if winner is not None and (not isinstance(winner, str) or not winner):
         errors.append("winner must be a non-empty string or null")
     _validate_artifacts(payload.get("artifacts", {}), errors, prefix="artifacts", references=True)
+    failure_reason = payload.get("failure_reason")
+    if failure_reason is not None and (
+        not isinstance(failure_reason, str) or len(failure_reason) > MAX_RESULT_FAILURE_REASON_CHARS
+    ):
+        errors.append(f"failure_reason must be at most {MAX_RESULT_FAILURE_REASON_CHARS} characters")
     result_version = payload.get("result_version")
     if result_version is not None and result_version != RESULT_SCHEMA_VERSION:
         errors.append(f"result_version must be {RESULT_SCHEMA_VERSION}")
@@ -51,10 +69,13 @@ def validate_runner_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...
     score = payload.get("score")
     if score is not None and (isinstance(score, bool) or not isinstance(score, (int, float))):
         errors.append("sandbox result score must be numeric or null")
-    elif score is not None and not math.isfinite(float(score)):
+    elif score is not None and not _is_finite_number(score):
         errors.append("sandbox result score must be finite")
-    if not isinstance(payload.get("metrics", {}), Mapping):
+    metrics = payload.get("metrics", {})
+    if not isinstance(metrics, Mapping):
         errors.append("sandbox result metrics must be an object")
+    else:
+        _validate_json_size(metrics, errors, "sandbox result metrics")
     _validate_scores(payload.get("scores"), errors, prefix="sandbox result scores")
     winner = payload.get("winner")
     if winner is not None and (not isinstance(winner, str) or not winner):
@@ -62,6 +83,8 @@ def validate_runner_result_payload(payload: Mapping[str, Any]) -> tuple[str, ...
     _validate_artifacts(payload.get("artifacts", {}), errors, prefix="sandbox result artifacts")
     if payload.get("status") == "failed" and not isinstance(payload.get("failure_reason"), str):
         errors.append("failed sandbox results need a failure_reason")
+    elif isinstance(payload.get("failure_reason"), str) and len(payload["failure_reason"]) > MAX_RESULT_FAILURE_REASON_CHARS:
+        errors.append(f"sandbox result failure_reason must be at most {MAX_RESULT_FAILURE_REASON_CHARS} characters")
     result_version = payload.get("result_version")
     if result_version is not None and result_version != RESULT_SCHEMA_VERSION:
         errors.append(f"result_version must be {RESULT_SCHEMA_VERSION}")
@@ -74,12 +97,14 @@ def _validate_scores(value: Any, errors: list[str], *, prefix: str) -> None:
     if not isinstance(value, Mapping):
         errors.append(f"{prefix} must be an object")
         return
+    if len(value) > MAX_RESULT_SCORES:
+        errors.append(f"{prefix} contains too many entries")
     for seat, score in value.items():
-        if not isinstance(seat, str) or not seat:
+        if not isinstance(seat, str) or not seat or len(seat) > 200:
             errors.append(f"{prefix} keys must be non-empty strings")
         if isinstance(score, bool) or not isinstance(score, (int, float)):
             errors.append(f"{prefix} values must be numeric")
-        elif not math.isfinite(float(score)):
+        elif not _is_finite_number(score):
             errors.append(f"{prefix} values must be finite")
 
 
@@ -89,14 +114,15 @@ def _validate_artifacts(value: Any, errors: list[str], *, prefix: str, reference
     if not isinstance(value, Mapping):
         errors.append(f"{prefix} must be an object")
         return
-    if len(value) > 32:
+    if len(value) > MAX_RESULT_ARTIFACTS:
         errors.append(f"{prefix} contains too many entries")
     for name, descriptor in value.items():
-        if not isinstance(name, str) or not name:
+        if not isinstance(name, str) or not name or len(name) > 200:
             errors.append(f"{prefix} names must be non-empty strings")
             continue
         if references:
-            if not isinstance(descriptor, Mapping) or not isinstance(descriptor.get("artifact_id"), str):
+            artifact_identifier = descriptor.get("artifact_id") if isinstance(descriptor, Mapping) else None
+            if not isinstance(artifact_identifier, str) or not _ARTIFACT_ID_RE.fullmatch(artifact_identifier):
                 errors.append(f"{prefix}.{name} must declare an artifact_id")
             continue
         if isinstance(descriptor, str):
@@ -111,6 +137,23 @@ def _validate_artifacts(value: Any, errors: list[str], *, prefix: str, reference
         relative = Path(path)
         if relative.is_absolute() or ".." in relative.parts:
             errors.append(f"{prefix}.{name} path must be relative")
+
+
+def _validate_json_size(value: Mapping[str, Any], errors: list[str], label: str) -> None:
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        errors.append(f"{label} must contain only JSON-compatible finite values")
+        return
+    if len(encoded.encode("utf-8")) > MAX_RESULT_METRICS_BYTES:
+        errors.append(f"{label} exceeds {MAX_RESULT_METRICS_BYTES} bytes")
+
+
+def _is_finite_number(value: float) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def validate_capability_payload(payload: Mapping[str, Any]) -> tuple[str, ...]:

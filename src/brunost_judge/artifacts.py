@@ -15,7 +15,7 @@ import os
 import shutil
 import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -52,19 +52,24 @@ def _packable(item: Path, root: Path) -> bool:
     return not any(part == "__pycache__" or part.endswith(".pyc") for part in relative.parts)
 
 
-def pack_directory(path: str | Path) -> bytes:
+def pack_directory(path: str | Path, *, max_bytes: int | None = None) -> bytes:
     """Create a deterministic gzip tar bundle from a directory."""
 
     root = Path(path).expanduser().resolve()
     if not root.is_dir():
         raise ArtifactError(f"artifact source is not a directory: {root}")
+    if max_bytes is not None:
+        max_bytes = _positive_limit(max_bytes, name="max_bytes")
     tar_output = io.BytesIO()
+    total_bytes = 0
     with tarfile.open(fileobj=tar_output, mode="w") as archive:
         for item in sorted(root.rglob("*")):
             if not _packable(item, root):
                 continue
             if item.is_symlink():
                 raise ArtifactError(f"symlinks are not allowed in artifacts: {item}")
+            if not item.is_dir() and not item.is_file():
+                raise ArtifactError(f"special files are not allowed in artifacts: {item}")
             relative = item.relative_to(root).as_posix()
             info = archive.gettarinfo(str(item), arcname=relative)
             info.uid = 0
@@ -73,6 +78,12 @@ def pack_directory(path: str | Path) -> bytes:
             info.gname = ""
             info.mtime = 0
             if item.is_file():
+                try:
+                    total_bytes += item.stat().st_size
+                except OSError as exc:
+                    raise ArtifactError(f"could not inspect artifact file: {item}") from exc
+                if max_bytes is not None and total_bytes > max_bytes:
+                    raise ArtifactError(f"artifact source exceeds {max_bytes} bytes")
                 with item.open("rb") as source:
                     archive.addfile(info, source)
             else:
@@ -93,8 +104,13 @@ def safe_extract(
 ) -> Path:
     """Extract a bundle while rejecting traversal, links, special files, and bombs."""
 
-    root = Path(destination).expanduser().resolve()
+    destination_path = Path(destination).expanduser()
+    if destination_path.is_symlink():
+        raise ArtifactError("artifact extraction destination must not be a symlink")
+    root = destination_path.resolve()
     root.mkdir(parents=True, exist_ok=True)
+    if any(item.is_symlink() for item in root.rglob("*")):
+        raise ArtifactError("artifact extraction destination contains a symlink")
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as archive:
         members = archive.getmembers()
         max_members = _positive_limit(max_members, name="max_members")
@@ -103,12 +119,20 @@ def safe_extract(
         if len(members) > max_members:
             raise ArtifactError(f"artifact contains too many members (maximum {max_members})")
         expanded_bytes = 0
-        names: set[str] = set()
+        names: dict[str, bool] = {}
         for member in members:
-            if member.name in names:
+            relative = PurePosixPath(member.name)
+            if relative.is_absolute() or not relative.parts or ".." in relative.parts or "." in relative.parts:
+                raise ArtifactError("artifact contains a path traversal")
+            normalized_name = relative.as_posix()
+            if normalized_name in names:
                 raise ArtifactError("artifact contains duplicate member names")
-            names.add(member.name)
-            target = (root / member.name).resolve()
+            for parent in relative.parents:
+                parent_name = parent.as_posix()
+                if parent_name != "." and parent_name in names and not names[parent_name]:
+                    raise ArtifactError("artifact contains a file/directory collision")
+            names[normalized_name] = member.isdir()
+            target = (root / normalized_name).resolve()
             if target != root and root not in target.parents:
                 raise ArtifactError("artifact contains a path traversal")
             if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
@@ -120,7 +144,7 @@ def safe_extract(
                 if expanded_bytes > max_expanded_bytes:
                     raise ArtifactError(f"artifact expands beyond {max_expanded_bytes} bytes")
         for member in members:
-            target = root / member.name
+            target = root / PurePosixPath(member.name).as_posix()
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -128,7 +152,9 @@ def safe_extract(
             if source is None:
                 raise ArtifactError("artifact member could not be read")
             target.parent.mkdir(parents=True, exist_ok=True)
-            with source, target.open("wb") as output:
+            if target.exists() and target.is_symlink():
+                raise ArtifactError("artifact extraction encountered a symlink")
+            with source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
     return root
 
@@ -259,9 +285,11 @@ class S3ArtifactStore(ArtifactStore):
             declared_size = response.get("ContentLength")
             if declared_size is not None and int(declared_size) > self.max_bytes:
                 raise ArtifactError(f"artifact exceeds {self.max_bytes} bytes")
-            data = body.read()
+            data = body.read(self.max_bytes + 1)
         finally:
             body.close()
+        if len(data) > self.max_bytes:
+            raise ArtifactError(f"artifact exceeds {self.max_bytes} bytes")
         if artifact_id(data) != safe_identifier:
             raise ArtifactError("artifact checksum mismatch")
         return data
