@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from brunost_judge.contracts import (
+    TERMINAL_STATUSES,
     ExecutionRequest,
     ExecutionResult,
     TaskRecord,
@@ -480,6 +481,8 @@ class PostgresJudgeStore:
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
         if not worker_id.strip():
             raise ValueError("worker_id is required to finish an execution")
+        if result.status not in TERMINAL_STATUSES:
+            raise ValueError("execution results must be terminal")
         with self._connect() as db:
             cursor = db.execute(
                 """UPDATE executions SET
@@ -573,15 +576,40 @@ class PostgresJudgeStore:
             )
         return cursor.rowcount == 1
 
-    def mark_callback_failed(self, execution_id: str, error: str) -> None:
+    def mark_callback_failed(self, execution_id: str, error: str, *, worker_id: str | None = None) -> bool:
         with self._connect() as db:
             row = db.execute("SELECT attempts FROM callback_deliveries WHERE execution_id=%s", (execution_id,)).fetchone()
             attempts = int(row["attempts"]) if row else 0
-            db.execute("UPDATE callback_deliveries SET attempts=attempts+1,next_attempt_at=%s,last_error=%s,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=%s", (datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, attempts)))), error[:2000], execution_id))
+            owner_clause = " AND lease_owner=%s" if worker_id is not None else ""
+            cursor = db.execute(
+                "UPDATE callback_deliveries SET attempts=attempts+1,next_attempt_at=%s,last_error=%s,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=%s" + owner_clause,
+                (
+                    datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, attempts)))),
+                    error[:2000],
+                    execution_id,
+                    *([worker_id] if worker_id is not None else []),
+                ),
+            )
+            return cursor.rowcount == 1
 
     def cancel(self, execution_id: str) -> ExecutionResult | None:
         with self._connect() as db:
+            existing = db.execute(
+                "SELECT status,callback_url,callback_token FROM executions WHERE execution_id=%s",
+                (execution_id,),
+            ).fetchone()
+            if existing is None:
+                return None
             db.execute("UPDATE executions SET cancel_requested=TRUE,status=CASE WHEN status='queued' THEN 'canceled' ELSE status END,updated_at=%s WHERE execution_id=%s", (_now(), execution_id))
+            if existing["status"] == "queued" and existing["callback_url"]:
+                db.execute(
+                    """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                       VALUES(%s,%s,%s,%s)
+                       ON CONFLICT(execution_id) DO UPDATE SET
+                       callback_url=EXCLUDED.callback_url,callback_token=EXCLUDED.callback_token
+                       WHERE callback_deliveries.delivered_at IS NULL""",
+                    (execution_id, existing["callback_url"], existing["callback_token"], _now()),
+                )
         return self.get_execution(execution_id)
 
     def is_cancel_requested(self, execution_id: str) -> bool:
@@ -619,9 +647,11 @@ class PostgresJudgeStore:
     def _result(row: dict[str, Any]) -> ExecutionResult:
         metrics = row["metrics_json"] if isinstance(row["metrics_json"], dict) else json.loads(row["metrics_json"])
         metadata = row["metadata_json"] if isinstance(row["metadata_json"], dict) else json.loads(row["metadata_json"])
+        event_id = metadata.get("event_id") or f"execution:{row['execution_id']}:result"
+        metadata.setdefault("event_id", event_id)
         scores = row["scores_json"] if isinstance(row["scores_json"], dict) else json.loads(row["scores_json"] or "{}")
         artifacts = row["artifacts_json"] if isinstance(row["artifacts_json"], dict) else json.loads(row["artifacts_json"] or "{}")
-        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"], task_digest=metadata.get("task_digest"), evaluator=metadata.get("evaluator"), runtime_image=metadata.get("runtime_image"), seed=metadata.get("seed"), event_id=metadata.get("event_id"), scores=scores, winner=row["winner"], artifacts=artifacts)
+        return ExecutionResult(row["execution_id"], row["task_ref"], row["status"], row["score"], metrics, row["failure_reason"], metadata, queue=row["queue"], resource_class=row["resource_class"], priority=row["priority"], task_digest=metadata.get("task_digest"), evaluator=metadata.get("evaluator"), runtime_image=metadata.get("runtime_image"), seed=metadata.get("seed"), event_id=event_id, scores=scores, winner=row["winner"], artifacts=artifacts)
 
     @staticmethod
     def _worker(row: dict[str, Any]) -> WorkerRecord:

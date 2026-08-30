@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from brunost_judge.contracts import (
+    TERMINAL_STATUSES,
     ExecutionRequest,
     ExecutionResult,
     TaskRecord,
@@ -630,6 +631,8 @@ class JudgeStore:
     def finish(self, execution_id: str, result: ExecutionResult, *, worker_id: str) -> ExecutionResult | None:
         if not worker_id.strip():
             raise ValueError("worker_id is required to finish an execution")
+        if result.status not in TERMINAL_STATUSES:
+            raise ValueError("execution results must be terminal")
         now = _now()
         with self._lock, self._connect() as db:
             cursor = db.execute(
@@ -743,13 +746,20 @@ class JudgeStore:
             )
         return cursor.rowcount == 1
 
-    def mark_callback_failed(self, execution_id: str, error: str) -> None:
+    def mark_callback_failed(self, execution_id: str, error: str, *, worker_id: str | None = None) -> bool:
         with self._lock, self._connect() as db:
-            db.execute(
+            owner_clause = " AND lease_owner=?" if worker_id is not None else ""
+            cursor = db.execute(
                 """UPDATE callback_deliveries SET attempts=attempts+1,
-                   next_attempt_at=?,last_error=?,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=?""",
-                ((datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, self._callback_attempts(db, execution_id)))))).isoformat(), error[:2000], execution_id),
+                   next_attempt_at=?,last_error=?,lease_owner=NULL,lease_expires_at=NULL WHERE execution_id=?""" + owner_clause,
+                (
+                    (datetime.now(UTC) + timedelta(seconds=min(3600, 5 * (2 ** min(8, self._callback_attempts(db, execution_id)))))).isoformat(),
+                    error[:2000],
+                    execution_id,
+                    *([worker_id] if worker_id is not None else []),
+                ),
             )
+            return cursor.rowcount == 1
 
     @staticmethod
     def _callback_attempts(db: sqlite3.Connection, execution_id: str) -> int:
@@ -758,10 +768,24 @@ class JudgeStore:
 
     def cancel(self, execution_id: str) -> ExecutionResult | None:
         with self._lock, self._connect() as db:
+            existing = db.execute(
+                "SELECT status,callback_url,callback_token FROM executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if existing is None:
+                return None
             db.execute(
                 "UPDATE executions SET cancel_requested=1,status=CASE WHEN status='queued' THEN 'canceled' ELSE status END,updated_at=? WHERE execution_id=?",
                 (_now(), execution_id),
             )
+            if existing["status"] == "queued" and existing["callback_url"]:
+                db.execute(
+                    """INSERT INTO callback_deliveries(execution_id,callback_url,callback_token,next_attempt_at)
+                       VALUES(?,?,?,?) ON CONFLICT(execution_id) DO UPDATE SET
+                       callback_url=excluded.callback_url,callback_token=excluded.callback_token
+                       WHERE callback_deliveries.delivered_at IS NULL""",
+                    (execution_id, existing["callback_url"], existing["callback_token"], _now()),
+                )
         return self.get_execution(execution_id)
 
     def is_cancel_requested(self, execution_id: str) -> bool:
@@ -795,6 +819,8 @@ class JudgeStore:
 
     def _result(self, row: sqlite3.Row) -> ExecutionResult:
         metadata = json.loads(row["metadata_json"])
+        event_id = metadata.get("event_id") or f"execution:{row['execution_id']}:result"
+        metadata.setdefault("event_id", event_id)
         return ExecutionResult(
             execution_id=row["execution_id"],
             task_ref=row["task_ref"],
@@ -810,7 +836,7 @@ class JudgeStore:
             evaluator=metadata.get("evaluator"),
             runtime_image=metadata.get("runtime_image"),
             seed=metadata.get("seed"),
-            event_id=metadata.get("event_id"),
+            event_id=event_id,
             scores=json.loads(row["scores_json"] or "{}"),
             winner=row["winner"],
             artifacts=json.loads(row["artifacts_json"] or "{}"),

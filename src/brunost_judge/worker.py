@@ -254,7 +254,7 @@ def _deliver_callbacks(store: Any, worker_id: str, signing_secret: str | None, *
         try:
             _notify(row["callback_url"], row["callback_token"], execution.as_dict(), signing_secret)
         except Exception as exc:  # noqa: BLE001 - retry delivery without re-execution
-            store.mark_callback_failed(execution_id, f"{type(exc).__name__}: {exc}")
+            store.mark_callback_failed(execution_id, f"{type(exc).__name__}: {exc}", worker_id=worker_id)
         else:
             store.mark_callback_delivered_by_owner(execution_id, worker_id)
             delivered += 1
