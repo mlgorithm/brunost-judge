@@ -48,6 +48,82 @@ def test_docker_sandbox_judges_classic_task_without_task_visibility(tmp_path: Pa
     assert result["score"] == pytest.approx(1.0), result
 
 
+def test_docker_sandbox_drops_privileges_before_native_candidate_compilation(tmp_path: Path):
+    """A C compiler must not be able to include a root-only private asset."""
+
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    (task / "public").mkdir(parents=True)
+    (task / "private").mkdir()
+    (task / "tests").mkdir()
+    submission.mkdir()
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: coding\nrunner: classic\nlanguage: c\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "one.in").write_text("1\n", encoding="utf-8")
+    (task / "tests" / "one.ans").write_text("2\n", encoding="utf-8")
+    (task / "private" / "compile-secret.h").write_text(
+        '#define COMPILE_SECRET "PRIVATE_NATIVE_COMPILE_LEAK"\n', encoding="utf-8"
+    )
+    (submission / "solution.c").write_text(
+        '#include "/tmp/brunost-assets/private/compile-secret.h"\n'
+        "#include <stdio.h>\n"
+        "int main(void) { puts(COMPILE_SECRET); return 0; }\n",
+        encoding="utf-8",
+    )
+    seccomp = Path(__file__).parents[1] / "src" / "brunost_judge" / "security" / "seccomp-v1.json"
+
+    result = DockerSandboxRunner(
+        os.environ["BRUNOST_JUDGE_SANDBOX_IMAGE"],
+        os.environ.get("BRUNOST_JUDGE_SANDBOX_RUNTIME", "runc"),
+        timeout_seconds=30,
+        seccomp_profile=str(seccomp),
+    ).run(submission, task, "docker-native-compile-privacy")
+
+    assert result["status"] == "completed", result
+    assert result["score"] == pytest.approx(0.0), result
+    assert result["metrics"]["verdict"] == "CE", result
+    assert "PRIVATE_NATIVE_COMPILE_LEAK" not in str(result)
+
+
+def test_docker_sandbox_compiles_a_native_candidate_after_the_uid_drop(tmp_path: Path):
+    task = tmp_path / "task"
+    submission = tmp_path / "submission"
+    (task / "public").mkdir(parents=True)
+    (task / "private").mkdir()
+    (task / "tests").mkdir()
+    submission.mkdir()
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: coding\nrunner: classic\nlanguage: c\n"
+        "answer_source: reference\nreference_language: c\nreference_entrypoint: private/reference.c\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "one.in").write_text("21\n", encoding="utf-8")
+    (task / "private" / "reference.c").write_text(
+        "#include <stdio.h>\n"
+        "int main(void) { int value; scanf(\"%d\", &value); printf(\"%d\\n\", value * 2); }\n",
+        encoding="utf-8",
+    )
+    (submission / "solution.c").write_text(
+        "#include <stdio.h>\n"
+        "int main(void) { int value; scanf(\"%d\", &value); printf(\"%d\\n\", value * 2); }\n",
+        encoding="utf-8",
+    )
+    seccomp = Path(__file__).parents[1] / "src" / "brunost_judge" / "security" / "seccomp-v1.json"
+
+    result = DockerSandboxRunner(
+        os.environ["BRUNOST_JUDGE_SANDBOX_IMAGE"],
+        os.environ.get("BRUNOST_JUDGE_SANDBOX_RUNTIME", "runc"),
+        timeout_seconds=30,
+        seccomp_profile=str(seccomp),
+    ).run(submission, task, "docker-native-compile-success")
+
+    assert result["status"] == "completed", result
+    assert result["score"] == pytest.approx(1.0), result
+    assert result["metrics"]["verdict"] == "AC", result
+
+
 def test_docker_sandbox_judges_interactive_task(tmp_path: Path):
     task = tmp_path / "interactive-task"
     submission = tmp_path / "submission"
@@ -56,19 +132,22 @@ def test_docker_sandbox_judges_interactive_task(tmp_path: Path):
     (task / "tests").mkdir()
     submission.mkdir()
     (task / "judge.yaml").write_text(
-        "version: 1\nkind: interactive\nrunner: classic\nlanguage: python\n"
+        "version: 1\nkind: interactive\nrunner: classic\nlanguage: c\n"
         "interactor: interactor.py\ntime_limit_ms: 1000\n",
         encoding="utf-8",
     )
     (task / "tests" / "one.in").write_text("5\n", encoding="utf-8")
+    (task / "private" / "runtime-secret.txt").write_text("not for contestants\n", encoding="utf-8")
     (task / "interactor.py").write_text(
         "def interact(session, input_path):\n"
         "    session.send('ready')\n"
         "    return int(session.receive()) == 10\n",
         encoding="utf-8",
     )
-    (submission / "solution.py").write_text(
-        "if input().strip() == 'ready':\n    print(10, flush=True)\n",
+    (submission / "solution.c").write_text(
+        "#include <stdio.h>\n"
+        "#include <string.h>\n"
+        "int main(void) { FILE *secret = fopen(\"/tmp/brunost-assets/private/runtime-secret.txt\", \"r\"); char line[64]; if (secret) { fclose(secret); puts(\"0\"); } else if (fgets(line, sizeof line, stdin) && strcmp(line, \"ready\\n\") == 0) { puts(\"10\"); } fflush(stdout); }\n",
         encoding="utf-8",
     )
 
@@ -80,6 +159,47 @@ def test_docker_sandbox_judges_interactive_task(tmp_path: Path):
 
     assert result["status"] == "completed", result
     assert result["score"] == pytest.approx(1.0), result
+
+
+def test_docker_sandbox_compiles_private_optimization_baseline_without_exposing_it(tmp_path: Path):
+    task = tmp_path / "optimization-task"
+    submission = tmp_path / "submission"
+    (task / "public").mkdir(parents=True)
+    (task / "private").mkdir()
+    (task / "tests").mkdir()
+    submission.mkdir()
+    (task / "judge.yaml").write_text(
+        "version: 1\nkind: optimization\nrunner: optimization\nlanguage: c\n"
+        "evaluator_entrypoint: private/evaluator.py\nbaseline_enabled: true\n"
+        "baseline_entrypoint: private/baseline.c\nobjective_direction: maximize\n"
+        "score_mode: baseline_ratio\naggregation: mean\ntime_limit_ms: 1000\n",
+        encoding="utf-8",
+    )
+    (task / "tests" / "one.in").write_text("21\n", encoding="utf-8")
+    (task / "private" / "evaluator.py").write_text(
+        "def evaluate(input_path, output_path):\n"
+        "    value = int(open(output_path, encoding='utf-8').read())\n"
+        "    return {'feasible': value >= 0, 'objective': float(value)}\n",
+        encoding="utf-8",
+    )
+    solution = (
+        "#include <stdio.h>\n"
+        "int main(void) { int value; scanf(\"%d\", &value); printf(\"%d\\n\", value * 2); }\n"
+    )
+    (task / "private" / "baseline.c").write_text(solution, encoding="utf-8")
+    (submission / "solution.c").write_text(solution, encoding="utf-8")
+    seccomp = Path(__file__).parents[1] / "src" / "brunost_judge" / "security" / "seccomp-v1.json"
+
+    result = DockerSandboxRunner(
+        os.environ["BRUNOST_JUDGE_SANDBOX_IMAGE"],
+        os.environ.get("BRUNOST_JUDGE_SANDBOX_RUNTIME", "runc"),
+        timeout_seconds=30,
+        seccomp_profile=str(seccomp),
+    ).run(submission, task, "docker-optimization-native-baseline")
+
+    assert result["status"] == "completed", result
+    assert result["score"] == pytest.approx(1.0), result
+    assert result["metrics"]["verdict"] == "OK", result
 
 
 def test_docker_sandbox_runs_game_plugin_bundle(tmp_path: Path):

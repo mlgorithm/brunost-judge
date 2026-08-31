@@ -1,0 +1,14 @@
+version: 1
+kind: optimization
+runner: optimization
+language: python
+time_limit_ms: 1000
+memory_limit_mb: 256
+output_limit_bytes: 65536
+network: disabled
+evaluation: evaluator:evaluate
+objective_direction: maximize
+score_mode: checker_score
+aggregation: mean
+evaluator_entrypoint: private/evaluator.py
+baseline_enabled: false

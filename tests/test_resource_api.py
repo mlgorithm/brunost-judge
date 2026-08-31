@@ -37,15 +37,36 @@ def test_agent_game_and_match_api(tmp_path: Path):
     submission.mkdir()
     client = TestClient(create_app(tmp_path / "judge.db"))
 
-    assert client.post("/v1/tasks", json={"task_ref": "game/v1", "path": str(task)}).status_code == 201
+    registered_task = client.post(
+        "/v1/tasks",
+        json={"task_ref": "game/v1", "path": str(task), "resource_profile": {"memory_mb": 2048}},
+    )
+    assert registered_task.status_code == 201
+    assert registered_task.json()["manifest"]["resource_profile_mode"] == "planning_only"
     agent = client.post(
         "/v1/agents",
-        json={"agent_id": "baseline", "name": "Baseline", "artifact_path": str(submission)},
+        json={
+            "agent_id": "baseline",
+            "name": "Baseline",
+            "artifact_path": str(submission),
+            "resource_profile": {"cpu_cores": 2},
+        },
     )
     assert agent.status_code == 201
+    assert agent.json()["resource_profile_mode"] == "planning_only"
     assert client.get("/v1/agents/baseline").json()["name"] == "Baseline"
-    game = client.post("/v1/games", json={"game_id": "connect4", "name": "Connect Four", "task_ref": "game/v1", "seats": 2})
+    game = client.post(
+        "/v1/games",
+        json={
+            "game_id": "connect4",
+            "name": "Connect Four",
+            "task_ref": "game/v1",
+            "seats": 2,
+            "resource_profile": {"gpu_count": 1},
+        },
+    )
     assert game.status_code == 201
+    assert game.json()["resource_profile_mode"] == "planning_only"
     match = client.post(
         "/v1/games/connect4/matches",
         json={
@@ -153,6 +174,13 @@ def test_enrolled_worker_can_refresh_runtime_capabilities_without_re_registering
     assert updated.status_code == 200
     assert updated.json()["capabilities"] == ["runtime:python-3.13", "runtime:python-3.13-ml-v1"]
     assert updated.json()["queues"] == ["default"]
+    escalated = client.post(
+        "/v1/workers/runtime-worker/capabilities",
+        headers=worker_headers,
+        json={"capabilities": ["runtime:python-3.13", "gpu:true"]},
+    )
+    assert escalated.status_code == 422
+    assert "enrollment grant" in escalated.json()["detail"]
     assert client.post(
         "/v1/workers/runtime-worker/capabilities",
         headers={"Authorization": "Bearer wrong"},

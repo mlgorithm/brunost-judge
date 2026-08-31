@@ -46,7 +46,7 @@ services:
       BRUNOST_JUDGE_SANDBOX_IMAGES: ${BRUNOST_JUDGE_SANDBOX_IMAGES:-}
       BRUNOST_JUDGE_SANDBOX_RUNTIME: ${BRUNOST_JUDGE_SANDBOX_RUNTIME:-runsc}
       BRUNOST_JUDGE_REQUIRE_SECCOMP: "true"
-      BRUNOST_JUDGE_SANDBOX_SECCOMP: ${BRUNOST_JUDGE_SANDBOX_SECCOMP:-/etc/docker/seccomp/brunost-seccomp.json}
+      BRUNOST_JUDGE_SANDBOX_SECCOMP: /etc/docker/seccomp/brunost-seccomp-v1.json
       BRUNOST_JUDGE_SANDBOX_TIMEOUT_SECONDS: ${BRUNOST_JUDGE_SANDBOX_TIMEOUT_SECONDS:-900}
       BRUNOST_JUDGE_SANDBOX_MEMORY: ${BRUNOST_JUDGE_SANDBOX_MEMORY:-4g}
       BRUNOST_JUDGE_SANDBOX_CPUS: ${BRUNOST_JUDGE_SANDBOX_CPUS:-2}
@@ -61,4 +61,4 @@ services:
     volumes:
       - ${BRUNOST_JUDGE_TASK_ROOT:-./examples}:/tasks:ro
       - ${BRUNOST_JUDGE_SUBMISSION_ROOT:-./local-submissions}:/submissions
-      - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-/srv/brunost/security/brunost-seccomp.json}:/etc/docker/seccomp/brunost-seccomp.json:ro
+      - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-./src/brunost_judge/security/seccomp-v1.json}:/etc/docker/seccomp/brunost-seccomp-v1.json:ro

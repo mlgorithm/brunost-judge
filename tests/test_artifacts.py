@@ -1,4 +1,5 @@
 import io
+import os
 import tarfile
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from brunost_judge.artifacts import (
 from brunost_judge.server import create_app
 from brunost_judge.store import JudgeStore
 from brunost_judge.worker import LocalWorker
+from grader.agent_runtime import AgentSpec, resolve_agent_command
 
 
 def _task(root: Path) -> Path:
@@ -103,6 +105,20 @@ def test_pack_directory_enforces_a_source_size_limit(tmp_path: Path):
 def test_directory_bundle_is_deterministic(tmp_path: Path):
     task = _task(tmp_path)
     assert pack_directory(task) == pack_directory(task)
+
+
+def test_safe_extract_preserves_only_safe_executable_bits_for_agent_bundle(tmp_path: Path):
+    agent = tmp_path / "agent-source"
+    agent.mkdir()
+    executable = agent / "agent"
+    executable.write_text("#!/bin/sh\necho ready\n", encoding="utf-8")
+    executable.chmod(0o775)
+
+    extracted = safe_extract(pack_directory(agent), tmp_path / "agent-extracted")
+    restored = extracted / "agent"
+    assert restored.stat().st_mode & 0o777 == 0o755
+    assert os.access(restored, os.X_OK)
+    assert resolve_agent_command(AgentSpec("native-agent", 0, str(extracted))) == ("./agent",)
 
 
 def test_generated_bytecode_is_not_part_of_artifact_or_task_digest(tmp_path: Path):

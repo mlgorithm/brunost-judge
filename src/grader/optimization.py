@@ -15,7 +15,6 @@ import multiprocessing
 import os
 import signal
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,12 +23,14 @@ from grader.classic import (
     ClassicConfig,
     _compile,
     _CompileFailure,
+    _copy_compiled_runtime,
     _limit_child,
     _manifest,
     _normalize_language,
     _run_process,
     _safe_relative,
     _source_path,
+    _temporary_workspace,
 )
 
 MAX_DIAGNOSTIC_CHARS = 4000
@@ -337,7 +338,17 @@ def _evaluate(
         process.join(timeout=1)
 
 
-def _run_solution(command: list[str], input_path: Path, output_path: Path, config: OptimizationConfig) -> Any:
+def _run_solution(
+    command: list[str],
+    input_path: Path,
+    output_path: Path,
+    config: OptimizationConfig,
+    *,
+    sandbox: bool = True,
+    drop_privileges: bool | None = None,
+) -> Any:
+    if drop_privileges is None:
+        drop_privileges = os.environ.get("BRUNOST_JUDGE_CLASSIC_DROP_PRIVILEGES", "false").lower() == "true"
     return _run_process(
         command,
         cwd=output_path.parent,
@@ -346,7 +357,8 @@ def _run_solution(command: list[str], input_path: Path, output_path: Path, confi
         timeout_ms=config.time_limit_ms,
         memory_mb=config.memory_limit_mb,
         output_limit_bytes=config.output_limit_bytes,
-        drop_privileges=os.environ.get("BRUNOST_JUDGE_CLASSIC_DROP_PRIVILEGES", "false").lower() == "true",
+        sandbox=sandbox,
+        drop_privileges=drop_privileges,
     )
 
 
@@ -399,12 +411,15 @@ def run_optimization(submission_path: str, assets_path: str) -> dict[str, Any]:
             reference_language=config.language,
             reference_entrypoint=None,
         )
-        with tempfile.TemporaryDirectory(prefix="brunost-optimization-") as temporary:
+        with _temporary_workspace(prefix="brunost-optimization-") as temporary, _temporary_workspace(
+            prefix="brunost-optimization-baseline-"
+        ) as baseline_temporary:
             root = Path(temporary)
-            # TemporaryDirectory is intentionally 0700.  The candidate is
-            # executed as UID 65533, so the evaluator workspace itself must
-            # be searchable even though its contents remain private.
-            root.chmod(0o755)
+            # Interpreters must be able to resolve their CWD after the UID
+            # drop, so this root is searchable but not listable.  Private task
+            # inputs and baseline artifacts stay under distinct 0700 roots;
+            # _compile narrows only the candidate child workspace.
+            root.chmod(0o711)
             candidate_dir = root / "candidate"
             candidate_dir.mkdir()
             source = _source_path(submission, judge_config)
@@ -437,12 +452,26 @@ def run_optimization(submission_path: str, assets_path: str) -> dict[str, Any]:
                 baseline_path = _safe_relative(task, config.baseline_entrypoint)
                 if not baseline_path.is_file():
                     raise OptimizationJudgeError(f"optimization baseline does not exist: {config.baseline_entrypoint}")
-                baseline_dir = root / "baseline"
+                baseline_dir = Path(baseline_temporary) / "work"
                 baseline_dir.mkdir()
-                baseline_command, _ = _compile(baseline_path, judge_config, baseline_dir)
+                baseline_dir.chmod(0o700)
+                with _temporary_workspace(prefix="brunost-optimization-baseline-compile-") as compile_temporary:
+                    compile_root = Path(compile_temporary)
+                    compile_root.chmod(0o711)
+                    compile_dir = compile_root / "work"
+                    compile_dir.mkdir()
+                    baseline_command, _ = _compile(baseline_path, judge_config, compile_dir)
+                    _copy_compiled_runtime(baseline_path, compile_dir, baseline_dir)
                 for index, input_path in enumerate(inputs):
                     output_path = baseline_dir / f"output-{index}.txt"
-                    outcome = _run_solution(baseline_command, input_path, output_path, config)
+                    outcome = _run_solution(
+                        baseline_command,
+                        input_path,
+                        output_path,
+                        config,
+                        sandbox=False,
+                        drop_privileges=False,
+                    )
                     if outcome.verdict != "OK":
                         raise OptimizationJudgeError(f"baseline failed on {input_path.name}: {outcome.verdict}")
                     result = _evaluate(task, config.evaluator_entrypoint, input_path, output_path, config)

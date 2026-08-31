@@ -35,7 +35,7 @@ Before an official contest, operators must provide:
 - a durable callback dispatcher (`brunost callback-dispatcher`) running on the
   control plane. Terminal results and callback outbox rows are committed in
   one database transaction, so worker loss after finishing an evaluation does
-  not lose the Premium notification;
+  not lose the integrating platform's notification;
 - one-time node enrollment with `BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true` and
   a separate scoped credential per worker;
 - backups, monitoring, alerting, and a rehearsed restore/failover plan;
@@ -49,7 +49,6 @@ use the hardened overlay:
 ```bash
 export BRUNOST_JUDGE_SANDBOX_IMAGE='ghcr.io/example/brunost-judge-runtime@sha256:<64-hex-digest>'
 export BRUNOST_JUDGE_SANDBOX_RUNTIME=runsc   # or a certified Kata runtime
-export BRUNOST_JUDGE_SANDBOX_SECCOMP=/etc/docker/seccomp/brunost-seccomp.json
 export BRUNOST_JUDGE_SANDBOX_IMAGES='{"python-3.13":"ghcr.io/example/brunost-judge-runtime@sha256:<64-hex-digest>","python-3.13-ml-v1":"ghcr.io/example/brunost-judge-runtime-ml@sha256:<64-hex-digest>"}'
 docker compose -f docker-compose.yml -f docker-compose.production.yml up --build -d
 ```
@@ -60,13 +59,23 @@ That makes the reference deployment runnable without weakening their
 read-only root filesystems. It is still a single-host convenience volume: use
 an S3/MinIO-compatible backend for a multi-host control plane and workers.
 
-The overlay makes the worker's Docker socket explicit, but every evaluator is
-still launched with no network, read-only rootfs, dropped capabilities, quotas,
-and the configured gVisor/Kata runtime. The classic runner gives the evaluator
-root access only to the private task tmpfs, then drops contestant/compiler
-processes to dedicated UID 65533; task assets are never mounted into that
-contestant process. On runtimes that permit it, bubblewrap adds a second mount
-namespace as defense in depth. Build the sandbox image with
+The overlay bind-mounts the checked-in, versioned
+`src/brunost_judge/security/seccomp-v1.json` profile and passes it to every
+evaluator. It is the maintained Docker Engine v28.5.2 default allowlist
+profile, vendored as a release-controlled asset; task execution has no retained
+Docker capabilities that would enable its conditional privileged calls. Keep
+the default mount or point `BRUNOST_JUDGE_SECCOMP_HOST_PATH` only at a reviewed
+copy of that exact profile. `brunost cluster init` writes the same file into
+the generated worker bundle under `security/brunost-seccomp-v1.json`.
+
+Every evaluator is also launched with no network, read-only rootfs, dropped
+capabilities, quotas, and the configured gVisor/Kata runtime. The evaluator is
+root only long enough to extract the root-only task tmpfs. Every native
+compiler is unconditionally dropped to UID 65533 before it processes staged
+submission/reference/baseline source, and every contestant runtime uses that
+identity; private task assets are never readable by those processes. On
+runtimes that permit it, bubblewrap adds a second mount namespace as defense
+in depth. Build the sandbox image with
 `Dockerfile.sandbox` on top of the pinned task runtime, then publish it by
 digest. Build `Dockerfile.sandbox.ml` for the `python-3.13-ml-v1` entry and map
 it with `BRUNOST_JUDGE_SANDBOX_IMAGES`; unmapped non-default runtimes fail closed.
@@ -119,8 +128,8 @@ workers; workers should use the credential returned by `brunost node join`.
 
 - `scripts/canary.sh` uploads immutable task/submission artifacts, registers the
   CPU task by digest, submits twice with one idempotency key, and waits for a
-  terminal result. Set `BRUNOST_JUDGE_CANARY_CALLBACK_URL` to exercise the
-  Premium callback receiver as part of the run.
+  terminal result. Set `BRUNOST_JUDGE_CANARY_CALLBACK_URL` to exercise an
+  integrating platform's callback receiver as part of the run.
 - `scripts/backup_postgres.sh` writes an atomic custom-format dump and checksum;
   copy the resulting directory to a different failure domain.
 - `scripts/restore_drill.sh` restores that dump into a throwaway PostgreSQL
@@ -133,13 +142,11 @@ The HTTP-level artifact, enrollment, callback-signature, idempotency, and lease
 reclaim path is also exercised by `tests/test_distributed_canary.py` before a
 release is promoted.
 
-Premium should switch traffic using its existing gateway and outbox, not by
-sharing Judge tables. Configure `BRUNOST_JUDGE_CALLBACK_HOSTS` with the
-hostname in Premium's `BRUNOST_JUDGE_CALLBACK_URL`, and use the same callback
-signing secret on both services. The open-source `brunost-deploy` repository
-automates this Judge control-plane/worker deployment boundary; it does not
-deploy Premium. Keep the current in-repo worker available until the canary has
-passed and a rollback window has closed.
+An integrating platform should switch traffic using its own gateway and outbox,
+not by sharing Judge tables. Configure `BRUNOST_JUDGE_CALLBACK_HOSTS` with the
+receiver hostname and use the same callback signing secret on both services.
+Keep a known-good worker pool available until the canary has passed and a
+rollback window has closed.
 
 ## Configuration safety gate
 

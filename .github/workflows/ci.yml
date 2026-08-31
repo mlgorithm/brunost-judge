@@ -25,6 +25,8 @@ jobs:
       - run: ruff check src tests
       - run: python -m compileall -q src tests
       - run: pytest -q
+      - run: python scripts/check_public_contract.py
+      - run: python scripts/export_openapi.py /tmp/brunost-judge-openapi.json
 
   images:
     runs-on: ubuntu-latest

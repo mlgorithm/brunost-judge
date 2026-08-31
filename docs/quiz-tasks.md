@@ -4,6 +4,8 @@ Quiz tasks are deterministic, answer-file evaluations. They do not execute
 participant code. The answer key is private to the Judge and the participant
 uploads one bounded JSON file.
 
+The complete minimal package is [`../examples/quiz-basics`](../examples/quiz-basics).
+
 ## Manifest
 
 ```yaml
@@ -12,7 +14,8 @@ kind: quiz
 runner: quiz
 answer_key: private/questions.json
 submission_file: answers.json
-scoring_mode: weighted # or all_or_nothing
+scoring_mode: weighted
+# Use all_or_nothing to require every answer.
 free_text_normalization: casefold_trim
 network: disabled
 ```
@@ -89,4 +92,3 @@ submissions receive a completed zero-score `INVALID_SUBMISSION` verdict.
 one only when every question is correct. Results include aggregate counts,
 points, scoring configuration, and per-question correctness/points metadata,
 but never include the answer key or the participant's raw answers.
-

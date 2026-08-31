@@ -1,0 +1,23 @@
+{
+  "title": "Judge basics",
+  "questions": [
+    {
+      "id": "language",
+      "type": "single_choice",
+      "prompt": "Which language is commonly used for Judge task authors?",
+      "choices": [
+        {"id": "python", "text": "Python"},
+        {"id": "other", "text": "A hidden answer"}
+      ],
+      "answer": "python",
+      "points": 1
+    },
+    {
+      "id": "immutable",
+      "type": "free_text",
+      "prompt": "What property identifies a registered task artifact?",
+      "accepted_answers": ["immutable", "content addressed"],
+      "points": 1
+    }
+  ]
+}

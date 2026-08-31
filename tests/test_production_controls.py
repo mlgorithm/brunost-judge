@@ -67,6 +67,27 @@ def test_worker_claim_filters_required_capabilities(tmp_path: Path):
     assert claimed[0].task_ref == "gpu/v1"
 
 
+def test_capability_filter_scans_past_an_incompatible_queue_head(tmp_path: Path):
+    store = _store(tmp_path)
+    store.register_task(
+        TaskRecord(
+            "gpu/v1",
+            str(tmp_path / "task"),
+            "ioai",
+            {"required_capabilities": ["gpu:true"]},
+        )
+    )
+    submission = tmp_path / "submission"
+    submission.mkdir()
+    for index in range(100):
+        store.submit(ExecutionRequest("gpu/v1", str(submission), f"gpu-head-{index}", priority=10))
+    compatible = store.submit(ExecutionRequest("demo/v1", str(submission), "cpu-after-gpu-head", priority=0))
+
+    claimed = store.claim_next(worker_id="cpu-1", capabilities=("resource:cpu",))
+    assert claimed is not None
+    assert claimed[0].execution_id == compatible.execution_id
+
+
 def test_task_refs_are_immutable_and_only_the_lease_owner_can_finish(tmp_path: Path):
     store = _store(tmp_path)
     task_path = tmp_path / "replacement-task"

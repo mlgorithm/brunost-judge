@@ -4,8 +4,6 @@ The compatibility ``grader`` package remains importable for task packages that
 were authored before the standalone repository was extracted.
 """
 
-__version__ = "1.3.1"
-
 from brunost_judge.adapters import (
     DockerAdapter,
     KubernetesAdapter,
@@ -81,6 +79,7 @@ from brunost_judge.scheduler import (
     WorkerAdvertisement,
 )
 from brunost_judge.task import task_digest
+from brunost_judge.version import __version__
 from grader.harness import normalize_result, run
 
 __all__ = [
@@ -128,6 +127,7 @@ __all__ = [
     "TaskDefinition",
     "WorkerAdvertisement",
     "WorkerRecord",
+    "__version__",
     "artifact_id",
     "assert_conformant",
     "decode_message",
@@ -144,4 +144,3 @@ __all__ = [
     "validate_result_payload",
     "validate_runner_result_payload",
 ]
-__version__ = "1.2.0"

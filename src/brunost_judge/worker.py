@@ -35,6 +35,7 @@ from brunost_judge.sdk import JudgeClient
 from brunost_judge.security import callback_signature
 from brunost_judge.store import JudgeStore
 from brunost_judge.task import task_digest
+from brunost_judge.version import __version__
 
 LOGGER = logging.getLogger(__name__)
 
@@ -251,7 +252,7 @@ _CALLBACK_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 def _notify(url: str, token: str | None, payload: dict, signing_secret: str | None = None) -> None:
     body = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "brunost-judge-worker/1.3.1"}
+    headers = {"Content-Type": "application/json", "User-Agent": f"brunost-judge-worker/{__version__}"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if signing_secret:

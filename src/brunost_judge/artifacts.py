@@ -147,6 +147,9 @@ def safe_extract(
             target = root / PurePosixPath(member.name).as_posix()
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
+                # Do not retain group/world-writable or special directory
+                # modes from an untrusted archive.
+                target.chmod(0o755)
                 continue
             source = archive.extractfile(member)
             if source is None:
@@ -156,6 +159,10 @@ def safe_extract(
                 raise ArtifactError("artifact extraction encountered a symlink")
             with source, target.open("xb") as output:
                 shutil.copyfileobj(source, output)
+            # Agent bundles may contain a native executable or shell entry
+            # point. Preserve only the fact that it was executable; never
+            # restore archive-controlled writable or special permission bits.
+            target.chmod(0o755 if member.mode & 0o111 else 0o644)
     return root
 
 

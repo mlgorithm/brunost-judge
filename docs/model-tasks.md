@@ -5,6 +5,8 @@ the Judge runs prediction against each evaluation split, and an author-owned
 evaluator scores the resulting predictions. There is no artifact-only model
 mode and no model-specific `metrics.py` contract.
 
+The complete minimal package is [`../examples/model-basics`](../examples/model-basics).
+
 ## Package layout
 
 ```text
@@ -57,8 +59,8 @@ post_competition_enabled: false
 The two public fields must be declared together. `model_max_bytes` limits the
 artifact produced by `train()` and is also bounded by the Judge's 64 MB safety
 limit. The total time limit is the complete budget; each phase also has its own
-ceiling. Premium calculates the total from the phase limits when it publishes a
-package.
+ceiling. Task publishers calculate the total from the phase limits when they
+publish a package.
 
 ## Submission contract
 
@@ -134,13 +136,14 @@ post_evaluator_entrypoint: post_evaluator.py
 
 The same submitted module is trained from scratch on the new training data,
 evaluated on the new hidden test set, and scored with `post_evaluator.py` (or
-the live evaluator if no separate code is supplied by Premium). Workers select
-this profile through execution metadata; it is not participant-controlled.
-Premium can keep the result in a separate post-competition leaderboard.
+the live evaluator if no separate code is supplied). Workers select this
+profile through execution metadata; it is not participant-controlled. The
+integrating platform can keep the result in a separate post-competition
+leaderboard.
 
 ## Runtime image
 
-Premium publishes `python-3.13-ml-v1`. Operators must map that runtime to a
+`python-3.13-ml-v1` is the reference ML runtime. Operators must map it to a
 digest-pinned sandbox image containing the supported CPU ML libraries:
 
 ```text

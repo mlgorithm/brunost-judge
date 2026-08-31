@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 
@@ -37,7 +38,9 @@ def test_docker_runner_uses_hardened_flags(tmp_path: Path, monkeypatch):
         assert "--pids-limit" in command
         assert "--init" in command
         assert "--ulimit" in command
+        assert "/workspace/work:rw,exec,nosuid,nodev,size=256m" in command
         assert "BRUNOST_JUDGE_TASK_BUNDLE=stdin" in command
+        assert "BRUNOST_JUDGE_WORK_ROOT=/workspace/work" in command
         assert not any("/workspace/assets" in value for value in command)
         volume_args = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--volume"]
         output_mount = next(value for value in volume_args if value.endswith(":/workspace/output:rw"))
@@ -48,6 +51,27 @@ def test_docker_runner_uses_hardened_flags(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("brunost_judge.sandbox.subprocess.run", fake_run)
     result = DockerSandboxRunner("judge@sha256:" + "a" * 64, "runsc").run(submission, task, "exec-1")
     assert result["status"] == "completed"
+
+
+def test_bundled_seccomp_profile_is_versioned_and_fails_closed():
+    profile_path = Path(__file__).parents[1] / "src" / "brunost_judge" / "security" / "seccomp-v1.json"
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+
+    assert profile["defaultAction"] == "SCMP_ACT_ERRNO"
+    assert profile["defaultErrnoRet"] == 1
+    assert any(
+        entry["action"] == "SCMP_ACT_ERRNO" and "clone3" in entry["names"]
+        for entry in profile["syscalls"]
+    )
+    privileged = next(entry for entry in profile["syscalls"] if "mount" in entry["names"])
+    assert privileged["includes"]["caps"] == ["CAP_SYS_ADMIN"]
+
+
+def test_production_compose_uses_the_bundled_versioned_seccomp_profile():
+    compose = (Path(__file__).parents[1] / "docker-compose.production.yml").read_text(encoding="utf-8")
+
+    assert "BRUNOST_JUDGE_SANDBOX_SECCOMP: /etc/docker/seccomp/brunost-seccomp-v1.json" in compose
+    assert "./src/brunost_judge/security/seccomp-v1.json" in compose
 
 
 def test_docker_runner_passes_model_evaluation_profile(tmp_path: Path, monkeypatch):

@@ -9,7 +9,7 @@ can run it in its own infrastructure.
 - Pin the API and worker images by digest.
 - Set unique random values for `BRUNOST_JUDGE_API_TOKEN`,
   `BRUNOST_JUDGE_CALLBACK_SIGNING_SECRET`, and the database password.
-- Configure `BRUNOST_TASK_ROOT` and `BRUNOST_SUBMISSION_ROOT` to mounted,
+- Configure `BRUNOST_JUDGE_TASK_ROOT` and `BRUNOST_JUDGE_SUBMISSION_ROOT` to mounted,
   read-only/read-write paths respectively.
 - Confirm the task package hash and scorer version in the contest manifest.
 - Confirm PostgreSQL backups and a tested restore in a separate environment.

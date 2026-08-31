@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
+from brunost_judge.artifacts import artifact_id, pack_directory
+from brunost_judge.server import create_app
 from brunost_judge.task import validate_task
 
 
@@ -97,3 +101,31 @@ def test_validate_model_rejects_legacy_manifest(tmp_path: Path):
     assert not result.valid
     assert "unsupported judge.yaml version" in " ".join(result.errors)
     assert "model_contract" in " ".join(result.errors)
+
+
+def test_model_artifact_registration_uses_package_identity_fields(tmp_path: Path, monkeypatch):
+    """An immutable task ref cannot be accidentally registered as v1/classic."""
+
+    monkeypatch.setenv("BRUNOST_JUDGE_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    bundle = pack_directory(_model_task(tmp_path / "task"))
+    identifier = artifact_id(bundle)
+    client = TestClient(create_app(tmp_path / "judge.db"))
+
+    assert client.put(f"/v1/artifacts/{identifier}", content=bundle).status_code == 201
+    registered = client.post(
+        "/v1/tasks",
+        json={"task_ref": "model/v2", "artifact_id": identifier},
+    )
+    assert registered.status_code == 201
+    manifest = registered.json()["manifest"]
+    assert manifest["kind"] == "model"
+    assert manifest["version"] == 2
+    assert manifest["runtime"] == "python-3.13-ml-v1"
+    assert manifest["evaluator"] == "evaluator:evaluate"
+
+    mismatched = client.post(
+        "/v1/tasks",
+        json={"task_ref": "model/v2-mismatched", "artifact_id": identifier, "version": 1},
+    )
+    assert mismatched.status_code == 422
+    assert "version" in mismatched.json()["detail"]

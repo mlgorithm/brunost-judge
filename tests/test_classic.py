@@ -6,7 +6,13 @@ from brunost_judge.contracts import ExecutionRequest, TaskRecord
 from brunost_judge.store import JudgeStore
 from brunost_judge.task import validate_task
 from brunost_judge.worker import LocalWorker, _execution_timeout
-from grader.classic import _sandbox_command, run_classic
+from grader.classic import (
+    ClassicConfig,
+    ProcessOutcome,
+    _compile,
+    _sandbox_command,
+    run_classic,
+)
 from grader.harness import run
 
 
@@ -121,6 +127,46 @@ def test_classic_reference_runner_rejects_wrong_submission_without_answer_files(
     assert result["status"] == "completed", result
     assert result["score"] == pytest.approx(0.0)
     assert result["metrics"]["verdict"] == "WA"
+
+
+def test_native_compile_is_always_unprivileged_and_uses_a_non_listable_workspace(tmp_path, monkeypatch):
+    """The shared compiler path serves coding, interactive, and optimization."""
+
+    source = tmp_path / "candidate.c"
+    source.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+    build_dir = tmp_path / "private-evaluator-root" / "work"
+    build_dir.mkdir(parents=True)
+    received: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        received["command"] = command
+        received.update(kwargs)
+        return ProcessOutcome("OK", 1.0, 0, "")
+
+    monkeypatch.setattr("grader.classic.shutil.which", lambda _: "/usr/bin/gcc")
+    monkeypatch.setattr("grader.classic._run_process", fake_run)
+    _compile(
+        source,
+        ClassicConfig(
+            kind="coding",
+            language="c",
+            entrypoint=None,
+            interactor="",
+            time_limit_ms=1000,
+            memory_limit_mb=256,
+            output_limit_bytes=65536,
+            answer_source="answer_key",
+            scoring_mode="all_or_nothing",
+            reference_language="c",
+            reference_entrypoint=None,
+        ),
+        build_dir,
+    )
+
+    assert received["drop_privileges"] is True
+    assert received["sandbox"] is True
+    assert build_dir.stat().st_mode & 0o777 == 0o733
+    assert (build_dir / "candidate.c").stat().st_mode & 0o777 == 0o644
 
 
 def test_classic_runner_awards_percentage_for_solved_tests(tmp_path):

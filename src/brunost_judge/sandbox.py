@@ -216,6 +216,9 @@ class DockerSandboxRunner:
                 "--pids-limit", str(self.pids_limit), "--memory", self.memory,
                 "--cpus", self.cpus, "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m",
                 "--tmpfs", "/dev/shm:rw,noexec,nosuid,nodev,size=64m",
+                # /tmp stores private task assets and stays noexec.  Native
+                # contestant builds use this independent executable tmpfs.
+                "--tmpfs", "/workspace/work:rw,exec,nosuid,nodev,size=256m",
                 # The evaluator needs root only to read the root-only task tmpfs
                 # and drop the contestant process to dedicated UID 65533. The evaluator
                 # container still has no network, no filesystem write access,
@@ -228,6 +231,7 @@ class DockerSandboxRunner:
                 "--env", "RESULT_PATH=/workspace/output/results.json",
                 "--env", "RESULT_ARTIFACTS_PATH=/workspace/output/artifacts",
                 "--env", "HOME=/tmp",
+                "--env", "BRUNOST_JUDGE_WORK_ROOT=/workspace/work",
                 # The task bundle is delivered on evaluator stdin and extracted
                 # into root-only tmpfs; it is never mounted into the container.
                 "--env", "BRUNOST_JUDGE_CLASSIC_USE_BWRAP=false",

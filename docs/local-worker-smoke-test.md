@@ -10,10 +10,11 @@ SQLite and filesystem-artifact storage on the local machine.
 
 ## 1. Install the Judge
 
-In Terminal 1:
+From the repository checkout, set this once in every terminal below:
 
 ```bash
-cd /Users/sam.urmian/Documents/github/brunost-judge
+export BRUNOST_JUDGE_REPO=/path/to/brunost-judge
+cd "$BRUNOST_JUDGE_REPO"
 python3 -m venv .venv-local
 source .venv-local/bin/activate
 python -m pip install -e '.[server]'
@@ -54,7 +55,7 @@ outage is retried by the remote worker without terminating the worker loop.
 In Terminal 2, use the path printed by Terminal 1:
 
 ```bash
-cd /Users/sam.urmian/Documents/github/brunost-judge
+cd "$BRUNOST_JUDGE_REPO"
 source .venv-local/bin/activate
 
 export BRUNOST_TEST_ROOT="/tmp/PASTE-THE-PATH-HERE"
@@ -87,7 +88,7 @@ issue a new token instead of retrying the old one.
 In Terminal 3:
 
 ```bash
-cd /Users/sam.urmian/Documents/github/brunost-judge
+cd "$BRUNOST_JUDGE_REPO"
 source .venv-local/bin/activate
 
 export BRUNOST_JUDGE_SANDBOX_MODE=process
@@ -107,7 +108,7 @@ task, and posts the result.
 In a fourth terminal, with the same virtual environment and test-root path:
 
 ```bash
-cd /Users/sam.urmian/Documents/github/brunost-judge
+cd "$BRUNOST_JUDGE_REPO"
 source .venv-local/bin/activate
 
 export BRUNOST_TEST_ROOT="/tmp/PASTE-THE-PATH-HERE"

@@ -82,7 +82,7 @@ def test_ioai_manifest_controls_registration_and_scheduling(tmp_path: Path):
         json={
             "task_ref": "ioai/gpu-v1",
             "path": str(task),
-            "runtime": "caller-cannot-override-task-runtime",
+            "runtime": "python-3.13-cpu",
             "required_capabilities": ["runtime:docker"],
         },
     )
@@ -129,8 +129,8 @@ def test_coding_manifest_controls_runtime_scheduling_and_execution_budget(tmp_pa
         json={
             "task_ref": "classic/gpu-v1",
             "path": str(task),
-            "runtime": "caller-cannot-override-classic-runtime",
-            "evaluator": "caller-cannot-override-classic-evaluator",
+            "runtime": "classic-python-v1",
+            "evaluator": "grader.classic:run_classic",
             "required_capabilities": ["runtime:docker"],
         },
     )

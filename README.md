@@ -1,13 +1,19 @@
 # Brunost Judge
 
-Current release: `1.3.1` — local match execution, formal agent protocols, portable artifacts, worker credentials, scoped service authentication, secret-file loading, audit logging, rate limiting, signed callbacks, capability scheduling, provider adapters, deterministic game contracts, replay artifact results, and durable callback delivery.
+Current release: `1.3.1` — local match execution, formal agent protocols,
+portable artifacts, scoped service authentication, signed callbacks,
+capability scheduling, deterministic game contracts, replay artifacts, and
+durable callback delivery. See [the release notes](CHANGELOG.md) and
+[release process](docs/releases.md) for the supported public contract.
 
-Brunost Judge is the platform-independent judging layer for scorer-backed IOAI
-and output-only tasks, plus versioned model, optimization, quiz, coding, interactive, and agent
-runners. Model tasks use the dedicated `train_predict_v2` lifecycle. It is intentionally separate from the NOKI/Brunost education
-platform: task authors can use the core and CLI directly, while an LMS or contest
-platform integrates through the SDK/API boundary. The built-in runtime fails
-closed for runner kinds that do not have an installed evaluator plugin.
+Brunost Judge is a platform-independent execution service for contests and
+assessments. Its current user-facing task families are deterministic `coding`,
+machine-learning `model`, `quiz`, and `optimization`. It also retains advanced
+or compatibility kinds for generic scorer, interactive, agent, and game
+workloads. Model tasks use the dedicated `train_predict_v2` lifecycle.
+Task authors can use the core and CLI directly; an LMS or contest platform
+integrates through the SDK/API boundary. The built-in runtime fails closed for
+runner kinds that do not have an installed evaluator plugin.
 
 The distribution includes the scorer core, task package validator, local CLI,
 SQLite development control plane, optional PostgreSQL control plane, HTTP API,
@@ -18,10 +24,10 @@ High-assurance runtime availability remains a host certification step.
 ## Quick start
 
 ```bash
+# From a source checkout. Python 3.11 or newer is required.
 python -m pip install -e '.[dev]'
-brunost task new ioai tasks/example
-brunost task validate tasks/example
-brunost run tasks/example --submission ./submission
+brunost task validate examples/deterministic-sum
+brunost run examples/deterministic-sum --submission examples/canary-deterministic-sum
 
 # standalone API + worker
 export BRUNOST_JUDGE_API_TOKEN=local-development-only
@@ -50,9 +56,9 @@ export BRUNOST_JUDGE_ARTIFACT_ENDPOINT=https://s3.example.org
 Artifact object keys are content-addressed and verified on upload and
 download. Filesystem storage remains the default for local single-node use.
 
-The generated task can be run locally without a database, Redis, cloud account,
-or Brunost platform. Official workers mount the same task package into a sealed
-sandbox.
+The bundled coding example runs locally without a database, Redis, cloud
+account, or companion platform. Official workers stage the same immutable task
+package into a sealed sandbox.
 
 ## Standalone API
 
@@ -117,6 +123,13 @@ in CI.
 The API and provider model are documented in [`docs/api.md`](docs/api.md) and
 [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md).
 
+## Project health
+
+Contributions follow [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+[`GOVERNANCE.md`](GOVERNANCE.md). Use [`SUPPORT.md`](SUPPORT.md) for public
+help and [`SECURITY.md`](SECURITY.md) for private vulnerability reporting.
+Every stable release follows [`docs/releases.md`](docs/releases.md).
+
 ## Documentation guide
 
 Use the document that matches the role you are performing; the Judge keeps
@@ -126,7 +139,7 @@ execution concerns separate from contest and identity policy.
 | --- | --- | --- |
 | Trying the Judge on one machine | [`docs/standalone.md`](docs/standalone.md) | [`docs/local-worker-smoke-test.md`](docs/local-worker-smoke-test.md) |
 | Integrating an LMS, contest system, or submission service | [`docs/api.md`](docs/api.md) | [`docs/ownership.md`](docs/ownership.md) and [`docs/architecture.md`](docs/architecture.md) |
-| Authoring a task | This README’s runner sections | [`docs/classic-tasks.md`](docs/classic-tasks.md), [`docs/model-tasks.md`](docs/model-tasks.md), [`docs/optimization-tasks.md`](docs/optimization-tasks.md), or [`docs/plugins.md`](docs/plugins.md) |
+| Authoring a task | [`docs/task-types.md`](docs/task-types.md) | [`docs/classic-tasks.md`](docs/classic-tasks.md), [`docs/model-tasks.md`](docs/model-tasks.md), [`docs/quiz-tasks.md`](docs/quiz-tasks.md), [`docs/optimization-tasks.md`](docs/optimization-tasks.md), or [`docs/plugins.md`](docs/plugins.md) |
 | Adding a CPU/GPU worker node | [`docs/node-onboarding.md`](docs/node-onboarding.md) | [`docs/adapters-and-scheduling.md`](docs/adapters-and-scheduling.md) |
 | Operating a shared or official contest deployment | [`docs/production.md`](docs/production.md) | [`docs/rollout.md`](docs/rollout.md) and [`docs/architecture.md`](docs/architecture.md) |
 
@@ -134,6 +147,16 @@ The most useful production reading order is: architecture, API contract,
 production profile, node onboarding, then the supervised rollout checklist.
 The OpenAPI schema at `/openapi.json` is the authoritative field-level HTTP
 reference for the version of the server you are running.
+
+## Task types and compatibility
+
+[`docs/task-types.md`](docs/task-types.md) is the single human-readable index
+of supported task kinds, their manifest versions, runners, execution kinds, and
+compatibility status. The machine-readable companion schemas live under
+[`schemas/`](schemas/). New integrations should use `coding`, `model`, `quiz`,
+and `optimization`; `icpc` is accepted solely as a legacy alias for `coding`.
+The API and package compatibility rules are in
+[`docs/compatibility.md`](docs/compatibility.md).
 
 ## Generic scorer contract
 
@@ -202,7 +225,8 @@ time_limit_ms: 2000
 memory_limit_mb: 512
 output_limit_bytes: 1048576
 network: disabled
-scoring_mode: all_or_nothing # or percentage
+scoring_mode: all_or_nothing
+# Use percentage for equal per-test scoring.
 ```
 
 The task contains matching `tests/**/*.in` and `.ans`/`.out` files. With

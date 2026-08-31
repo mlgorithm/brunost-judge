@@ -1,6 +1,6 @@
 [project]
 name = "brunost-judge"
-version = "1.3.1"
+dynamic = ["version"]
 description = "Open-source, platform-independent judging contracts and task tooling"
 requires-python = ">=3.11"
 dependencies = []
@@ -20,3 +20,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "brunost_judge.version.__version__"}
+
+[tool.setuptools.package-data]
+brunost_judge = ["security/*.json"]

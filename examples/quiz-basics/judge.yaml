@@ -1,0 +1,8 @@
+version: 1
+kind: quiz
+runner: quiz
+answer_key: private/questions.json
+submission_file: answers.json
+scoring_mode: weighted
+free_text_normalization: casefold_trim
+network: disabled

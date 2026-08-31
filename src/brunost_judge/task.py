@@ -135,6 +135,35 @@ def _scheduling_settings(manifest: str, *, default_runtime: str | None = None) -
     return settings
 
 
+def _registration_settings(manifest: str, kind: str | None, settings: dict[str, Any]) -> dict[str, Any]:
+    """Return the immutable identity fields derived from a valid package.
+
+    Registration accepts an artifact, not an independently authored copy of
+    its manifest.  Keeping these fields together prevents a task reference
+    from being permanently registered with a version, runtime, or evaluator
+    that disagrees with the immutable package behind it.
+    """
+
+    result = dict(settings)
+    version = _manifest_field(manifest, "version")
+    if version is not None:
+        try:
+            result["version"] = int(version)
+        except ValueError:
+            # ``validate_task`` reports the invalid manifest; retain a safe
+            # fallback here so callers can still inspect its validation errors.
+            pass
+    result["runtime"] = str(
+        result.get("runtime")
+        or _manifest_field(manifest, "runtime")
+        or ("python-3.13-ml-v1" if kind == "model" else "python-3.13")
+    )
+    evaluator = result.get("evaluator") or result.get("scoring") or _manifest_field(manifest, "evaluation")
+    if evaluator:
+        result["evaluator"] = str(evaluator)
+    return result
+
+
 def _validate_scheduling_labels(manifest: str, errors: list[str]) -> None:
     runtime = _manifest_field(manifest, "runtime")
     if runtime and is_browser_only_runtime(runtime):
@@ -858,7 +887,7 @@ def validate_task(path: str | Path) -> TaskValidation:
     if not (root / "private").is_dir():
         errors.append("missing private/ hidden-assets directory")
 
-    return TaskValidation(root, kind, tuple(errors), settings)
+    return TaskValidation(root, kind, tuple(errors), _registration_settings(manifest_text, kind, settings))
 
 
 def task_digest(path: str | Path) -> str:

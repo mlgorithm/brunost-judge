@@ -294,6 +294,9 @@ worker advertises capabilities such as `gpu:true`, `runtime:kubernetes`, and
 
 ## Compatibility policy
 
+The complete public policy, including task-manifest and plugin compatibility,
+is in [`compatibility.md`](compatibility.md).
+
 - Additive fields are allowed in a minor release.
 - Existing fields and endpoints remain supported for at least one major cycle.
 - Breaking changes require a new `/v2` namespace or an explicit migration.

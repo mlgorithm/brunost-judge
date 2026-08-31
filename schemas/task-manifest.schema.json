@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mlgorithm/brunost-judge/blob/main/schemas/task-manifest.schema.json",
+  "title": "Brunost Judge task manifest",
+  "description": "Versioned JSON representation of a judge.yaml task manifest.",
+  "oneOf": [
+    {"$ref": "task-manifest-v1.schema.json"},
+    {"$ref": "task-manifest-v2.schema.json"}
+  ]
+}

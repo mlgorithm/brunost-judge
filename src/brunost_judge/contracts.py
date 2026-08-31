@@ -13,6 +13,7 @@ from typing import Any
 
 TERMINAL_STATUSES = frozenset({"completed", "failed", "canceled"})
 RESULT_SCHEMA_VERSION = 1
+RESOURCE_PROFILE_MODE = "planning_only"
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,13 @@ class TaskRecord:
 
 @dataclass(frozen=True)
 class ResourceProfile:
-    """Portable resource requirements understood by capability-aware workers."""
+    """Portable resource planning metadata, not a scheduling guarantee.
+
+    The Judge currently selects workers using ``resource_class`` and
+    ``required_capabilities``.  It neither admits work nor applies sandbox
+    limits from this profile, so callers must not treat these values as
+    enforced resource requirements.
+    """
 
     cpu_cores: float = 1
     memory_mb: int = 512
@@ -57,6 +64,7 @@ class TaskDefinition:
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["resource_profile"] = self.resource_profile.as_dict()
+        payload["resource_profile_mode"] = RESOURCE_PROFILE_MODE
         payload["required_capabilities"] = list(self.required_capabilities)
         return payload
 
@@ -77,6 +85,7 @@ class AgentDefinition:
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["resource_profile"] = self.resource_profile.as_dict()
+        payload["resource_profile_mode"] = RESOURCE_PROFILE_MODE
         payload["required_capabilities"] = list(self.required_capabilities)
         return payload
 
@@ -98,6 +107,7 @@ class GameDefinition:
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["resource_profile"] = self.resource_profile.as_dict()
+        payload["resource_profile_mode"] = RESOURCE_PROFILE_MODE
         payload["required_capabilities"] = list(self.required_capabilities)
         return payload
 

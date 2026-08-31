@@ -5,6 +5,9 @@ each input instance. A trusted author-owned evaluator decides whether the
 candidate is feasible and computes its objective value. Contestant output is
 never trusted to report its own score.
 
+The complete minimal package is
+[`../examples/optimization-basics`](../examples/optimization-basics).
+
 The contestant is run once per instance. Its standard input is the instance
 file and its standard output is the candidate solution consumed by the
 evaluator. There is no required output format in the Judge itself: the task
@@ -22,9 +25,11 @@ memory_limit_mb: 512
 output_limit_bytes: 1048576
 network: disabled
 evaluation: evaluator:evaluate
-objective_direction: maximize # or minimize
-score_mode: checker_score # or baseline_ratio
-aggregation: mean # minimum or geometric_mean
+objective_direction: maximize
+score_mode: checker_score
+aggregation: mean
+# Alternatives: objective_direction: minimize; score_mode: baseline_ratio;
+# aggregation: minimum or geometric_mean.
 evaluator_entrypoint: private/evaluator.py
 baseline_enabled: false
 ```

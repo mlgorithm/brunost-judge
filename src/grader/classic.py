@@ -264,10 +264,43 @@ def _child_setup(
     if not drop_privileges or os.name != "posix":
         return
     if os.geteuid() != 0:
-        raise PermissionError("classic privilege dropping requires a root evaluator process")
+        # Local development normally runs the evaluator as an unprivileged
+        # user already.  Production starts the evaluator as root only so it
+        # can read the root-only task tmpfs; in that case the UID transition
+        # below is mandatory before any contestant-controlled executable is
+        # entered.
+        return
     os.setgroups([])
     os.setgid(CONTESTANT_GID)
     os.setuid(CONTESTANT_UID)
+
+
+def _temporary_workspace(prefix: str) -> tempfile.TemporaryDirectory[str]:
+    """Create evaluator scratch space, using the sandbox's executable tmpfs.
+
+    Docker production mounts ``/tmp`` with ``noexec`` because task assets are
+    materialized there.  Native programs therefore use the separate work
+    tmpfs when it is supplied by the sandbox runner.  Local development keeps
+    the standard temporary-directory behaviour.
+    """
+
+    configured_root = os.environ.get("BRUNOST_JUDGE_WORK_ROOT", "").strip()
+    if not configured_root:
+        return tempfile.TemporaryDirectory(prefix=prefix)
+    root = Path(configured_root)
+    if not root.is_absolute():
+        raise ClassicJudgeError("BRUNOST_JUDGE_WORK_ROOT must be an absolute path")
+    root.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=root)
+
+
+def _copy_compiled_runtime(source: Path, compile_dir: Path, runtime_dir: Path) -> None:
+    """Move only the staged source/program into a private trusted runtime."""
+
+    for name in (source.name, "program"):
+        staged = compile_dir / name
+        if staged.is_file():
+            shutil.copy2(staged, runtime_dir / name)
 
 
 def _kill_process(process: subprocess.Popen[Any]) -> None:
@@ -443,7 +476,17 @@ def _run_process(
 
 
 def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list[str], str]:
-    build_dir.chmod(0o755)
+    """Stage and compile code without granting the compiler task access.
+
+    The evaluator may be root because it owns the private task bundle.  A
+    native compiler processes contestant-controlled input, though, so it must
+    always run as the contestant identity.  ``build_dir`` is deliberately a
+    child of an evaluator-only temporary workspace; its write/execute-only
+    mode lets that identity build and execute staged source without making the
+    workspace itself listable.
+    """
+
+    build_dir.chmod(0o733)
     staged_source = build_dir / source.name
     shutil.copy2(source, staged_source)
     # Artifact extraction intentionally makes uploaded files private.  The
@@ -451,7 +494,9 @@ def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list
     # mode would make an otherwise valid source unreadable in production.
     staged_source.chmod(0o644)
     if config.language == "python":
-        return [sys.executable, str(staged_source)], ""
+        # Keep command arguments relative to the working directory.  This is
+        # also required by bubblewrap, which mounts only that directory.
+        return [sys.executable, staged_source.name], ""
     compiler_name = {"c": "gcc", "cpp": "g++", "rust": "rustc"}[config.language]
     compiler_setting = {
         "c": "BRUNOST_JUDGE_C_COMPILER",
@@ -468,11 +513,11 @@ def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list
         raise ClassicJudgeError(f"required compiler is unavailable: {compiler}")
     binary = build_dir / "program"
     if config.language == "c":
-        command = [compiler, "-std=c11", "-O2", "-pipe", str(staged_source), "-o", str(binary)]
+        command = [compiler, "-std=c11", "-O2", "-pipe", staged_source.name, "-o", binary.name]
     elif config.language == "cpp":
-        command = [compiler, "-std=c++17", "-O2", "-pipe", str(staged_source), "-o", str(binary)]
+        command = [compiler, "-std=c++17", "-O2", "-pipe", staged_source.name, "-o", binary.name]
     else:
-        command = [compiler, "-O", "-o", str(binary), str(staged_source)]
+        command = [compiler, "-O", "-o", binary.name, staged_source.name]
     outcome = _run_process(
         command,
         cwd=build_dir,
@@ -481,12 +526,17 @@ def _compile(source: Path, config: ClassicConfig, build_dir: Path) -> tuple[list
         timeout_ms=COMPILE_TIMEOUT_MS,
         memory_mb=2048,
         output_limit_bytes=None,
+        sandbox=True,
+        # Do not make this conditional on an environment setting.  This is
+        # the privilege boundary that prevents native source from reading
+        # /tmp/brunost-assets while the evaluator is root.
+        drop_privileges=True,
     )
     if outcome.verdict == "judge_error":
         raise ClassicJudgeError(f"compiler could not start: {outcome.stderr}")
     if outcome.verdict != "OK":
         raise _CompileFailure(outcome.verdict, outcome.stderr)
-    return [str(binary)], outcome.stderr
+    return [f"./{binary.name}"], outcome.stderr
 
 
 class _CompileFailure(Exception):
@@ -538,6 +588,7 @@ def _reference_answers(
         raise ClassicJudgeError(f"reference entrypoint does not exist: {config.reference_entrypoint}")
     reference_dir = build_dir / "reference"
     reference_dir.mkdir(parents=True, exist_ok=True)
+    reference_dir.chmod(0o700)
     reference_config = replace(
         config,
         language=config.reference_language,
@@ -546,12 +597,20 @@ def _reference_answers(
         reference_language=config.reference_language,
         reference_entrypoint=None,
     )
-    try:
-        command, _ = _compile(source, reference_config, reference_dir)
-    except _CompileFailure as exc:
-        raise ClassicJudgeError(f"reference solution has a compile error: {exc.message}") from exc
+    # The reference runtime stays private so generated answers remain hidden
+    # from the candidate.  Native compilation uses a short-lived sibling
+    # workspace that is searchable (but not listable) after the UID drop.
+    with _temporary_workspace(prefix="brunost-reference-compile-") as compile_temporary:
+        compile_root = Path(compile_temporary)
+        compile_root.chmod(0o711)
+        compile_dir = compile_root / "work"
+        compile_dir.mkdir()
+        try:
+            command, _ = _compile(source, reference_config, compile_dir)
+        except _CompileFailure as exc:
+            raise ClassicJudgeError(f"reference solution has a compile error: {exc.message}") from exc
+        _copy_compiled_runtime(source, compile_dir, reference_dir)
     resolved: list[TestCase] = []
-    drop_privileges = os.environ.get("BRUNOST_JUDGE_CLASSIC_DROP_PRIVILEGES", "false").lower() == "true"
     for index, case in enumerate(cases):
         answer_path = reference_dir / f"answer-{index}.txt"
         outcome = _run_process(
@@ -562,7 +621,12 @@ def _reference_answers(
             timeout_ms=config.time_limit_ms,
             memory_mb=config.memory_limit_mb,
             output_limit_bytes=config.output_limit_bytes,
-            drop_privileges=drop_privileges,
+            # Reference code is author-controlled and needs its private
+            # input.  It remains in a root-only workspace and is still inside
+            # the outer container/runtime boundary.  Its *native compile*
+            # step above was nevertheless unprivileged.
+            sandbox=False,
+            drop_privileges=False,
         )
         if outcome.verdict != "OK":
             detail = f"reference solution failed on {case.test_id}: {outcome.verdict}"
@@ -603,16 +667,21 @@ def run_classic(submission_path: str, assets_path: str) -> dict[str, Any]:
         cases = _test_cases(task, config.answer_source)
         checker = _load_checker(task)
         source = _source_path(submission, config)
-        # Keep generated reference answers outside the contestant build root.
-        # The production bubblewrap command only mounts the build root, so a
-        # separate temporary root prevents submissions from reading answers.
-        with tempfile.TemporaryDirectory(prefix="brunost-classic-") as temporary, tempfile.TemporaryDirectory(
+        # The candidate root is searchable but not listable so interpreters
+        # can resolve their current working directory after the UID drop. The
+        # reference root remains the default 0700 because it contains private
+        # answers.  Private task assets themselves live in a separate 0700
+        # root owned by the evaluator.
+        with _temporary_workspace(prefix="brunost-classic-") as temporary, _temporary_workspace(
             prefix="brunost-reference-"
         ) as reference_temporary:
-            build_dir = Path(temporary)
-            build_dir.chmod(0o755)
-            Path(reference_temporary).chmod(0o755)
-            cases = _reference_answers(task, config, cases, Path(reference_temporary))
+            candidate_root = Path(temporary)
+            candidate_root.chmod(0o711)
+            build_dir = candidate_root / "work"
+            build_dir.mkdir()
+            reference_dir = Path(reference_temporary) / "work"
+            reference_dir.mkdir()
+            cases = _reference_answers(task, config, cases, reference_dir)
             try:
                 command, compile_stderr = _compile(source, config, build_dir)
             except _CompileFailure as exc:
@@ -727,7 +796,20 @@ def run_interactive(submission_path: str, assets_path: str) -> dict[str, Any]:
                             part
                             for part in (str(Path(__file__).resolve().parent.parent), os.environ.get("PYTHONPATH", ""))
                             if part
-                        )
+                        ),
+                        **(
+                            {"BRUNOST_JUDGE_WORK_ROOT": os.environ["BRUNOST_JUDGE_WORK_ROOT"]}
+                            if os.environ.get("BRUNOST_JUDGE_WORK_ROOT")
+                            else {}
+                        ),
+                        **{
+                            name: os.environ[name]
+                            for name in (
+                                "BRUNOST_JUDGE_CLASSIC_DROP_PRIVILEGES",
+                                "BRUNOST_JUDGE_CLASSIC_USE_BWRAP",
+                            )
+                            if os.environ.get(name)
+                        },
                     },
                 )
                 if outcome.verdict == "TLE":

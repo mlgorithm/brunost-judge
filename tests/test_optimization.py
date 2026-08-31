@@ -254,3 +254,4 @@ def test_optimization_stages_private_submission_source_for_contestant_user(tmp_p
         build_dir,
     )
     assert (build_dir / "solution.py").stat().st_mode & 0o777 == 0o644
+    assert build_dir.stat().st_mode & 0o777 == 0o733

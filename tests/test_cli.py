@@ -79,10 +79,13 @@ def test_generated_bundle_respects_container_entrypoints(tmp_path: Path):
     render_country_bundle(tmp_path, force=True)
     control = (tmp_path / "docker-compose.control.yml").read_text(encoding="utf-8")
     worker = (tmp_path / "docker-compose.worker.yml").read_text(encoding="utf-8")
+    seccomp = (tmp_path / "security" / "brunost-seccomp-v1.json").read_text(encoding="utf-8")
     assert 'command: ["server"' in control
     assert 'command: ["worker"' in worker
     assert 'command: ["brunost"' not in control + worker
     assert 'command: ["callback-dispatcher"' in control
+    assert "/etc/docker/seccomp/brunost-seccomp-v1.json" in worker
+    assert '"defaultAction":"SCMP_ACT_ERRNO"' in seccomp
 
 
 def test_canary_uses_immutable_artifacts_and_checks_idempotency(tmp_path: Path, monkeypatch, capsys):

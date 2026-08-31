@@ -13,7 +13,7 @@ from brunost_judge.sdk import JudgeClient
 
 judge = JudgeClient("http://127.0.0.1:8787")
 evaluation = judge.submit_evaluation(
-    task_ref="ioai/radar-v1",
+    task_ref="coding/radar-v1",
     submission_path="/var/lib/submissions/attempt-1",
     idempotency_key="student-42-attempt-1",
     evaluation_kind="batch",

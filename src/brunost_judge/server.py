@@ -25,7 +25,7 @@ from brunost_judge.auth import (
     int_environment,
     write_secret_file,
 )
-from brunost_judge.contracts import TaskRecord
+from brunost_judge.contracts import RESOURCE_PROFILE_MODE, TaskRecord
 from brunost_judge.enrollment import digest_secret, expires_at, new_secret
 from brunost_judge.store import create_store
 from brunost_judge.task import (
@@ -34,6 +34,7 @@ from brunost_judge.task import (
     task_digest,
     validate_task,
 )
+from brunost_judge.version import __version__
 
 LOGGER = logging.getLogger(__name__)
 
@@ -51,10 +52,16 @@ def create_app(database: str | Path | None = None):
         path: str | None = Field(default=None, min_length=1)
         artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         kind: str | None = Field(default=None, min_length=1, max_length=50)
-        version: int = Field(default=1, ge=1)
-        runtime: str = Field(default="python-3.13", min_length=1, max_length=100)
+        version: int | None = Field(default=None, ge=1)
+        runtime: str | None = Field(default=None, min_length=1, max_length=100)
         evaluator: str | None = None
-        resource_profile: dict[str, Any] = Field(default_factory=dict)
+        resource_profile: dict[str, Any] = Field(
+            default_factory=dict,
+            description=(
+                "Planning metadata only. The Judge does not schedule or enforce this profile; "
+                "use resource_class and required_capabilities for worker selection."
+            ),
+        )
         required_capabilities: list[str] = Field(default_factory=list, max_length=32)
         metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -82,7 +89,13 @@ def create_app(database: str | Path | None = None):
         artifact_path: str | None = None
         artifact_id: str | None = Field(default=None, min_length=64, max_length=128)
         protocol: str = Field(default="stdio", min_length=1, max_length=100)
-        resource_profile: dict[str, Any] = Field(default_factory=dict)
+        resource_profile: dict[str, Any] = Field(
+            default_factory=dict,
+            description=(
+                "Planning metadata only. The Judge does not schedule or enforce this profile; "
+                "use required_capabilities for worker selection."
+            ),
+        )
         required_capabilities: list[str] = Field(default_factory=list, max_length=32)
         metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -93,7 +106,13 @@ def create_app(database: str | Path | None = None):
         seats: int = Field(default=2, ge=2, le=64)
         protocol: str = Field(default="stdio", min_length=1, max_length=100)
         referee: str | None = None
-        resource_profile: dict[str, Any] = Field(default_factory=dict)
+        resource_profile: dict[str, Any] = Field(
+            default_factory=dict,
+            description=(
+                "Planning metadata only. The Judge does not schedule or enforce this profile; "
+                "use required_capabilities for worker selection."
+            ),
+        )
         required_capabilities: list[str] = Field(default_factory=list, max_length=32)
         metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -180,7 +199,7 @@ def create_app(database: str | Path | None = None):
     database_ref = database or os.environ.get("BRUNOST_JUDGE_DATABASE_URL") or os.environ.get("BRUNOST_JUDGE_DB", "judge.db")
     store = create_store(database_ref)
     artifact_store = artifact_store_from_environment()
-    app = FastAPI(title="Brunost Judge", version="1.3.1")
+    app = FastAPI(title="Brunost Judge", version=__version__)
     allow_anonymous_api = os.environ.get("BRUNOST_JUDGE_ALLOW_ANONYMOUS_API", "false").lower() == "true"
     require_idempotency_header = os.environ.get("BRUNOST_JUDGE_REQUIRE_IDEMPOTENCY_HEADER", "false").lower() == "true"
     rate_limiter = RateLimiter()
@@ -385,7 +404,7 @@ def create_app(database: str | Path | None = None):
         return {
             "status": "ok",
             "service": "brunost-judge",
-            "version": "1.3.1",
+            "version": __version__,
             "database": type(store).__name__,
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
         }
@@ -457,7 +476,7 @@ def create_app(database: str | Path | None = None):
         return {
             "cluster_id": os.environ.get("BRUNOST_JUDGE_CLUSTER_ID", "local"),
             "service": "brunost-judge",
-            "version": "1.3.1",
+            "version": __version__,
             "workers": len(workers),
             "ready_workers": sum(1 for worker in workers if worker.status == "ready" and not worker.draining),
         }
@@ -566,7 +585,15 @@ def create_app(database: str | Path | None = None):
             queues=tuple(payload.get("queues") or ("default",)),
             resource_classes=resource_classes,
             region=payload.get("region"),
-            metadata={**metadata, "node_id": payload.get("node_id"), "role": payload.get("role", "worker")},
+            metadata={
+                **metadata,
+                "node_id": payload.get("node_id"),
+                "role": payload.get("role", "worker"),
+                # The node may later report a smaller inventory, but a scoped
+                # worker credential must never manufacture a capability the
+                # operator did not grant at enrollment time.
+                "enrollment_capabilities": sorted(approved_capabilities),
+            },
         )
         registered = store.register_worker(worker)
         worker_token = new_secret()
@@ -621,6 +648,21 @@ def create_app(database: str | Path | None = None):
         if requested_kind != manifest_kind:
             raise HTTPException(status_code=422, detail="request kind must match judge.yaml kind")
         task_settings = validation.settings
+        package_version = int(task_settings["version"])
+        package_runtime = str(task_settings["runtime"])
+        package_evaluator = task_settings.get("evaluator")
+        if request.version is not None and request.version != package_version:
+            raise HTTPException(status_code=422, detail="request version must match judge.yaml version")
+        if request.runtime is not None:
+            if is_browser_only_runtime(request.runtime):
+                raise HTTPException(
+                    status_code=422,
+                    detail="browser-only runtimes must remain in Premium Lab and cannot be Judge task runtimes",
+                )
+            if request.runtime != package_runtime:
+                raise HTTPException(status_code=422, detail="request runtime must match judge.yaml runtime")
+        if request.evaluator is not None and request.evaluator != package_evaluator:
+            raise HTTPException(status_code=422, detail="request evaluator must match judge.yaml evaluator")
         required_capabilities = sorted({
             *request.required_capabilities,
             *(task_settings.get("required_capabilities") or ()),
@@ -628,10 +670,11 @@ def create_app(database: str | Path | None = None):
         manifest = {
             **request.metadata,
             "kind": requested_kind,
-            "version": request.version,
-            "runtime": task_settings.get("runtime") or request.runtime,
-            "evaluator": task_settings.get("evaluator") or task_settings.get("scoring") or request.evaluator,
+            "version": package_version,
+            "runtime": package_runtime,
+            "evaluator": package_evaluator,
             "resource_profile": request.resource_profile,
+            "resource_profile_mode": RESOURCE_PROFILE_MODE,
             "required_capabilities": required_capabilities,
             "digest": digest,
         }
@@ -815,6 +858,7 @@ def create_app(database: str | Path | None = None):
     @app.post("/v1/agents", status_code=201, dependencies=[Depends(require_api_token)])
     def register_agent(request: AgentDefinitionModel) -> dict[str, Any]:
         payload = request.model_dump()
+        payload["resource_profile_mode"] = RESOURCE_PROFILE_MODE
         artifact_path = payload.get("artifact_path")
         artifact_id = payload.pop("artifact_id", None)
         if bool(artifact_path) and bool(artifact_id):
@@ -847,7 +891,9 @@ def create_app(database: str | Path | None = None):
         if task.kind != "game":
             raise HTTPException(status_code=422, detail="games must reference a task with kind=game")
         try:
-            return store.register_definition("game", request.game_id, request.model_dump())
+            payload = request.model_dump()
+            payload["resource_profile_mode"] = RESOURCE_PROFILE_MODE
+            return store.register_definition("game", request.game_id, payload)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -908,8 +954,9 @@ def create_app(database: str | Path | None = None):
     def advertise_worker_capabilities(
         worker_id: str,
         request: WorkerCapabilityAdvertisementModel,
+        http_request: Request,
     ) -> dict[str, Any]:
-        """Refresh the authenticated worker's runtime capability inventory."""
+        """Refresh an enrolled worker's capability inventory within its grant."""
 
         from brunost_judge.contracts import WorkerRecord
 
@@ -917,6 +964,12 @@ def create_app(database: str | Path | None = None):
         if worker is None:
             raise HTTPException(status_code=404, detail="worker not found")
         capabilities = tuple(dict.fromkeys(item.strip() for item in request.capabilities if item.strip()))
+        if getattr(http_request.state, "auth_subject", None) != "admin":
+            approved_capabilities = set(worker.metadata.get("enrollment_capabilities") or worker.capabilities)
+            if not set(capabilities).issubset(approved_capabilities):
+                raise HTTPException(status_code=422, detail="worker capabilities exceed the enrollment grant")
+        metadata = dict(worker.metadata)
+        metadata["detected_capabilities"] = sorted(capabilities)
         updated = WorkerRecord(
             worker_id=worker.worker_id,
             capabilities=capabilities,
@@ -925,7 +978,7 @@ def create_app(database: str | Path | None = None):
             region=worker.region,
             status=worker.status,
             draining=worker.draining,
-            metadata=worker.metadata,
+            metadata=metadata,
         )
         return store.register_worker(updated).as_dict()
 

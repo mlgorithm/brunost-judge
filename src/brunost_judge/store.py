@@ -616,22 +616,31 @@ class JudgeStore:
             if resource_classes:
                 clauses.append("e.resource_class IN (" + ",".join("?" for _ in resource_classes) + ")")
                 params.extend(resource_classes)
-            rows = db.execute(
-                "SELECT e.*, t.manifest_json AS task_manifest_json FROM executions e "
-                "JOIN tasks t ON t.task_ref = e.task_ref WHERE " + " AND ".join(clauses) +
-                " ORDER BY e.priority DESC, e.created_at LIMIT 100",
-                params,
-            ).fetchall()
             available_capabilities = set(capabilities or ())
             row = None
-            for candidate in rows:
-                task_manifest = json.loads(candidate["task_manifest_json"])
-                execution_metadata = json.loads(candidate["metadata_json"])
-                required = set(task_manifest.get("required_capabilities") or ())
-                required.update(execution_metadata.get("required_capabilities") or ())
-                if required.issubset(available_capabilities):
-                    row = candidate
+            offset = 0
+            # Capability predicates are application-level JSON data in the
+            # SQLite store. Scan deterministically in bounded pages rather
+            # than inspecting only the first page: a backlog of GPU/ML work
+            # must not make later CPU-compatible work permanently invisible.
+            while row is None:
+                rows = db.execute(
+                    "SELECT e.*, t.manifest_json AS task_manifest_json FROM executions e "
+                    "JOIN tasks t ON t.task_ref = e.task_ref WHERE " + " AND ".join(clauses) +
+                    " ORDER BY e.priority DESC, e.created_at, e.execution_id LIMIT ? OFFSET ?",
+                    [*params, 100, offset],
+                ).fetchall()
+                if not rows:
                     break
+                for candidate in rows:
+                    task_manifest = json.loads(candidate["task_manifest_json"])
+                    execution_metadata = json.loads(candidate["metadata_json"])
+                    required = set(task_manifest.get("required_capabilities") or ())
+                    required.update(execution_metadata.get("required_capabilities") or ())
+                    if required.issubset(available_capabilities):
+                        row = candidate
+                        break
+                offset += len(rows)
             if row is None:
                 db.commit()
                 return None

@@ -467,17 +467,25 @@ class PostgresJudgeStore:
             if resource_classes:
                 clauses.append("resource_class = ANY(%s)")
                 params.append(list(resource_classes))
-            rows = db.execute("SELECT e.*,t.manifest_json AS task_manifest_json FROM executions e JOIN tasks t ON t.task_ref=e.task_ref WHERE " + " AND ".join(clauses) + " ORDER BY e.priority DESC,e.created_at LIMIT 100 FOR UPDATE SKIP LOCKED", params).fetchall()
-            available_capabilities = set(capabilities or ())
-            row = None
-            for candidate in rows:
-                task_manifest = candidate["task_manifest_json"] if isinstance(candidate["task_manifest_json"], dict) else json.loads(candidate["task_manifest_json"])
-                execution_metadata = candidate["metadata_json"] if isinstance(candidate["metadata_json"], dict) else json.loads(candidate["metadata_json"])
-                required = set(task_manifest.get("required_capabilities") or ())
-                required.update(execution_metadata.get("required_capabilities") or ())
-                if required.issubset(available_capabilities):
-                    row = candidate
-                    break
+            # Apply the capability subset predicate in PostgreSQL before the
+            # priority limit and row lock.  Otherwise the first 100
+            # incompatible jobs can starve compatible work farther back in the
+            # queue.  Ignore malformed legacy metadata rather than allowing it
+            # to make claiming fail.
+            clauses.append(
+                "COALESCE(%s::jsonb, '[]'::jsonb) @> ("
+                "CASE WHEN jsonb_typeof(t.manifest_json->'required_capabilities') = 'array' "
+                "THEN t.manifest_json->'required_capabilities' ELSE '[]'::jsonb END || "
+                "CASE WHEN jsonb_typeof(e.metadata_json->'required_capabilities') = 'array' "
+                "THEN e.metadata_json->'required_capabilities' ELSE '[]'::jsonb END)"
+            )
+            params.append(json.dumps(sorted(set(capabilities or ()))))
+            row = db.execute(
+                "SELECT e.*,t.manifest_json AS task_manifest_json FROM executions e "
+                "JOIN tasks t ON t.task_ref=e.task_ref WHERE " + " AND ".join(clauses) +
+                " ORDER BY e.priority DESC,e.created_at,e.execution_id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                params,
+            ).fetchone()
             if not row:
                 return None
             lease = now + timedelta(seconds=max(1, lease_seconds))

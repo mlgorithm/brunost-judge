@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from importlib import resources
 from pathlib import Path
 
 CONTROL_PLANE_COMPOSE = """services:
@@ -101,7 +102,7 @@ WORKER_COMPOSE = """services:
       BRUNOST_JUDGE_SANDBOX_IMAGES: ${BRUNOST_JUDGE_SANDBOX_IMAGES:-}
       BRUNOST_JUDGE_SANDBOX_RUNTIME: ${BRUNOST_JUDGE_SANDBOX_RUNTIME:-runsc}
       BRUNOST_JUDGE_REQUIRE_SECCOMP: \"true\"
-      BRUNOST_JUDGE_SANDBOX_SECCOMP: ${BRUNOST_JUDGE_SANDBOX_SECCOMP:-/etc/docker/seccomp/brunost-seccomp.json}
+      BRUNOST_JUDGE_SANDBOX_SECCOMP: /etc/docker/seccomp/brunost-seccomp-v1.json
       BRUNOST_JUDGE_ENV: production
       BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS: \"true\"
       BRUNOST_JUDGE_REQUIRE_SIGNED_CALLBACKS: \"true\"
@@ -112,10 +113,22 @@ WORKER_COMPOSE = """services:
       - ${BRUNOST_NODE_CONFIG:-./brunost-node.json}:/etc/brunost/node.json:ro
       - ${BRUNOST_TASK_ROOT:-./tasks}:/tasks:ro
       - ${BRUNOST_SUBMISSION_ROOT:-./submissions}: /submissions
+      - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-./security/brunost-seccomp-v1.json}:/etc/docker/seccomp/brunost-seccomp-v1.json:ro
     restart: unless-stopped
 """
 
 WORKER_COMPOSE = WORKER_COMPOSE.replace(": /submissions", ":/submissions")
+
+
+def _bundled_seccomp_profile() -> str:
+    """Return the versioned seccomp asset that accompanies worker Compose."""
+
+    return (
+        resources.files("brunost_judge")
+        .joinpath("security")
+        .joinpath("seccomp-v1.json")
+        .read_text(encoding="utf-8")
+    )
 
 RUNBOOK = """# Country cluster runbook
 
@@ -152,6 +165,7 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         "docker-compose.control.yml": CONTROL_PLANE_COMPOSE,
         "docker-compose.worker.yml": WORKER_COMPOSE,
         "RUNBOOK.md": RUNBOOK,
+        "security/brunost-seccomp-v1.json": _bundled_seccomp_profile(),
         "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGES={\\\"python-3.13\\\":\\\"ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\\\",\\\"python-3.13-ml-v1\\\":\\\"ghcr.io/brunost/judge-runtime-ml@sha256:<64-hex-digest>\\\"}\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\nBRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=false\n",
     }
     written: list[Path] = []
@@ -159,6 +173,7 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         path = destination / name
         if path.exists() and not force:
             continue
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
         written.append(path)
     return written

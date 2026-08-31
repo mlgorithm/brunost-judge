@@ -3,8 +3,15 @@ import runpy
 from pathlib import Path
 
 from brunost_judge.cli import main
+from brunost_judge.task import validate_task
 
 ROOT = Path(__file__).parents[1]
+
+
+def test_current_task_family_examples_validate():
+    for name in ("deterministic-sum", "model-basics", "optimization-basics", "quiz-basics"):
+        validation = validate_task(ROOT / "examples" / name)
+        assert validation.valid, f"{name}: {validation.errors}"
 
 
 def test_reference_agents_pass_cli_smoke_validation(capsys):

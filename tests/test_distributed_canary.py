@@ -88,15 +88,17 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
 
         def enroll(
             worker_id: str,
-            *,
-            queues: list[str] | None = None,
-            resource_classes: list[str] | None = None,
-        ) -> tuple[str, str]:
+                *,
+                queues: list[str] | None = None,
+                resource_classes: list[str] | None = None,
+                capabilities: list[str] | None = None,
+            ) -> tuple[str, str]:
             issued = admin.issue_enrollment_token(
                 node_id=f"node-{worker_id}",
                 worker_id=worker_id,
                 queues=queues or ["default"],
                 resource_classes=resource_classes or ["cpu"],
+                capabilities=capabilities or [],
             )
             enrolled = JudgeClient(base_url).enroll_node(join_token=issued["join_token"])
             return worker_id, str(enrolled["worker_token"])
@@ -105,6 +107,7 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
             "canary-worker-a",
             queues=["default", lease_queue],
             resource_classes=["cpu", lease_queue],
+            capabilities=["runtime:python-3.13"],
         )
         task_path = Path(__file__).parents[1] / "examples" / "deterministic-sum"
         submission_path = Path(__file__).parents[1] / "examples" / "canary-deterministic-sum"
@@ -112,7 +115,7 @@ def test_distributed_canary_covers_artifacts_callbacks_idempotency_and_lease_rec
         task = admin.register_task(
             task_ref="canary/deterministic-sum-v1",
             artifact_id=str(uploaded_task["artifact_id"]),
-            kind="icpc",
+            kind="coding",
         )
         uploaded_submission = admin.upload_artifact(submission_path)
         request = {

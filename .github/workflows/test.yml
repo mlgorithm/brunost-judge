@@ -22,4 +22,6 @@ jobs:
       - run: python -m compileall -q src tests
       - run: python -m brunost_judge task validate examples/ioai-cpu
       - run: bash -n scripts/*.sh
-      - run: BRUNOST_JUDGE_SANDBOX_IMAGE='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet
+      - run: python scripts/check_public_contract.py
+      - run: python scripts/export_openapi.py /tmp/brunost-judge-openapi.json
+      - run: BRUNOST_JUDGE_CALLBACK_HOSTS='callbacks.invalid' BRUNOST_DOCKER_SOCKET_PROXY_IMAGE='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' BRUNOST_JUDGE_SANDBOX_IMAGE='example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' docker compose -f docker-compose.yml -f docker-compose.production.yml config --quiet

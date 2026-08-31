@@ -1,5 +1,5 @@
 version: 1
-kind: icpc
+kind: coding
 runner: classic
 language: python
 runtime: python-3.13
