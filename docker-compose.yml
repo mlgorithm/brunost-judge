@@ -93,7 +93,7 @@ services:
       - judge-artifacts:/artifacts
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:rw,noexec,nosuid,size=${BRUNOST_JUDGE_WORKER_TMPFS_SIZE:-256m}
     depends_on:
       judge-postgres:
         condition: service_healthy

@@ -94,7 +94,10 @@ WORKER_COMPOSE = """services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     restart: unless-stopped
   judge-worker:
-    image: ${BRUNOST_JUDGE_IMAGE}
+    # This must be the Docker-enabled worker image, not the control-plane API
+    # image. The worker needs the Docker CLI to reach the constrained socket
+    # proxy; the API image intentionally does not contain that CLI.
+    image: ${BRUNOST_JUDGE_WORKER_IMAGE:?set BRUNOST_JUDGE_WORKER_IMAGE to a digest-pinned Docker-enabled Judge worker image}
     command: [\"worker\", \"--config\", \"/etc/brunost/node.json\"]
     environment:
       BRUNOST_JUDGE_SANDBOX_MODE: ${BRUNOST_JUDGE_SANDBOX_MODE:-docker}
@@ -114,6 +117,15 @@ WORKER_COMPOSE = """services:
       - ${BRUNOST_TASK_ROOT:-./tasks}:/tasks:ro
       - ${BRUNOST_SUBMISSION_ROOT:-./submissions}: /submissions
       - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-./security/brunost-seccomp-v1.json}:/etc/docker/seccomp/brunost-seccomp-v1.json:ro
+    user: \"10001:10001\"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=${BRUNOST_JUDGE_WORKER_TMPFS_SIZE:-256m}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${BRUNOST_JUDGE_WORKER_PIDS_LIMIT:-512}
     restart: unless-stopped
 """
 
@@ -144,6 +156,13 @@ RUNBOOK = """# Country cluster runbook
 
    `docker compose --env-file worker.env -f docker-compose.worker.yml up -d`
 
+   `worker.env` must set `BRUNOST_JUDGE_WORKER_IMAGE` to the digest-pinned
+   Docker-enabled Judge worker image (never `BRUNOST_JUDGE_IMAGE`). The
+   container runs as UID 10001 with a read-only root filesystem, so make the
+   mounted node configuration readable by UID 10001, for example:
+
+   `sudo chown 10001:10001 /etc/brunost/node.json && sudo chmod 0600 /etc/brunost/node.json`
+
 4. Run `brunost node doctor --config /etc/brunost/node.json`.
 5. Upload task and submission bundles with `brunost artifact upload`.
 6. Run the CPU canary before enabling contest traffic.
@@ -166,7 +185,7 @@ def render_country_bundle(root: str | Path, *, force: bool = False) -> list[Path
         "docker-compose.worker.yml": WORKER_COMPOSE,
         "RUNBOOK.md": RUNBOOK,
         "security/brunost-seccomp-v1.json": _bundled_seccomp_profile(),
-        "worker.env.example": "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGES={\\\"python-3.13\\\":\\\"ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\\\",\\\"python-3.13-ml-v1\\\":\\\"ghcr.io/brunost/judge-runtime-ml@sha256:<64-hex-digest>\\\"}\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\nBRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=false\n",
+        "worker.env.example": "BRUNOST_JUDGE_WORKER_IMAGE=ghcr.io/mlgorithm/brunost-judge-worker@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\nBRUNOST_JUDGE_SANDBOX_IMAGES={\\\"python-3.13\\\":\\\"ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>\\\",\\\"python-3.13-ml-v1\\\":\\\"ghcr.io/brunost/judge-runtime-ml@sha256:<64-hex-digest>\\\"}\nBRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>\nBRUNOST_NODE_CONFIG=/etc/brunost/node.json\nBRUNOST_JUDGE_WORKER_TMPFS_SIZE=256m\nBRUNOST_JUDGE_WORKER_PIDS_LIMIT=512\nBRUNOST_JUDGE_ALLOW_INTERNAL_HTTP_CALLBACKS=false\n",
     }
     written: list[Path] = []
     for name, content in files.items():

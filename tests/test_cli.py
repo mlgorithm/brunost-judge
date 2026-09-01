@@ -68,6 +68,7 @@ def test_cluster_init_generates_private_operator_environment(tmp_path: Path, cap
     contents = env.read_text(encoding="utf-8")
     assert "BRUNOST_JUDGE_REQUIRE_WORKER_TOKEN=true" in contents
     assert "BRUNOST_JUDGE_DOMAIN=judge.example.test" in contents
+    assert "BRUNOST_JUDGE_WORKER_IMAGE=ghcr.io/mlgorithm/brunost-judge-worker@sha256:" in contents
     assert (tmp_path / "brunost-cluster.json").exists()
     assert (tmp_path / "docker-compose.control.yml").exists()
     assert (tmp_path / "docker-compose.worker.yml").exists()
@@ -86,6 +87,17 @@ def test_generated_bundle_respects_container_entrypoints(tmp_path: Path):
     assert 'command: ["callback-dispatcher"' in control
     assert "/etc/docker/seccomp/brunost-seccomp-v1.json" in worker
     assert '"defaultAction":"SCMP_ACT_ERRNO"' in seccomp
+    assert "image: ${BRUNOST_JUDGE_WORKER_IMAGE:?" in worker
+    assert "BRUNOST_JUDGE_IMAGE" not in worker
+    assert 'user: "10001:10001"' in worker
+    assert "read_only: true" in worker
+    assert "/tmp:rw,noexec,nosuid,size=${BRUNOST_JUDGE_WORKER_TMPFS_SIZE:-256m}" in worker
+    assert "no-new-privileges:true" in worker
+    assert "cap_drop:" in worker
+    assert "pids_limit: ${BRUNOST_JUDGE_WORKER_PIDS_LIMIT:-512}" in worker
+    worker_env = (tmp_path / "worker.env.example").read_text(encoding="utf-8")
+    assert "BRUNOST_JUDGE_WORKER_IMAGE=ghcr.io/mlgorithm/brunost-judge-worker@sha256:" in worker_env
+    assert "BRUNOST_JUDGE_IMAGE=" not in worker_env
 
 
 def test_canary_uses_immutable_artifacts_and_checks_idempotency(tmp_path: Path, monkeypatch, capsys):

@@ -378,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"BRUNOST_JUDGE_CLUSTER_ID={cluster_id}",
                 f"BRUNOST_JUDGE_DOMAIN={args.domain}",
                 "BRUNOST_JUDGE_IMAGE=ghcr.io/mlgorithm/brunost-judge@sha256:<64-hex-digest>",
+                "BRUNOST_JUDGE_WORKER_IMAGE=ghcr.io/mlgorithm/brunost-judge-worker@sha256:<64-hex-digest>",
                 "BRUNOST_JUDGE_SANDBOX_IMAGE=ghcr.io/brunost/judge-runtime@sha256:<64-hex-digest>",
                 "BRUNOST_DOCKER_SOCKET_PROXY_IMAGE=tecnativa/docker-socket-proxy@sha256:<64-hex-digest>",
                 "BRUNOST_JUDGE_CALLBACK_HOSTS=premium.example",

@@ -17,7 +17,11 @@ brunost cluster init /srv/brunost
 The command also generates `docker-compose.control.yml`,
 `docker-compose.worker.yml`, `worker.env.example`, and `RUNBOOK.md`. The first
 file starts PostgreSQL and the Judge API; the worker file is used on Nodes 2 and
-3 after enrollment.
+3 after enrollment. The worker Compose file requires
+`BRUNOST_JUDGE_WORKER_IMAGE`, a digest-pinned image built from
+[`Dockerfile.worker`](../Dockerfile.worker). Do not point this setting at
+`BRUNOST_JUDGE_IMAGE`: that is the smaller API/control-plane image and
+intentionally has no Docker CLI.
 
 Load the generated `.env` into the API deployment and start the API with a
 shared PostgreSQL database. The generated configuration includes a cluster ID,
@@ -68,7 +72,15 @@ For production, run that command as a container or systemd service. The agent
 heartbeats, claims only work matching its registered queues/resource classes,
 executes in the configured sandbox, and submits a signed result. The worker
 credential cannot list tasks, issue enrollment tokens, or control another
-worker.
+worker. The generated worker container runs as UID `10001`, with a read-only
+root filesystem, `no-new-privileges`, all Linux capabilities dropped, and a
+bounded `/tmp` tmpfs. Before mounting a config produced by `node join`, give
+that UID read access while retaining owner-only permissions:
+
+```bash
+sudo chown 10001:10001 /etc/brunost/node.json
+sudo chmod 0600 /etc/brunost/node.json
+```
 
 ## Verify the node
 

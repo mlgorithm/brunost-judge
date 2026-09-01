@@ -11,6 +11,9 @@ Before an official contest, operators must provide:
 - object storage for submissions, task packages, and bounded artifacts;
 - isolated worker hosts using gVisor/Kata/Firecracker or an equivalent boundary;
 - immutable, digest-pinned judge and runtime images;
+- a separate digest-pinned Docker-enabled worker image built from
+  `Dockerfile.worker`. The control-plane image from `Dockerfile` intentionally
+  omits the Docker CLI and must never be used for a Docker-sandbox worker;
 - `BRUNOST_JUDGE_ENV=production`, explicit `BRUNOST_JUDGE_SANDBOX_MODE=docker`,
   and `BRUNOST_JUDGE_REQUIRE_IMMUTABLE_ARTIFACTS=true`; production refuses the
   in-process runner and unpinned evaluator images;
@@ -67,6 +70,15 @@ Docker capabilities that would enable its conditional privileged calls. Keep
 the default mount or point `BRUNOST_JUDGE_SECCOMP_HOST_PATH` only at a reviewed
 copy of that exact profile. `brunost cluster init` writes the same file into
 the generated worker bundle under `security/brunost-seccomp-v1.json`.
+
+The API and worker images install the locked production dependency graph in
+`uv.lock`. Their Python, Docker CLI, and `uv` bases are pinned by digest through
+documented Docker build arguments. Keep the committed defaults for a release
+build; an explicit build-argument override is only appropriate when certifying
+a newer base. The worker runs as UID `10001` with a read-only root filesystem,
+`/tmp` tmpfs, no new privileges, dropped Linux capabilities, and an outer
+process limit. A mounted `node.json` must be owned by or readable to UID
+`10001`; preserve `0600` mode after assigning that ownership.
 
 Every evaluator is also launched with no network, read-only rootfs, dropped
 capabilities, quotas, and the configured gVisor/Kata runtime. The evaluator is

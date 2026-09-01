@@ -62,3 +62,12 @@ services:
       - ${BRUNOST_JUDGE_TASK_ROOT:-./examples}:/tasks:ro
       - ${BRUNOST_JUDGE_SUBMISSION_ROOT:-./local-submissions}:/submissions
       - ${BRUNOST_JUDGE_SECCOMP_HOST_PATH:-./src/brunost_judge/security/seccomp-v1.json}:/etc/docker/seccomp/brunost-seccomp-v1.json:ro
+    # Keep the Docker-enabled worker constrained even though evaluator
+    # containers are created through the limited socket proxy.
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${BRUNOST_JUDGE_WORKER_PIDS_LIMIT:-512}
